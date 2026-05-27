@@ -136,7 +136,12 @@ async fn run_one(llm: &LlmClient<'_>, ex: &Example) -> Result<Produced> {
     let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
 
     // 5. Postprocess into typed records (or a model-declared non-transaction).
-    let records = match adapter.postprocess(&json).context("adapter postprocess")? {
+    //    Uses the body-aware path so the eval scores the SAME deterministic
+    //    overrides the pipeline applies (PayPal P1 cross-currency USD total).
+    let records = match adapter
+        .postprocess_with_body(&json, &unwrapped.body)
+        .context("adapter postprocess")?
+    {
         Outcome::Transaction(records) => records,
         Outcome::NotATransaction { .. } => return Ok(Produced::not_a_transaction()),
     };

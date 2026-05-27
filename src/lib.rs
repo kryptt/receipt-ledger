@@ -179,7 +179,13 @@ async fn process_message(
     // 4. LLM extraction via ollama-router.
     let prompt = adapter.prompt(&unwrapped.body);
     let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
-    let records = match adapter.postprocess(&json).context("adapter postprocess")? {
+    // `postprocess_with_body` applies any deterministic body-derived override
+    // (PayPal P1: a cross-currency receipt's authoritative USD total) on top of
+    // the model's extraction.
+    let records = match adapter
+        .postprocess_with_body(&json, &unwrapped.body)
+        .context("adapter postprocess")?
+    {
         Outcome::Transaction(records) => records,
         // The model classified the mail as a non-transaction → clean skip.
         Outcome::NotATransaction { reason } => return Ok(Disposition::Skipped(reason)),

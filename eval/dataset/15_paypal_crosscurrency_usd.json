@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "54.50",
+  "currency": "USD",
+  "direction": "out",
+  "date": "2026-05-12",
+  "merchant": "Northwind Outfitters",
+  "status": "approved",
+  "routed_account": "paypal_balance"
+}

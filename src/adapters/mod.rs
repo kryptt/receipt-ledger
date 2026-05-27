@@ -67,6 +67,22 @@ pub trait Adapter: Send + Sync {
     /// [`Outcome::NotATransaction`]. Returns `Err` only when the JSON is
     /// structurally unusable.
     fn postprocess(&self, json: &Value) -> Result<Outcome>;
+
+    /// Parse the LLM's JSON, then apply any deterministic, *body-derived*
+    /// refinement the source needs — overrides that must come from the email
+    /// text itself, not the model's reading of it. The default is plain
+    /// [`postprocess`](Adapter::postprocess) (no refinement).
+    ///
+    /// PayPal overrides this to enforce policy P1: when a cross-currency receipt
+    /// carries an authoritative `Total amount of this Transaction: $X USD` line,
+    /// the booked amount/currency is that USD figure regardless of what the
+    /// model extracted — a deterministic guarantee, not a prompt hope.
+    ///
+    /// Pure (no I/O): both the live pipeline and the eval harness call this so
+    /// they share one extraction path.
+    fn postprocess_with_body(&self, json: &Value, _body: &str) -> Result<Outcome> {
+        self.postprocess(json)
+    }
 }
 
 /// The registry of all enabled adapters, tried in order. Built once and reused

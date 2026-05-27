@@ -130,3 +130,105 @@ fn shipping_update_is_not_a_transaction() {
 fn non_forward_is_not_unwrapped() {
     assert!(unwrap_forward("a plain message, no forward marker").is_none());
 }
+
+// === P1/P2/P3 production-derived behaviors (end-to-end over fixtures) ========
+
+const INSTALLMENT: &str = include_str!("../eval/dataset/17_paypal_payin4_installment_notatx.txt");
+const CROSS_CURRENCY: &str = include_str!("../eval/dataset/15_paypal_crosscurrency_usd.txt");
+const CARD_PROMO: &str = include_str!("../eval/dataset/18_paypal_card_promo_balance.txt");
+
+/// P2: a Pay-in-4 INSTALLMENT payment ("You made a $X payment for your Pay in 4
+/// plan") is a clean skip via the deterministic pre-filter — no LLM call, never
+/// a Review. It pays down a plan whose purchase was already booked.
+#[test]
+fn payin4_installment_is_not_a_transaction() {
+    let unwrapped = unwrap_forward(INSTALLMENT).expect("fixture is a Gmail forward");
+    assert_eq!(unwrapped.original_sender, "service@paypal.com");
+    let adapter = adapters::select(&unwrapped.original_sender).unwrap();
+    assert!(
+        !adapter.is_transaction(&unwrapped.body),
+        "installment payment must be skipped by the pre-filter"
+    );
+}
+
+/// P1: on a cross-currency receipt the booked amount is the authoritative
+/// `Total amount of this Transaction: $X USD` figure, applied deterministically
+/// by `postprocess_with_body` even if the model extracted the EUR merchant total.
+#[test]
+fn cross_currency_books_the_usd_total() {
+    let unwrapped = unwrap_forward(CROSS_CURRENCY).expect("fixture is a Gmail forward");
+    let adapter = adapters::select(&unwrapped.original_sender).unwrap();
+    assert!(adapter.is_transaction(&unwrapped.body));
+
+    // The model dutifully reads the EUR merchant total (the wrong figure to
+    // book); the deterministic body refinement must override it to USD.
+    let model_json = json!({
+        "kind": "transaction",
+        "external_id": "7AA11122BB333444C",
+        "amount": "44.80",
+        "currency": "EUR",
+        "direction": "out",
+        "date": "2026-05-12",
+        "merchant": "Northwind Outfitters",
+        "account_hint": "Visa ending x-9981",
+        "status": "approved",
+        "raw_ref": "NW-2026-7741"
+    });
+
+    let record = one(
+        adapter
+            .postprocess_with_body(&model_json, &unwrapped.body)
+            .expect("postprocess_with_body succeeds"),
+    );
+    assert_eq!(
+        record.amount().value(),
+        Decimal::from_str("54.50").unwrap(),
+        "books the USD transaction total, not the EUR merchant total"
+    );
+    assert_eq!(record.currency().as_str(), "USD");
+
+    // And it books (a linked card → PayPal Balance, USD currency).
+    match validate(record) {
+        Verdict::Booked(_) => {}
+        Verdict::Review { reason } => panic!("cross-currency should book: {reason}"),
+    }
+}
+
+/// P3: a cashback-Mastercard PROMO line is marketing noise, never the funding
+/// instrument. Following the prompt, the model reads the real VISA payment
+/// method; a linked card funds the PayPal Balance, not Credit.
+#[test]
+fn promo_mastercard_funds_balance_not_credit() {
+    use receipt_ledger::firefly::paypal_is_credit_funded;
+
+    let unwrapped = unwrap_forward(CARD_PROMO).expect("fixture is a Gmail forward");
+    let adapter = adapters::select(&unwrapped.original_sender).unwrap();
+    assert!(adapter.is_transaction(&unwrapped.body));
+
+    // Prompt-faithful model output: account_hint is the real VISA, not the
+    // promo Mastercard.
+    let model_json = json!({
+        "kind": "transaction",
+        "external_id": "3QW77410ZX556677A",
+        "amount": "12.10",
+        "currency": "USD",
+        "direction": "out",
+        "date": "2026-05-18",
+        "merchant": "Lakeshore Coffee Roasters",
+        "account_hint": "VISA ending x-7781",
+        "status": "approved",
+        "raw_ref": "LCR-55012"
+    });
+
+    let record = one(
+        adapter
+            .postprocess_with_body(&model_json, &unwrapped.body)
+            .expect("postprocess_with_body succeeds"),
+    );
+    assert!(
+        !paypal_is_credit_funded(&record),
+        "a linked VISA card funds the balance; the Mastercard promo is ignored"
+    );
+    assert_eq!(record.currency().as_str(), "USD");
+    assert_eq!(record.amount().value(), Decimal::from_str("12.10").unwrap());
+}

@@ -82,14 +82,22 @@ non-numeric value is a hard startup error. The deployment routes ids
 
 An objective judge for comparing models and prompt changes. It runs the **real**
 extraction path (`unwrap_message` → adapter `prompt` → live `/chat/completions`
-with the same params the pipeline uses → `extract_json` → `postprocess` →
-`validate` + routing) over a labeled dataset and scores each field
+with the same params the pipeline uses → `extract_json` → `postprocess_with_body`
+→ `validate` + routing) over a labeled dataset and scores each field
 (kind / amount / currency / direction / date / merchant / status / routed
 account) against the ground truth, printing a per-model × per-field accuracy
 matrix.
 
 - **Dataset**: `eval/dataset/` — paired `*.txt` (forwarded email body) + `*.json`
-  (ground-truth label). All values are invented/scrubbed.
+  (ground-truth label). All values are invented/scrubbed. Production-derived
+  PayPal edge cases cover the three booking policies the adapter enforces:
+  **P1** cross-currency receipts book the authoritative `Total amount of this
+  Transaction: $X USD` figure (not the merchant-currency total); **P2** Pay-in-4
+  *installment* payments and plan-created/shipping notices are
+  `not_a_transaction` (only a real "You paid $X to <merchant>" purchase books);
+  **P3** funding routes Pay-in-4 / Pay Later / PayPal Credit → credit and any
+  other instrument (Balance, Bank Account, linked card) → balance, ignoring
+  cashback-Mastercard promo lines.
 - **Pure scorer**: `src/eval/` (`score`, the matrix aggregation) is unit tested
   under `./test.sh`. Only the live model calls (in `src/bin/eval.rs`) hit the
   network, so the crate builds and tests offline.

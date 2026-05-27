@@ -1,0 +1,28 @@
+From: Buyer <buyer@example.com>
+Date: Tue, 12 May 2026 at 16:50
+Subject: Fwd: See your new PayPal Pay in 4 plan
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Tue, 12 May 2026, 16:47
+Subject: See your new PayPal Pay in 4 plan
+To: buyer@example.com
+
+
+Here's your new Pay in 4 plan!
+
+Great news — you can spread your $54.50 USD purchase into 4 payments
+with no impact to your credit.
+
+Payment schedule
+- $13.63 USD due today
+- $13.63 USD due May 26, 2026
+- $13.63 USD due June 9, 2026
+- $13.61 USD due June 23, 2026
+
+We'll charge the Bank Account ending in x-0142 automatically on each
+due date. No action is needed from you right now.
+
+Manage your plan any time in the PayPal app.

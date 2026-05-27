@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "12.10",
+  "currency": "USD",
+  "direction": "out",
+  "date": "2026-05-18",
+  "merchant": "Lakeshore Coffee Roasters",
+  "status": "approved",
+  "routed_account": "paypal_balance"
+}

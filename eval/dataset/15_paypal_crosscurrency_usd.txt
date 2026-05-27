@@ -1,0 +1,29 @@
+From: Buyer <buyer@example.com>
+Date: Tue, 12 May 2026 at 16:48
+Subject: Fwd: Receipt for your payment to Northwind Outfitters
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Tue, 12 May 2026, 16:45
+Subject: You paid Northwind Outfitters EUR 44.80
+To: buyer@example.com
+
+
+You paid €44.80 EUR to Northwind Outfitters
+
+Merchant Northwind Outfitters
+Transaction date May 12, 2026 16:45:09 PM CEST
+Order ID NW-2026-7741
+
+Total €44.80 EUR
+
+Total amount of this Transaction: $54.50 USD
+(includes PayPal's currency conversion)
+
+Payment method: Visa ending x-9981
+
+Transaction ID: 7AA11122BB333444C
+
+Your payment was sent from buyer@example.com

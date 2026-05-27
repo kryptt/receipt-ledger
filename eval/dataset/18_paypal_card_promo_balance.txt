@@ -1,0 +1,31 @@
+From: Buyer <buyer@example.com>
+Date: Mon, 18 May 2026 at 19:22
+Subject: Fwd: Receipt for your payment to Lakeshore Coffee Roasters
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Mon, 18 May 2026, 19:20
+Subject: You paid Lakeshore Coffee Roasters $12.10 USD
+To: buyer@example.com
+
+
+You paid $12.10 USD to Lakeshore Coffee Roasters
+
+Merchant Lakeshore Coffee Roasters
+Transaction date May 18, 2026 19:20:44 PM PDT
+Order ID LCR-55012
+
+Subtotal $12.10
+Total $12.10 USD
+
+Payment method
+VISA ending x-7781
+
+Earn 3% cash back with PayPal Cashback Mastercard® on everyday purchases.
+[image: PayPal Cashback Mastercard]
+
+Transaction ID: 3QW77410ZX556677A
+
+Your payment was sent from buyer@example.com

@@ -1,0 +1,27 @@
+From: Buyer <buyer@example.com>
+Date: Wed, 20 May 2026 at 09:05
+Subject: Fwd: Your Meadowlark Provisions order is on its way
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Wed, 20 May 2026, 09:02
+Subject: Your Meadowlark Provisions order is on its way
+To: buyer@example.com
+
+
+Good news! Your Meadowlark Provisions order is on its way.
+
+Your package shipped and should arrive within 3-5 business days.
+
+Order summary
+Total €49.94 EUR
+Payment €49.94 EUR
+
+Carrier ParcelExpress
+Tracking number PX447120093NL
+
+Track your delivery any time from your PayPal activity.
+
+Thanks for using PayPal.

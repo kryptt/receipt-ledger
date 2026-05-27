@@ -1,0 +1,34 @@
+From: Buyer <buyer@example.com>
+Date: Thu, 14 May 2026 at 11:03
+Subject: Fwd: You used Pay in 4 at Brightwater Cycles
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Thu, 14 May 2026, 11:00
+Subject: You used Pay in 4 at Brightwater Cycles
+To: buyer@example.com
+
+
+You paid €201.95 EUR to Brightwater Cycles
+
+Merchant Brightwater Cycles
+Transaction date May 14, 2026 11:00:27 AM CEST
+Order ID BW-2026-3390
+
+Subtotal €166.90
+Shipping €15.00
+Tax €20.05
+Total €201.95 EUR
+
+Paid with Pay in 4
+Down payment today €50.49 EUR
+3 remaining payments of €50.49 EUR
+
+Earn 3% cash back with PayPal Cashback Mastercard® on everyday purchases.
+[image: PayPal Cashback Mastercard]
+
+Transaction ID: 5KD88820PQ110934F
+
+Your payment was sent from buyer@example.com

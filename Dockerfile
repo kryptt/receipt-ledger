@@ -18,6 +18,11 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY tests/ tests/
+# The labeled eval dataset doubles as integration-test fixtures (the PayPal
+# pipeline tests `include_str!` cross-currency / installment / card-promo
+# forwards from here), so the test stage needs it in the build context. The
+# release stage ignores it.
+COPY eval/ eval/
 
 # Resolve the native musl target triple so the same Dockerfile builds on amd64
 # and arm64 hosts (e.g. under QEMU emulation in CI). rustc prints lines like

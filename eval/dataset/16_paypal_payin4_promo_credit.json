@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "201.95",
+  "currency": "EUR",
+  "direction": "out",
+  "date": "2026-05-14",
+  "merchant": "Brightwater Cycles",
+  "status": "approved",
+  "routed_account": "paypal_credit"
+}

@@ -1,0 +1,25 @@
+From: Buyer <buyer@example.com>
+Date: Fri, 22 May 2026 at 07:31
+Subject: Fwd: Your Pay in 4 payment went through
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Fri, 22 May 2026, 07:29
+Subject: Your PayPal Pay in 4 payment went through
+To: buyer@example.com
+
+
+Your Pay in 4 payment went through.
+
+You made a $62.00 USD payment for your Pay in 4 plan. The payment was
+charged to the Bank Account ending in x-0142 on May 22, 2026.
+
+Payment method
+Bank Account ending in x-0142
+
+You have 2 payments remaining on this plan. We'll let you know before
+each one is due.
+
+Manage your plan any time in the PayPal app.

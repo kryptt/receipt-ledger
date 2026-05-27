@@ -19,7 +19,7 @@ use serde_json::Value;
 
 use super::parse::{collect_objects, currency_field, parse_amount, parse_date_with, string_field};
 use super::{Adapter, Outcome};
-use crate::schema::{Direction, Extracted, Money, Source};
+use crate::schema::{Amount, Direction, Extracted, Money, Source};
 
 /// Sender substring that identifies a PayPal notification.
 const PAYPAL_SENDER: &str = "service@paypal.com";
@@ -28,6 +28,28 @@ const PAYPAL_SENDER: &str = "service@paypal.com";
 /// than a shipping/marketing/survey notice. Matched case-insensitively. A real
 /// receipt always carries the transaction id label and the "you paid" phrasing.
 const RECEIPT_MARKERS: &[&str] = &["transaction id", "you paid"];
+
+/// Phrases that mark a mail as a **Pay-in-4 installment payment** — paying DOWN
+/// an existing plan whose purchase was already booked at checkout — rather than
+/// a fresh purchase. An installment says "You made a $X payment for your Pay in
+/// 4 plan" (no merchant, just a plan + a funding instrument it was charged to).
+/// Matched case-insensitively as substrings of the body. A real Pay-in-4
+/// *purchase* never says "made a payment for your Pay in 4 plan"; it says
+/// "You paid $X to <merchant>" and carries a Transaction ID. See [`P2`].
+///
+/// [`P2`]: PaypalAdapter::is_installment_payment
+const INSTALLMENT_MARKERS: &[&str] = &[
+    "payment for your pay in 4 plan",
+    "payment for your pay-in-4 plan",
+    "pay in 4 payment went through",
+    "pay-in-4 payment went through",
+];
+
+/// The label PayPal uses for the authoritative USD figure on a cross-currency
+/// receipt: `Total amount of this Transaction: $54.50 USD`. When present, this
+/// is what the user's funding instrument was actually charged, so it — not the
+/// merchant's foreign-currency total — is the booked amount (policy P1).
+const USD_TXN_TOTAL_LABEL: &str = "total amount of this transaction";
 
 pub struct PaypalAdapter;
 
@@ -42,6 +64,13 @@ impl Adapter for PaypalAdapter {
 
     fn is_transaction(&self, body: &str) -> bool {
         let lower = body.to_ascii_lowercase();
+        // P2: a Pay-in-4 installment payment is NOT a transaction — it pays down
+        // a plan whose purchase was already booked. Veto it even if it happens
+        // to carry a receipt marker (a Transaction ID line), so the installment
+        // never spends an LLM call or gets mistaken for a fresh purchase.
+        if is_installment_payment(&lower) {
+            return false;
+        }
         RECEIPT_MARKERS.iter().any(|m| lower.contains(m))
     }
 
@@ -63,13 +92,26 @@ Return ONLY a JSON object (no prose, no markdown fences) with EXACTLY these keys
   "raw_ref": string        // the Order ID if present, else the Transaction ID
 }}
 
-KIND — is this a real money movement?
-- "transaction": an actual completed payment OR a refund — money moved. These
-  carry a "Transaction ID" and a "You paid" / "sent you a refund" line.
-- "other": NO money moved. Set every other field to "". Use "other" for:
-  shipping/delivery updates ("your order is on its way", tracking numbers),
-  "Pay in 4 plan created"/payment-schedule reminders (upcoming/“due” dates, NOT
-  a charge today), surveys, marketing, security notices.
+KIND — is this a real, NEW money movement (a purchase or a refund)?
+THE ONE TEST: does the email say "You paid $X to <MERCHANT>" (a purchase) or
+"<merchant> sent you a refund"? If yes -> "transaction". Otherwise -> "other".
+- "transaction": an actual completed PURCHASE ("You paid $X to <merchant>", with
+  a "Transaction ID" and a merchant name) or a refund. A Pay-in-4 PURCHASE is
+  STILL a transaction even when it shows a "Down payment today" / "3 remaining
+  payments" schedule — the schedule is just HOW it is funded; it was still paid
+  to a merchant today. Book it (account_hint "Pay in 4").
+- "other": NO new money movement to book. Set every other field to "". Use
+  "other" ONLY when there is NO "You paid $X to <merchant>" purchase line:
+  * Pay-in-4 INSTALLMENT payments — "You made a $X payment for your Pay in 4
+    plan" / "Your Pay in 4 payment went through". This pays DOWN an existing
+    plan; it names NO merchant and is charged to a funding instrument, NOT paid
+    "to" a merchant. (If the mail says "You paid ... to <merchant>", it is NOT
+    an installment — it is a purchase.)
+  * "Pay in 4 plan created" / "See your new Pay in 4 plan" / payment-schedule
+    reminders (upcoming / "due" dates, amounts "due today" — NOT a charge to a
+    merchant today).
+  * shipping/delivery updates ("your order is on its way", tracking numbers),
+    surveys, marketing, security notices.
 
 STATUS — pick exactly one token, in this priority order:
 - "refunded"  if this is a refund / money returned to the buyer (words like
@@ -84,22 +126,32 @@ DIRECTION — "out" if the user paid/sent money; "in" if the user RECEIVED money
 (a refund is "in").
 
 AMOUNT & CURRENCY:
-- Use the purchase TOTAL and its own currency — NOT any converted funding amount
-  shown in parentheses (e.g. ignore "PayPal's conversion rate" / a second "$x USD"
-  funding figure). For a refund use the refunded amount.
+- CROSS-CURRENCY RULE (P1): if the email shows a merchant total in a FOREIGN
+  currency AND a line "Total amount of this Transaction: $54.50 USD", BOOK THE
+  USD FIGURE: amount="54.50", currency="USD". That USD line is what the funding
+  instrument was actually charged. Only when NO "Total amount of this
+  Transaction" USD line is present, fall back to the merchant-currency total.
+- Otherwise use the purchase TOTAL (the "Total ..." line, NOT a "Subtotal") and
+  its own currency. Ignore any converted funding amount shown only in
+  parentheses ("PayPal's conversion rate"). For a refund use the refunded amount.
 - "amount" is a positive decimal with a dot separator and NO thousands commas
   and NO currency symbol, e.g. "149.99". "currency" is the 3-letter ISO code of
   that total: € -> EUR, $ -> USD (unless clearly another dollar), £ -> GBP.
 
-ACCOUNT_HINT — classify HOW it was funded. Output EXACTLY one of these strings:
-- "Pay in 4"      if funded by Pay in 4 (lines like "Paid with Pay in 4").
+ACCOUNT_HINT — classify HOW it was funded (P3). Output EXACTLY one of these:
+- "Pay in 4"      if funded by Pay in 4 (lines like "Paid with Pay in 4", or a
+                  "Pay in 4" down-payment / installment breakdown on a PURCHASE).
 - "Pay Later"     if funded by Pay Later / Pay Monthly.
 - "PayPal Credit" if funded by PayPal Credit.
-- "Balance"       if funded from the PayPal balance ("Paid with PayPal balance"
-                  / "Paid with Balance"), OR if NO funding line is stated at all
-                  (Balance is the default).
-- otherwise the card/bank as written, e.g. "Visa ending 1234" or "bank".
-Read the "Paid with ..." line to decide. When in doubt, use "Balance".
+- "Balance"       for ANY other funding — the PayPal balance, a Bank Account, or
+                  a linked card (VISA / Mastercard) — OR if NO funding line is
+                  stated at all (Balance is the default).
+IGNORE PROMOTIONAL NOISE: a line like "Earn 3% cash back with PayPal Cashback
+Mastercard®…" (often with an "[image: ...Mastercard...]" line) is MARKETING, not
+the funding instrument. Do NOT let that promo flip the account_hint to a card.
+Read only the actual "Payment method" / "Paid with" value. A genuine Pay-in-4
+PURCHASE is still credit — the Pay-in-4 line wins over any card shown.
+When in doubt, use "Balance".
 
 DATE — normalize to ISO YYYY-MM-DD. PayPal writes dates like
 "May 11, 2026 10:10:38 AM PDT" -> "2026-05-11"; "March 3, 2026" -> "2026-03-03".
@@ -113,6 +165,15 @@ Examples (illustrative):
   -> {{"kind":"transaction","amount":"72.30","currency":"EUR","direction":"in","status":"refunded","account_hint":"", ...}}
 - "Your Pay in 4 plan has been created. Payment 2 of 4 €53.00 due May 23"
   -> {{"kind":"other", ...everything else ""}}
+- P1 cross-currency: "You paid €44.80 EUR to Shop" + "Total €44.80 EUR" +
+  "Total amount of this Transaction: $54.50 USD" + "Payment method: Visa ..."
+  -> {{"kind":"transaction","amount":"54.50","currency":"USD","direction":"out","account_hint":"Balance","status":"approved", ...}} (USD line wins; a linked card is Balance)
+- P3 promo ignored: "You paid $12.10 USD to Shop" + "Subtotal $12.10" + "VISA" +
+  "Earn 3% cash back with PayPal Cashback Mastercard®…"
+  -> {{"kind":"transaction","amount":"12.10","currency":"USD","direction":"out","account_hint":"Balance","status":"approved", ...}} (VISA → Balance; ignore the Mastercard promo)
+- P2 installment: "Your Pay in 4 payment went through" + "You made a $62.00 USD
+  payment for your Pay in 4 plan ... charged to the Bank Account ending in x-0142"
+  -> {{"kind":"other", ...everything else ""}} (paying down a plan, NOT a purchase)
 
 Do not invent values; if a field is genuinely absent use "".
 
@@ -134,6 +195,35 @@ PayPal email:
         }
         let records = objects.iter().map(parse_one).collect::<Result<Vec<_>>>()?;
         Ok(Outcome::Transaction(records))
+    }
+
+    /// P1: after the model's extraction, deterministically override the booked
+    /// amount/currency with the receipt's `Total amount of this Transaction: $X
+    /// USD` line when present — that USD figure is what the funding instrument
+    /// was actually charged on a cross-currency purchase. A non-transaction
+    /// outcome is passed through untouched.
+    fn postprocess_with_body(&self, json: &Value, body: &str) -> Result<Outcome> {
+        let outcome = self.postprocess(json)?;
+        let Outcome::Transaction(records) = outcome else {
+            return Ok(outcome);
+        };
+        // No authoritative USD line → keep the merchant-currency total (the model
+        // already extracted it); downstream FX converts it at booking time.
+        let Some(usd) = usd_transaction_total(body) else {
+            return Ok(Outcome::Transaction(records));
+        };
+        let usd_currency = crate::schema::Currency::parse("USD")
+            .expect("USD is a valid 3-letter ISO code");
+        // Transform-and-return: rebuild each record with the USD money rather
+        // than mutating in place.
+        let refined = records
+            .into_iter()
+            .map(|r| Extracted {
+                money: Money::new(usd, usd_currency.clone()),
+                ..r
+            })
+            .collect();
+        Ok(Outcome::Transaction(refined))
     }
 }
 
@@ -199,6 +289,57 @@ fn parse_direction(v: Option<&Value>) -> Direction {
 fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
     const FORMATS: &[&str] = &["%Y-%m-%d", "%B %e, %Y", "%b %e, %Y", "%m/%d/%Y"];
     parse_date_with(v, FORMATS)
+}
+
+/// P2: whether a PayPal body is a Pay-in-4 **installment payment** — paying down
+/// an existing plan — rather than a fresh purchase. Pure; the caller passes an
+/// already-lower-cased body. A purchase ("You paid $X to <merchant>") never
+/// contains these phrases, so a `true` here is a confident non-transaction.
+#[must_use]
+fn is_installment_payment(lower_body: &str) -> bool {
+    INSTALLMENT_MARKERS.iter().any(|m| lower_body.contains(m))
+}
+
+/// P1: the authoritative USD figure from a cross-currency receipt's
+/// `Total amount of this Transaction: $54.50 USD` line, if present. Pure — no
+/// I/O — so it is unit tested under `./test.sh`.
+///
+/// Scans line by line for the [`USD_TXN_TOTAL_LABEL`] prefix (case-insensitive),
+/// then reads the first plain decimal that follows on that line through the
+/// sanitizing [`Amount::parse`] gate. Returns `None` when the label is absent or
+/// the value after it is not a clean decimal (fail closed — the caller then
+/// falls back to the merchant-currency total + downstream FX). The currency is
+/// always USD by definition of the label, so it is implied rather than returned.
+#[must_use]
+pub fn usd_transaction_total(body: &str) -> Option<Amount> {
+    body.lines().find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let idx = lower.find(USD_TXN_TOTAL_LABEL)?;
+        // The remainder of the line after the label holds "...: $54.50 USD".
+        let tail = &line[idx + USD_TXN_TOTAL_LABEL.len()..];
+        first_decimal(tail).and_then(|d| Amount::parse(&d).ok())
+    })
+}
+
+/// Extract the first plain decimal token from `s`, ignoring a leading currency
+/// symbol/`$`/`:` and stopping at the first non-`[0-9.]` after digits begin.
+/// `": $54.50 USD"` -> `"54.50"`. Returns `None` if no digit is found. Thousands
+/// commas are not expected on PayPal's USD line; a comma simply terminates the
+/// token (so a stray grouped value fails closed rather than misparsing).
+fn first_decimal(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut started = false;
+    for c in s.chars() {
+        match c {
+            '0'..='9' | '.' => {
+                out.push(c);
+                started = true;
+            }
+            _ if started => break,
+            _ => {}
+        }
+    }
+    if started { Some(out) } else { None }
 }
 
 #[cfg(test)]
@@ -327,5 +468,151 @@ mod tests {
             Outcome::Transaction(v) => assert_eq!(v.len(), 1),
             Outcome::NotATransaction { reason } => panic!("unexpected skip: {reason}"),
         }
+    }
+
+    // --- P2: installment detection / is_transaction prefilter --------------
+
+    #[test]
+    fn installment_payment_is_not_a_transaction() {
+        // Real production shape: "You made a $X payment for your Pay in 4 plan".
+        let body = "Your Pay in 4 payment went through\n\
+            You made a $62.00 USD payment for your Pay in 4 plan. The payment \
+            was charged to the Bank Account ending in x-0142.\n\
+            Payment method\nBank Account";
+        assert!(
+            !PaypalAdapter.is_transaction(body),
+            "an installment payment must not be treated as a transaction"
+        );
+    }
+
+    #[test]
+    fn installment_marker_vetoes_even_with_receipt_markers() {
+        // Even if an installment mail also carried a Transaction ID line, the
+        // installment veto wins — it is paying down an already-booked plan.
+        let body = "You made a $62.00 USD payment for your Pay in 4 plan.\n\
+            Transaction ID: 9ZZ00011AA222333B";
+        assert!(!PaypalAdapter.is_transaction(body));
+    }
+
+    #[test]
+    fn real_payin4_purchase_is_still_a_transaction() {
+        // A genuine Pay-in-4 PURCHASE ("You paid $X to <merchant>") is a
+        // transaction — only the installment-payment phrasing is vetoed.
+        let body = "You paid $212.00 USD to Northwind Outfitters\n\
+            Paid with Pay in 4\nTransaction ID: 6RT90034LM778820B";
+        assert!(PaypalAdapter.is_transaction(body));
+    }
+
+    #[test]
+    fn is_installment_payment_phrases() {
+        assert!(is_installment_payment(
+            "you made a $62.00 usd payment for your pay in 4 plan"
+        ));
+        assert!(is_installment_payment("your pay in 4 payment went through"));
+        // A purchase does not match.
+        assert!(!is_installment_payment("you paid $12.10 usd to a shop"));
+    }
+
+    // --- P1: cross-currency USD total --------------------------------------
+
+    #[test]
+    fn usd_transaction_total_extracts_the_usd_figure() {
+        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
+            Total €44.80 EUR\n\
+            Total amount of this Transaction: $54.50 USD\n\
+            Payment method: Visa ending x-9981";
+        assert_eq!(usd_transaction_total(body), Amount::parse("54.50").ok());
+    }
+
+    #[test]
+    fn usd_transaction_total_absent_when_no_label() {
+        let body = "You paid €44.80 EUR to Shop\nTotal €44.80 EUR";
+        assert_eq!(usd_transaction_total(body), None);
+    }
+
+    #[test]
+    fn first_decimal_strips_symbol_and_currency_suffix() {
+        assert_eq!(first_decimal(": $54.50 USD").as_deref(), Some("54.50"));
+        assert_eq!(first_decimal("  12 USD").as_deref(), Some("12"));
+        assert_eq!(first_decimal("no digits here"), None);
+    }
+
+    #[test]
+    fn postprocess_with_body_overrides_to_usd_on_cross_currency() {
+        // The model extracted the EUR merchant total; the body's authoritative
+        // USD line must win at the deterministic refinement step.
+        let model = json!({
+            "kind": "transaction",
+            "external_id": "7AA11122BB333444C",
+            "amount": "44.80",
+            "currency": "EUR",
+            "direction": "out",
+            "date": "2026-05-12",
+            "merchant": "Northwind Outfitters",
+            "account_hint": "Visa ending x-9981",
+            "status": "approved",
+            "raw_ref": "NW-XCUR-01"
+        });
+        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
+            Total €44.80 EUR\n\
+            Total amount of this Transaction: $54.50 USD\n\
+            Payment method: Visa ending x-9981\n\
+            Transaction ID: 7AA11122BB333444C";
+        let e = one(PaypalAdapter.postprocess_with_body(&model, body).unwrap());
+        assert_eq!(e.amount().value(), Decimal::from_str("54.50").unwrap());
+        assert_eq!(e.currency().as_str(), "USD");
+        // Everything else is preserved from the model's extraction.
+        assert_eq!(e.merchant, "Northwind Outfitters");
+        assert_eq!(e.external_id.as_deref(), Some("7AA11122BB333444C"));
+    }
+
+    #[test]
+    fn postprocess_with_body_keeps_merchant_total_when_no_usd_line() {
+        // No "Total amount of this Transaction" line → fall back to the model's
+        // merchant-currency total (downstream FX handles conversion).
+        let model = fixture_json(); // EUR 149.99
+        let body = "You paid €149.99 EUR to Example Merchant B.V.\nTotal €149.99 EUR";
+        let e = one(PaypalAdapter.postprocess_with_body(&model, body).unwrap());
+        assert_eq!(e.amount().value(), Decimal::from_str("149.99").unwrap());
+        assert_eq!(e.currency().as_str(), "EUR");
+    }
+
+    #[test]
+    fn postprocess_with_body_passes_through_non_transaction() {
+        let v = json!({"kind": "other"});
+        assert!(matches!(
+            PaypalAdapter
+                .postprocess_with_body(&v, "Total amount of this Transaction: $1.00 USD")
+                .unwrap(),
+            Outcome::NotATransaction { .. }
+        ));
+    }
+
+    // --- P3: promo-Mastercard ignored → funding from the real method --------
+
+    #[test]
+    fn promo_mastercard_does_not_become_the_funding_hint() {
+        // The model, following the prompt, reads the real VISA payment method
+        // and ignores the cashback-Mastercard promo. A "Balance"-class hint
+        // (a linked card) routes to PayPal Balance, never credit.
+        use crate::firefly::paypal_is_credit_funded;
+        let visa = one(PaypalAdapter
+            .postprocess(&json!({
+                "kind": "transaction",
+                "external_id": "C1",
+                "amount": "12.10",
+                "currency": "USD",
+                "direction": "out",
+                "date": "2026-05-12",
+                "merchant": "Card Shop",
+                "account_hint": "VISA ending x-7781",
+                "status": "approved",
+                "raw_ref": "C1"
+            }))
+            .unwrap());
+        assert!(
+            !paypal_is_credit_funded(&visa),
+            "a linked VISA card funds the PayPal balance, not credit"
+        );
     }
 }
