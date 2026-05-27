@@ -8,6 +8,7 @@ pub mod adapters;
 pub mod config;
 pub mod dedup;
 pub mod firefly;
+pub mod fx;
 pub mod jmap;
 pub mod llm;
 pub mod model_selection;
@@ -21,6 +22,7 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::firefly::{FireflyClient, SubmitOutcome};
+use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
 use crate::llm::LlmClient;
 use crate::validate::{Verdict, validate};
@@ -61,10 +63,15 @@ pub async fn run() -> Result<Summary> {
         .context("selecting extraction model")?;
     info!(%model, "using extraction model");
     let llm = LlmClient::new(&http, &cfg.ollama_url, model, cfg.llm_timeout);
+    // FX over the shared client; converts foreign charges into the target
+    // account's currency before booking. An FX error propagates from `submit`
+    // and routes the message to Review (never books at a wrong amount).
+    let fx = FxClient::new(&http, &cfg.fx_url);
     let firefly = FireflyClient::new(
         &http,
         &cfg.firefly_url,
         &cfg.firefly_token,
+        &fx,
         &cfg.paypal_balance_account,
         cfg.paypal_credit_account.clone(),
         cfg.banco_popular_usd_account.clone(),

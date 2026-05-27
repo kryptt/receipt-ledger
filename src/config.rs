@@ -23,6 +23,10 @@ const DEFAULT_MODEL_ALLOWLIST: &str = "gemma4:e2b";
 /// LLM request path — JMAP and Firefly keep the shared client's shorter timeout.
 const DEFAULT_LLM_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_FIREFLY_URL: &str = "http://firefly:8080";
+/// Default FX-rate provider — Frankfurter (ECB rates, key-free). Mirrors
+/// [`crate::fx::DEFAULT_FX_URL`]; kept as a literal here so config has no
+/// compile-time dependency on the fx module.
+const DEFAULT_FX_URL: &str = "https://api.frankfurter.app";
 const DEFAULT_PROCESSED_MAILBOX: &str = "Processed";
 const DEFAULT_REVIEW_MAILBOX: &str = "Review";
 
@@ -42,6 +46,11 @@ pub struct Config {
 
     pub firefly_url: String,
     pub firefly_token: String,
+    /// FX-rate provider base URL (Frankfurter-compatible). Used to convert a
+    /// foreign-currency charge into the target account's currency before
+    /// booking. An FX failure routes the message to Review rather than booking
+    /// the foreign number as the account currency.
+    pub fx_url: String,
     /// PayPal Balance account in Firefly (asset, USD) — name or numeric id.
     /// Required: a PayPal record whose funding is *not* a credit product books
     /// here, so this is the safe default and must always be present.
@@ -89,6 +98,7 @@ impl Config {
 
             firefly_url: env_or("RECEIPT_FIREFLY_URL", DEFAULT_FIREFLY_URL),
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
+            fx_url: env_or("RECEIPT_FX_URL", DEFAULT_FX_URL),
             // No sensible default — the safe-default PayPal account must always
             // point at a real Firefly account.
             paypal_balance_account: required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,

@@ -41,8 +41,14 @@ impl Adapter for BancoPopularAdapter {
 Devuelve SOLO un objeto JSON (sin prosa, sin bloques de markdown) con EXACTAMENTE estas claves:
 
 {{
-  "amount": string,        // el Monto como decimal, SIN prefijo de moneda ni "$"; de "EUR$1.50" extrae "1.50"
-  "currency": string,      // ISO-4217: Euro->EUR, Dólares/Dolares->USD, Pesos/Peso Dominicano->DOP. Úsalo de la columna Moneda o del prefijo XXX$
+  "amount": string,        // el Monto como decimal, SIN prefijo de moneda ni "$"; de "EUR$1.50" extrae "1.50", de "JPY$5,130.00" extrae "5130.00", de "US$65.33" extrae "65.33"
+  "currency": string,      // código ISO-4217 de 3 letras. Mapea el nombre de la columna "Moneda" (en español) Y/O el prefijo "XXX$" del Monto:
+                           //   Euro->EUR; Yen->JPY; Won->KRW;
+                           //   "Dólar estadounidense"/Dólar/Dólares/US$->USD;
+                           //   "Peso dominicano"/Peso/Pesos/RD$->DOP;
+                           //   Libra/"Libra esterlina"->GBP; "Franco suizo"->CHF;
+                           //   Yuan->CNY; "Dólar canadiense"->CAD; "Dólar australiano"->AUD.
+                           // Si el Monto trae prefijo (p.ej. "JPY$5,130.00") usa ese código (JPY) tal cual.
   "direction": "out",      // un consumo es siempre una compra/cargo: "out"
   "date": string,          // la Fecha en ISO YYYY-MM-DD. La FUENTE viene en DD/MM/YYYY
   "merchant": string,      // el valor de la columna Comercio
@@ -53,7 +59,8 @@ Devuelve SOLO un objeto JSON (sin prosa, sin bloques de markdown) con EXACTAMENT
 
 Reglas:
 - La tabla tiene columnas Monto | Moneda | Fecha | Comercio | Estatus (a veces una columna extra Razón).
-- "amount" debe ser un decimal positivo con punto como separador, sin prefijo de moneda.
+- "amount" debe ser un decimal positivo con punto como separador, SIN prefijo de moneda y SIN separador de miles (de "5,130.00" usa "5130.00").
+- "currency" debe ser SIEMPRE un código ISO-4217 de 3 letras en mayúsculas (EUR, JPY, KRW, USD, DOP, ...), nunca el nombre en español.
 - No inventes valores; si un campo realmente no está presente usa "".
 
 Notificación:
@@ -200,5 +207,34 @@ mod tests {
     fn accepts_transactions_wrapper() {
         let v = json!({ "transactions": [approved_json()] });
         assert_eq!(BancoPopularAdapter.postprocess(&v).unwrap().len(), 1);
+    }
+
+    /// The model maps "Moneda" = "Yen" (rendered `JPY$5,130.00`) to ISO "JPY".
+    /// We assert the postprocessed record carries currency "JPY" and the bare
+    /// decimal amount (the model strips the prefix + thousands separator).
+    #[test]
+    fn yen_row_postprocesses_with_jpy_currency() {
+        let mut v = approved_json();
+        v["currency"] = json!("JPY");
+        v["amount"] = json!("5130.00");
+        v["merchant"] = json!("Example Ramen Tokyo");
+        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
+        assert_eq!(e.currency, "JPY");
+        assert_eq!(e.amount, Decimal::from_str("5130.00").unwrap());
+        // JPY is a known currency, so an approved row books.
+        assert!(matches!(validate(e.clone()), Verdict::Booked(_)));
+    }
+
+    /// The model maps "Moneda" = "Won" (rendered `KRW$8,700.00`) to ISO "KRW".
+    #[test]
+    fn won_row_postprocesses_with_krw_currency() {
+        let mut v = approved_json();
+        v["currency"] = json!("KRW");
+        v["amount"] = json!("8700.00");
+        v["merchant"] = json!("Example Bibimbap Seoul");
+        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
+        assert_eq!(e.currency, "KRW");
+        assert_eq!(e.amount, Decimal::from_str("8700.00").unwrap());
+        assert!(matches!(validate(e.clone()), Verdict::Booked(_)));
     }
 }
