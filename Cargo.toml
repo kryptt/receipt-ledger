@@ -1,0 +1,37 @@
+[package]
+name = "receipt-ledger"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Transaction-notification-email → Firefly III ingestor (one-shot CronJob)"
+
+[dependencies]
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust_decimal = { version = "1", features = ["serde-with-str"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = "0.10"
+
+# reqwest 0.13 is pinned by jmap-client; reuse the same major here so the
+# dependency tree carries a single reqwest. rustls-no-provider keeps us off
+# reqwest's default rustls feature gymnastics; we install the ring crypto
+# provider ourselves in main(). aws-lc-rs is still pulled transitively by
+# jmap-client's `reqwest/rustls` feature, hence the cmake/clang build deps
+# in the Dockerfile builder stage.
+reqwest = { version = "0.13", default-features = false, features = ["http2", "json", "charset", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
+# stalwartlabs JMAP + MIME parsing. Drop default features to avoid the
+# websockets/tokio-tungstenite stack we never use; `async` + `ring` give us
+# the reqwest-backed async client on a pure-Rust TLS path.
+jmap-client = { version = "0.4", default-features = false, features = ["async", "ring"] }
+mail-parser = "0.11"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
