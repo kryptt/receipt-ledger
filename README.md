@@ -44,19 +44,28 @@ prompt, and a JSON→typed parser. See [`src/adapters/`](src/adapters/).
 
 ## How it works
 
-```
-JMAP mailbox (incremental: only new mail since the last run)
-  │
-  ├─ unwrap the forward, recover the original sender (PayPal, the bank, …)
-  ├─ pick the per-sender adapter; cheaply skip mail that isn't a transaction
-  ├─ ask your LLM (OpenAI-compatible /v1/chat/completions) to extract JSON
-  │
-  ├─ validate (deterministic, fail-closed):
-  │     approved status only · outgoing only · amount > 0 · known currency · merchant present
-  ├─ FX-convert foreign charges to the target account's currency (ECB rates)
-  ├─ flag implausibly large charges (optional USD ceiling) for Review
-  ├─ dedup (provider transaction id, or a content hash) — re-runs never double-book
-  └─ POST to Firefly III  →  move the email to Processed (booked) or Review (needs a human)
+```mermaid
+flowchart TD
+    A([JMAP mailbox<br/>new mail since the last run]) --> B[Unwrap the forward<br/>recover the original sender]
+    B --> C{Looks like a<br/>transaction?}
+    C -->|no — shipping, plan,<br/>installment, survey| SKIP[Skip]
+    C -->|yes| D[LLM extracts the fields as JSON<br/>your OpenAI-compatible endpoint]
+    D --> E{Validation gates<br/>approved · outgoing · amount &gt; 0<br/>known currency · merchant present}
+    E -->|fail| REV[Needs a human]
+    E -->|pass| F[FX-convert a foreign charge<br/>to the account currency · ECB rates]
+    F --> G{Over the optional<br/>USD ceiling?}
+    G -->|yes| REV
+    G -->|no| H[Dedup<br/>provider txn id or content hash]
+    H --> I[POST to Firefly III]
+    I --> BOOK[Booked]
+    SKIP --> P[(Processed mailbox)]
+    BOOK --> P
+    REV --> R[(Review mailbox)]
+
+    classDef ok fill:#e6f4ea,stroke:#34a853,color:#0b3d1f;
+    classDef warn fill:#fde8e8,stroke:#d93025,color:#5c0b0b;
+    class BOOK,SKIP,P ok;
+    class REV,R warn;
 ```
 
 The money-touching steps — validation, FX conversion, dedup, submission — are
