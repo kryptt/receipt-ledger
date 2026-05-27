@@ -15,18 +15,12 @@ use rust_decimal::Decimal;
 use serde_json::json;
 
 use receipt_ledger::adapters::{self, Outcome};
-use receipt_ledger::config::ValidationPolicy;
 use receipt_ledger::dedup;
 use receipt_ledger::schema::{Direction, Extracted, Source};
 use receipt_ledger::unwrap::unwrap_forward;
 use receipt_ledger::validate::{Verdict, validate};
 
 const FIXTURE: &str = include_str!("fixtures/paypal_accell.txt");
-
-/// No-ceiling policy for the deterministic-core tests.
-fn policy() -> ValidationPolicy {
-    ValidationPolicy { max_amount: None }
-}
 
 /// The single record from a `Transaction` outcome, or a panic.
 fn one(outcome: Outcome) -> Extracted {
@@ -90,7 +84,7 @@ fn paypal_fixture_books_with_expected_fields() {
     assert!(record.merchant.contains("Example Merchant"));
 
     // 5. Validation gates → booked.
-    let booked = match validate(record, &policy()) {
+    let booked = match validate(record) {
         Verdict::Booked(b) => b,
         Verdict::Review { reason } => panic!("expected booked, got review: {reason}"),
     };
@@ -121,10 +115,7 @@ fn declined_paypal_goes_to_review() {
     });
 
     let record = one(adapter.postprocess(&model_json).unwrap());
-    assert!(matches!(
-        validate(record, &policy()),
-        Verdict::Review { .. }
-    ));
+    assert!(matches!(validate(record), Verdict::Review { .. }));
 }
 
 /// M1: non-receipt PayPal mail (a shipping update) is a clean skip via the

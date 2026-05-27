@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "24.75",
+  "currency": "USD",
+  "direction": "out",
+  "date": "2026-04-17",
+  "merchant": "Harborlight Coffee Roasters",
+  "status": "approved",
+  "routed_account": "paypal_balance"
+}

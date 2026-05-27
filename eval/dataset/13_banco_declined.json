@@ -1,0 +1,10 @@
+{
+  "from": "Cliente Ejemplo <cliente@example.com>",
+  "kind": "transaction",
+  "amount": "318.40",
+  "currency": "USD",
+  "direction": "out",
+  "date": "2026-03-27",
+  "merchant": "Velocity Auto Parts",
+  "status": "declined"
+}

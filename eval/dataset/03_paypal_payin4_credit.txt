@@ -1,0 +1,30 @@
+From: Buyer <buyer@example.com>
+Date: Sat, 9 May 2026 at 13:20
+Subject: Fwd: Your Pay in 4 purchase is confirmed
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Sat, 9 May 2026, 13:18
+Subject: You used Pay in 4 at Northwind Outfitters
+To: buyer@example.com
+
+
+You paid $212.00 USD to Northwind Outfitters
+
+Merchant Northwind Outfitters
+Transaction date May 9, 2026 13:18:02 PM PDT
+Order ID NW-2026-5582
+
+Subtotal $200.00
+Tax $12.00
+Total $212.00 USD
+
+Paid with Pay in 4
+Down payment today $53.00 USD
+3 remaining payments of $53.00 USD
+
+Transaction ID: 6RT90034LM778820B
+
+Your payment was sent from buyer@example.com

@@ -51,34 +51,70 @@ impl Adapter for PaypalAdapter {
 Return ONLY a JSON object (no prose, no markdown fences) with EXACTLY these keys:
 
 {{
-  "kind": "transaction" | "other", // "transaction" ONLY for an actual payment
-                           // receipt (money moved). Use "other" for shipping
-                           // updates ("your order is on its way"), plan/"Pay in
-                           // 4" reminders, surveys, marketing, or anything where
-                           // no payment occurred.
-  "external_id": string,   // the "Transaction ID" value
-  "amount": string,        // the TOTAL amount as a decimal string, e.g. "149.99"
-  "currency": string,      // ISO-4217 code of the total, e.g. "EUR"
-  "direction": "out" | "in", // "out" if the user paid/sent money, "in" if received
-  "date": string,          // the transaction date as ISO YYYY-MM-DD
+  "kind": "transaction" | "other",
+  "external_id": string,   // the "Transaction ID" value, else ""
+  "amount": string,        // the purchase TOTAL as a decimal string, e.g. "149.99"
+  "currency": string,      // ISO-4217 code of the TOTAL, e.g. "EUR" / "USD" / "GBP"
+  "direction": "out" | "in",
+  "date": string,          // the transaction/refund date as ISO YYYY-MM-DD
   "merchant": string,      // the merchant / payee name
-  "account_hint": string,  // the FUNDING METHOD/SOURCE, stated plainly, else ""
-  "status": string,        // the payment status text, e.g. "approved" / "completed"
+  "account_hint": string,  // the FUNDING METHOD, one of the values listed below
+  "status": string,        // one of: "approved", "refunded", "declined", "pending"
   "raw_ref": string        // the Order ID if present, else the Transaction ID
 }}
 
-Rules:
-- If this email is NOT a payment receipt, set "kind" to "other" and leave the
-  other fields as "". Otherwise set "kind" to "transaction".
-- Use the purchase TOTAL and its currency, not any converted funding amount.
-- "amount" must be a positive decimal string with a dot separator.
-- If the payment clearly succeeded, set "status" to "approved".
-- For "account_hint", report HOW the payment was funded as clearly as the
-  receipt states it. Use the PayPal funding product name when present —
-  "PayPal Credit", "Pay in 4", "Pay Later", "Pay Monthly" — or "Balance" when
-  funded from the PayPal balance, or the card/bank when funded that way, e.g.
-  "Visa ending 1234" or "bank". If the funding source is not stated, use "".
-- Do not invent values; if a field is genuinely absent use "".
+KIND — is this a real money movement?
+- "transaction": an actual completed payment OR a refund — money moved. These
+  carry a "Transaction ID" and a "You paid" / "sent you a refund" line.
+- "other": NO money moved. Set every other field to "". Use "other" for:
+  shipping/delivery updates ("your order is on its way", tracking numbers),
+  "Pay in 4 plan created"/payment-schedule reminders (upcoming/“due” dates, NOT
+  a charge today), surveys, marketing, security notices.
+
+STATUS — pick exactly one token, in this priority order:
+- "refunded"  if this is a refund / money returned to the buyer (words like
+              "refund", "refunded", "sent you a refund", "reversed"). A refund
+              email often ALSO mentions the original successful payment — ignore
+              that; if money is being returned, status is "refunded".
+- "declined"  if the payment failed / was declined / cancelled / disputed.
+- "pending"   if the payment is pending / processing / on hold.
+- "approved"  ONLY for a normal completed outgoing payment with none of the above.
+
+DIRECTION — "out" if the user paid/sent money; "in" if the user RECEIVED money
+(a refund is "in").
+
+AMOUNT & CURRENCY:
+- Use the purchase TOTAL and its own currency — NOT any converted funding amount
+  shown in parentheses (e.g. ignore "PayPal's conversion rate" / a second "$x USD"
+  funding figure). For a refund use the refunded amount.
+- "amount" is a positive decimal with a dot separator and NO thousands commas
+  and NO currency symbol, e.g. "149.99". "currency" is the 3-letter ISO code of
+  that total: € -> EUR, $ -> USD (unless clearly another dollar), £ -> GBP.
+
+ACCOUNT_HINT — classify HOW it was funded. Output EXACTLY one of these strings:
+- "Pay in 4"      if funded by Pay in 4 (lines like "Paid with Pay in 4").
+- "Pay Later"     if funded by Pay Later / Pay Monthly.
+- "PayPal Credit" if funded by PayPal Credit.
+- "Balance"       if funded from the PayPal balance ("Paid with PayPal balance"
+                  / "Paid with Balance"), OR if NO funding line is stated at all
+                  (Balance is the default).
+- otherwise the card/bank as written, e.g. "Visa ending 1234" or "bank".
+Read the "Paid with ..." line to decide. When in doubt, use "Balance".
+
+DATE — normalize to ISO YYYY-MM-DD. PayPal writes dates like
+"May 11, 2026 10:10:38 AM PDT" -> "2026-05-11"; "March 3, 2026" -> "2026-03-03".
+
+Examples (illustrative):
+- "Paid with PayPal balance €58.40 EUR" + "You paid €58.40 EUR to Tulip Press"
+  -> {{"kind":"transaction","amount":"58.40","currency":"EUR","direction":"out","account_hint":"Balance","status":"approved", ...}}
+- "Paid with Pay in 4" + "You paid $212.00 USD to Northwind Outfitters"
+  -> {{"kind":"transaction","amount":"212.00","currency":"USD","direction":"out","account_hint":"Pay in 4","status":"approved", ...}}
+- "Maple & Stone Goods sent you a refund of €72.30 EUR"
+  -> {{"kind":"transaction","amount":"72.30","currency":"EUR","direction":"in","status":"refunded","account_hint":"", ...}}
+- "Your Pay in 4 plan has been created. Payment 2 of 4 €53.00 due May 23"
+  -> {{"kind":"other", ...everything else ""}}
+
+Do not invent values; if a field is genuinely absent use "".
 
 PayPal email:
 ---
@@ -168,16 +204,10 @@ fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ValidationPolicy;
     use crate::validate::{Verdict, validate};
     use rust_decimal::Decimal;
     use serde_json::json;
     use std::str::FromStr;
-
-    /// No-ceiling validation policy for these adapter-level tests.
-    fn policy() -> ValidationPolicy {
-        ValidationPolicy { max_amount: None }
-    }
 
     /// The JSON a correctly-behaving model produces for the fixture receipt.
     fn fixture_json() -> Value {
@@ -245,7 +275,7 @@ mod tests {
         assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 11).unwrap());
         assert!(e.merchant.contains("Example Merchant"));
 
-        match validate(e, &policy()) {
+        match validate(e) {
             Verdict::Booked(b) => {
                 assert_eq!(
                     b.as_extracted().external_id.as_deref(),
@@ -280,7 +310,7 @@ mod tests {
         let mut v = fixture_json();
         v["status"] = json!("Declined");
         let e = one(PaypalAdapter.postprocess(&v).unwrap());
-        assert!(matches!(validate(e, &policy()), Verdict::Review { .. }));
+        assert!(matches!(validate(e), Verdict::Review { .. }));
     }
 
     #[test]

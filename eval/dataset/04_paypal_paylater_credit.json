@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "389.95",
+  "currency": "EUR",
+  "direction": "out",
+  "date": "2026-05-11",
+  "merchant": "Greenfield Hardware Co.",
+  "status": "approved",
+  "routed_account": "paypal_credit"
+}

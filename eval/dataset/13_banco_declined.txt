@@ -1,0 +1,29 @@
+From: Cliente Ejemplo <cliente@example.com>
+Date: Fri, 27 Mar 2026 at 16:48
+Subject: Fwd: Notificación de Consumo
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: <notificaciones@popularenlinea.com>
+Date: Fri, 27 Mar 2026, 16:45
+Subject: Notificación de Consumo
+To: cliente@example.com
+
+
+Banco Popular Dominicano
+
+Notificación de Consumo
+
+Estimado(a) CLIENTE EJEMPLO,
+
+Le informamos que se ha intentado un consumo con su Tarjeta de Crédito
+terminada en 4417. A continuación los detalles de la transacción:
+
+Monto         Moneda  Fecha        Comercio              Estatus
+USD$318.40    Dólar   27/03/2026   Velocity Auto Parts   Declinada
+
+Si usted no reconoce esta transacción, comuníquese de inmediato con
+nuestro Centro de Atención Telefónica.
+
+Gracias por preferir el Banco Popular Dominicano.

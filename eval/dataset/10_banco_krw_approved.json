@@ -1,0 +1,11 @@
+{
+  "from": "<notificaciones@popularenlinea.com>",
+  "kind": "transaction",
+  "amount": "8700.00",
+  "currency": "KRW",
+  "direction": "out",
+  "date": "2026-03-19",
+  "merchant": "Hanok Tea Garden",
+  "status": "approved",
+  "routed_account": "banco_popular_usd"
+}

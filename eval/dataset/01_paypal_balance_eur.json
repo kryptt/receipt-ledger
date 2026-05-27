@@ -1,0 +1,11 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "58.40",
+  "currency": "EUR",
+  "direction": "out",
+  "date": "2026-03-03",
+  "merchant": "Tulip Press Studio",
+  "status": "approved",
+  "routed_account": "paypal_balance"
+}

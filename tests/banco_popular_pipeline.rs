@@ -19,7 +19,6 @@ use serde_json::json;
 use std::str::FromStr;
 
 use receipt_ledger::adapters::{self, Outcome};
-use receipt_ledger::config::ValidationPolicy;
 use receipt_ledger::dedup;
 use receipt_ledger::schema::{Direction, Extracted, Source};
 use receipt_ledger::unwrap::unwrap_message;
@@ -27,10 +26,6 @@ use receipt_ledger::validate::{Verdict, validate};
 
 const AUTOFORWARD: &str = include_str!("fixtures/banco_popular_autoforward.txt");
 const MANUAL_FWD: &str = include_str!("fixtures/banco_popular_manual_fwd.txt");
-
-fn policy() -> ValidationPolicy {
-    ValidationPolicy { max_amount: None }
-}
 
 /// The single record from a `Transaction` outcome, or a panic.
 fn one(outcome: Outcome) -> Extracted {
@@ -94,7 +89,7 @@ fn autoforwarded_consumo_books_with_expected_fields() {
     assert_eq!(record.account_hint.as_deref(), Some("1234"));
 
     // 5. Validation gates → booked.
-    let booked = match validate(record, &policy()) {
+    let booked = match validate(record) {
         Verdict::Booked(b) => b,
         Verdict::Review { reason } => panic!("expected booked, got review: {reason}"),
     };
@@ -137,8 +132,5 @@ fn manual_forward_recovers_inner_bank_sender_and_declined_reviews() {
     assert_eq!(record.status, "Declinada");
 
     // 4. A declined consumo never books.
-    assert!(matches!(
-        validate(record, &policy()),
-        Verdict::Review { .. }
-    ));
+    assert!(matches!(validate(record), Verdict::Review { .. }));
 }

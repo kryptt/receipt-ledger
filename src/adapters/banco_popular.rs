@@ -47,27 +47,64 @@ impl Adapter for BancoPopularAdapter {
 Devuelve SOLO un objeto JSON (sin prosa, sin bloques de markdown) con EXACTAMENTE estas claves:
 
 {{
-  "amount": string,        // el Monto como decimal, SIN prefijo de moneda ni "$"; de "EUR$1.50" extrae "1.50", de "JPY$5,130.00" extrae "5130.00", de "US$65.33" extrae "65.33"
-  "currency": string,      // código ISO-4217 de 3 letras. Mapea el nombre de la columna "Moneda" (en español) Y/O el prefijo "XXX$" del Monto:
-                           //   Euro->EUR; Yen->JPY; Won->KRW;
-                           //   "Dólar estadounidense"/Dólar/Dólares/US$->USD;
-                           //   "Peso dominicano"/Peso/Pesos/RD$->DOP;
-                           //   Libra/"Libra esterlina"->GBP; "Franco suizo"->CHF;
-                           //   Yuan->CNY; "Dólar canadiense"->CAD; "Dólar australiano"->AUD.
-                           // Si el Monto trae prefijo (p.ej. "JPY$5,130.00") usa ese código (JPY) tal cual.
+  "amount": string,        // el Monto como decimal puro
+  "currency": string,      // código ISO-4217 de 3 letras MAYÚSCULAS
   "direction": "out",      // un consumo es siempre una compra/cargo: "out"
-  "date": string,          // la Fecha en ISO YYYY-MM-DD. La FUENTE viene en DD/MM/YYYY
+  "date": string,          // la Fecha en ISO YYYY-MM-DD
   "merchant": string,      // el valor de la columna Comercio
-  "account_hint": string,  // los últimos 4 dígitos de la tarjeta ("terminada en NNNN"), p.ej. "1234"
-  "status": string,        // el Estatus textual: "Aprobada" o "Declinada"
+  "account_hint": string,  // los últimos 4 dígitos de la tarjeta, p.ej. "4417"
+  "status": string,        // "Aprobada" o "Declinada"
   "raw_ref": string        // "" (no hay id de referencia)
 }}
 
-Reglas:
-- La tabla tiene columnas Monto | Moneda | Fecha | Comercio | Estatus (a veces una columna extra Razón).
-- "amount" debe ser un decimal positivo con punto como separador, SIN prefijo de moneda y SIN separador de miles (de "5,130.00" usa "5130.00").
-- "currency" debe ser SIEMPRE un código ISO-4217 de 3 letras en mayúsculas (EUR, JPY, KRW, USD, DOP, ...), nunca el nombre en español.
-- No inventes valores; si un campo realmente no está presente usa "".
+La tabla tiene columnas Monto | Moneda | Fecha | Comercio | Estatus (a veces sin
+la columna Moneda, o con una columna extra Razón). El Monto viene con un prefijo
+de moneda y "$", p.ej. "EUR$1.50", "JPY$5,130.00", "US$65.33", "RD$1,450.00".
+
+MONTO ("amount"):
+- Quita el prefijo de moneda Y el signo "$", y quita los separadores de miles
+  (comas). Deja un decimal positivo con punto. Ejemplos:
+    "EUR$1.50"     -> "1.50"
+    "JPY$5,130.00" -> "5130.00"
+    "US$65.33"     -> "65.33"
+    "RD$1,450.00"  -> "1450.00"
+
+MONEDA ("currency") — SIEMPRE un código ISO-4217 de 3 letras en mayúsculas,
+NUNCA el nombre en español. Decide usando el prefijo "XXX$" del Monto Y/O el
+nombre de la columna "Moneda":
+- prefijo "EUR$"  o  Moneda "Euro"                         -> EUR
+- prefijo "JPY$"  o  Moneda "Yen"                          -> JPY
+- prefijo "KRW$"  o  Moneda "Won"                          -> KRW
+- prefijo "US$"/"USD$" o Moneda "Dólar"/"Dólares"/"Dólar estadounidense" -> USD
+- prefijo "RD$"   o  Moneda "Peso"/"Pesos"/"Peso dominicano"             -> DOP
+- prefijo "GBP$"  o  Moneda "Libra"/"Libra esterlina"      -> GBP
+- Moneda "Franco suizo" -> CHF; "Yuan" -> CNY;
+  "Dólar canadiense" -> CAD; "Dólar australiano" -> AUD.
+- Si el Monto trae un prefijo ISO claro (p.ej. "JPY$..."), usa ESE código tal
+  cual aunque la columna Moneda use otro nombre.
+
+FECHA ("date") — la FUENTE viene en DD/MM/YYYY (día primero, NO mes primero).
+Conviértela a ISO YYYY-MM-DD: "27/05/2026" -> "2026-05-27"; "04/03/2026" ->
+"2026-03-04" (4 de marzo, no 3 de abril).
+
+ESTATUS ("status") — copia el texto: "Aprobada" si la transacción se aprobó,
+"Declinada" si se rechazó/declinó.
+
+ACCOUNT_HINT — los 4 dígitos de "Tarjeta ... terminada en NNNN", p.ej. "4417".
+
+Ejemplos:
+- "EUR$64.20  Euro  04/03/2026  Tulip Press Studio  Aprobada"
+  -> {{"amount":"64.20","currency":"EUR","date":"2026-03-04","merchant":"Tulip Press Studio","status":"Aprobada","direction":"out","account_hint":"4417","raw_ref":""}}
+- "JPY$5,130.00  Yen  12/03/2026  Sakura Ramen House  Aprobada"
+  -> {{"amount":"5130.00","currency":"JPY", ...}}
+- "KRW$8,700.00  Won  19/03/2026  Hanok Tea Garden  Aprobada"
+  -> {{"amount":"8700.00","currency":"KRW", ...}}
+- "RD$1,450.00  Peso dominicano  25/03/2026  Colmado La Esquina  Aprobada"
+  -> {{"amount":"1450.00","currency":"DOP", ...}}
+- "USD$318.40  Dólar  27/03/2026  Velocity Auto Parts  Declinada"
+  -> {{"amount":"318.40","currency":"USD","status":"Declinada", ...}}
+
+No inventes valores; si un campo realmente no está presente usa "".
 
 Notificación:
 ---
@@ -131,16 +168,10 @@ fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ValidationPolicy;
     use crate::validate::{Verdict, validate};
     use rust_decimal::Decimal;
     use serde_json::json;
     use std::str::FromStr;
-
-    /// No-ceiling validation policy for these adapter-level tests.
-    fn policy() -> ValidationPolicy {
-        ValidationPolicy { max_amount: None }
-    }
 
     /// JSON a correct model returns for an APPROVED consumo (the autoforward
     /// fixture): `EUR$1.50  Euro  27/05/2026  Example Cafe Amsterdam  Aprobada`.
@@ -189,7 +220,7 @@ mod tests {
         assert_eq!(e.merchant, "Example Cafe Amsterdam");
         assert_eq!(e.account_hint.as_deref(), Some("1234"));
 
-        match validate(e, &policy()) {
+        match validate(e) {
             Verdict::Booked(b) => {
                 assert_eq!(b.as_extracted().source, Source::BancoPopular);
                 assert_eq!(b.as_extracted().external_id, None);
@@ -205,7 +236,7 @@ mod tests {
         v["amount"] = json!("49.08");
         v["merchant"] = json!("Example Shop B.V.");
         let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
-        assert!(matches!(validate(e, &policy()), Verdict::Review { .. }));
+        assert!(matches!(validate(e), Verdict::Review { .. }));
     }
 
     #[test]
@@ -259,7 +290,7 @@ mod tests {
         assert_eq!(e.currency().as_str(), "JPY");
         assert_eq!(e.amount().value(), Decimal::from_str("5130.00").unwrap());
         // JPY is a known currency, so an approved row books.
-        assert!(matches!(validate(e, &policy()), Verdict::Booked(_)));
+        assert!(matches!(validate(e), Verdict::Booked(_)));
     }
 
     /// The model maps "Moneda" = "Won" (rendered `KRW$8,700.00`) to ISO "KRW".
@@ -272,7 +303,7 @@ mod tests {
         let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
         assert_eq!(e.currency().as_str(), "KRW");
         assert_eq!(e.amount().value(), Decimal::from_str("8700.00").unwrap());
-        assert!(matches!(validate(e, &policy()), Verdict::Booked(_)));
+        assert!(matches!(validate(e), Verdict::Booked(_)));
     }
 
     // --- property tests --------------------------------------------------

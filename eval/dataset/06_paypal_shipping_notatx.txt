@@ -1,0 +1,24 @@
+From: Buyer <buyer@example.com>
+Date: Wed, 13 May 2026 at 08:15
+Subject: Fwd: Your order is on its way!
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Wed, 13 May 2026, 08:12
+Subject: Good news! Your order from Aurora Bike Works has shipped
+To: buyer@example.com
+
+
+Good news! Your order is on its way.
+
+Aurora Bike Works has shipped your recent order. Your package is
+expected to arrive within 3-5 business days.
+
+Carrier ParcelExpress
+Tracking number PX889204471DE
+
+You can track your delivery any time from your PayPal activity.
+
+Thanks for using PayPal.

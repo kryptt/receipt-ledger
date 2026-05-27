@@ -1,0 +1,11 @@
+{
+  "from": "<notificaciones@popularenlinea.com>",
+  "kind": "transaction",
+  "amount": "5130.00",
+  "currency": "JPY",
+  "direction": "out",
+  "date": "2026-03-12",
+  "merchant": "Sakura Ramen House",
+  "status": "approved",
+  "routed_account": "banco_popular_usd"
+}

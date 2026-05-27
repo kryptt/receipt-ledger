@@ -1,0 +1,11 @@
+{
+  "from": "<notificaciones@popularenlinea.com>",
+  "kind": "transaction",
+  "amount": "65.33",
+  "currency": "USD",
+  "direction": "out",
+  "date": "2026-03-22",
+  "merchant": "Harborlight Coffee",
+  "status": "approved",
+  "routed_account": "banco_popular_usd"
+}

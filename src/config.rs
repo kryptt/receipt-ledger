@@ -71,13 +71,22 @@ impl std::fmt::Display for AccountId {
     }
 }
 
-/// Deterministic validation policy, derived from configuration and consumed by
-/// [`crate::validate::validate`]. Carries only the knobs that gate booking.
+/// Deterministic validation policy, derived from configuration. Carries only
+/// the knobs that gate booking.
+///
+/// Note: the only field is the *USD-equivalent* ceiling, which is FX-dependent
+/// and therefore applied in the async pipeline ([`crate::process_message`]),
+/// NOT in the pure [`crate::validate::validate`] gate. The struct lives in
+/// config so the threshold is parsed once at the boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValidationPolicy {
-    /// Plausibility ceiling for a single transaction amount. `None` means no
-    /// upper bound. When `Some(max)`, an amount strictly greater than `max`
-    /// routes to Review rather than booking (`RECEIPT_MAX_AMOUNT`).
+    /// Plausibility ceiling for a single transaction amount, **interpreted as
+    /// US dollars** (`RECEIPT_MAX_AMOUNT`). `None` means no upper bound. When
+    /// `Some(max)`, a charge whose USD-equivalent (`fx_rate(currency→USD) ×
+    /// amount`) strictly exceeds `max` routes to Review rather than booking.
+    /// The conversion to USD happens in the pipeline because it needs a live FX
+    /// rate; a non-USD charge like ₩100,000 (≈ $72) must NOT trip a $100,000
+    /// ceiling, and the raw 100000 figure alone cannot tell us that.
     pub max_amount: Option<Decimal>,
 }
 

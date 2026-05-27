@@ -7,6 +7,7 @@
 pub mod adapters;
 pub mod config;
 pub mod dedup;
+pub mod eval;
 pub mod firefly;
 pub mod fx;
 pub mod jmap;
@@ -14,6 +15,7 @@ pub mod llm;
 pub mod model_selection;
 pub mod schema;
 pub mod unwrap;
+pub mod usd_ceiling;
 pub mod validate;
 
 use anyhow::{Context, Result};
@@ -26,6 +28,7 @@ use crate::firefly::{FireflyClient, SubmitOutcome};
 use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
 use crate::llm::LlmClient;
+use crate::usd_ceiling::CeilingVerdict;
 use crate::validate::{Verdict, validate};
 
 /// Tallies for the end-of-run summary.
@@ -85,7 +88,7 @@ pub async fn run() -> Result<Summary> {
     let mut summary = Summary::default();
     for msg in &messages {
         summary.processed += 1;
-        match process_message(msg, &llm, &firefly, &cfg.validation).await {
+        match process_message(msg, &llm, &firefly, &fx, &cfg.validation).await {
             Ok(Disposition::Booked) => {
                 summary.booked += 1;
                 route(&mailbox, &msg.id, true).await;
@@ -137,6 +140,7 @@ async fn process_message(
     msg: &FetchedMessage,
     llm: &LlmClient<'_>,
     firefly: &FireflyClient<'_>,
+    fx: &FxClient<'_>,
     policy: &ValidationPolicy,
 ) -> Result<Disposition> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
@@ -194,11 +198,40 @@ async fn process_message(
     let mut review_reason: Option<String> = None;
 
     for record in records {
-        // 5. Validation gates (deterministic). Only `validate` can mint a
+        // 5. Validation gates (deterministic, sync). Only `validate` can mint a
         //    `Validated`, which `firefly.submit` requires — the gate is
         //    impossible to bypass.
-        match validate(record, policy) {
+        match validate(record) {
             Verdict::Booked(validated) => {
+                // 5b. USD-equivalent ceiling (`RECEIPT_MAX_AMOUNT`). FX-dependent,
+                //     so it lives here in the async pipeline rather than in the
+                //     pure `validate` gate: convert the charge to USD with a live
+                //     rate and route to Review if it exceeds the ceiling. An FX
+                //     failure here routes to Review (never books an unscreened
+                //     large amount). Skip the lookup entirely when no ceiling is
+                //     set — the common case — to avoid a needless FX call.
+                if let Some(ceiling) = policy.max_amount {
+                    let extracted = validated.as_extracted();
+                    let rate = fx
+                        .rate(extracted.currency().as_str(), "USD", extracted.date)
+                        .await
+                        .context("resolving FX rate for USD ceiling")?;
+                    match usd_ceiling::check(extracted.amount().value(), rate, Some(ceiling)) {
+                        CeilingVerdict::Within { .. } => {}
+                        CeilingVerdict::Over {
+                            usd_equivalent,
+                            ceiling,
+                        } => {
+                            review_reason.get_or_insert(format!(
+                                "amount ≈ ${} (>{} USD) — routed to review",
+                                usd_equivalent.round_dp(2).normalize(),
+                                ceiling.normalize()
+                            ));
+                            continue;
+                        }
+                    }
+                }
+
                 // 6. Dedup key. 7. Submit to Firefly.
                 let external_id = dedup::external_id(validated.as_extracted());
                 match firefly.submit(&validated, &external_id).await? {

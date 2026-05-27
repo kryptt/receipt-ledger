@@ -15,12 +15,14 @@ JMAP read (Stalwart, incremental via Email/changes state cursor)
     then build an extraction prompt
   → ollama-router (liveness-selected small model) returns JSON
   → deterministic validation gates (closed status classification — only an
-    Approved status books; outgoing direction only; amount > 0 and within the
-    optional ceiling; known currency; merchant present)
+    Approved status books; outgoing direction only; amount > 0; known currency;
+    merchant present)
   → dedup (PayPal Transaction ID; composite sha256 over
     source|date|amount|currency|merchant|last4|status as fallback)
   → route to the Firefly account (PayPal balance/credit, Banco USD/DOP),
     convert foreign charges to the account currency via FX (Frankfurter)
+  → USD-equivalent ceiling: convert the charge to USD via FX and route to
+    Review if it exceeds the optional RECEIPT_MAX_AMOUNT (a USD threshold)
   → POST Firefly /api/v1/transactions (error_if_duplicate_hash)
   → move the message to Processed (booked / duplicate / clean skip) or Review
 ```
@@ -57,7 +59,7 @@ validation pass can mint the `Validated` token that `firefly::submit` requires.
 | `RECEIPT_PAYPAL_CREDIT_ACCOUNT` | — (optional) | PayPal Credit account id; absent → credit-funded mail → Review. |
 | `RECEIPT_BANCO_POPULAR_USD_ACCOUNT` | — (optional) | Banco Popular USD account id; absent → non-DOP mail → Review. |
 | `RECEIPT_BANCO_POPULAR_DOP_ACCOUNT` | — (optional) | Banco Popular DOP account id; absent → DOP mail → Review. |
-| `RECEIPT_MAX_AMOUNT` | — (optional) | Plausibility ceiling for a single transaction. Unset → no upper bound. Over-limit → Review. |
+| `RECEIPT_MAX_AMOUNT` | — (optional) | Plausibility ceiling, **in US dollars**. A charge whose USD-equivalent (`fx_rate(currency→USD) × amount`) exceeds it routes to Review. Unset → no upper bound. So `100000` means ">$100,000 USD → Review"; a ₩100,000 (≈ $72) charge does **not** trip it. |
 | `RECEIPT_PROCESSED_MAILBOX` | `Processed` | Destination for booked / duplicate / skipped mail. |
 | `RECEIPT_REVIEW_MAILBOX` | `Review` | Destination for un-bookable mail. |
 | `RUST_LOG` | `info` | `tracing` env filter. |
@@ -75,6 +77,36 @@ non-numeric value is a hard startup error. The deployment routes ids
 
 `build.sh` refuses to push a tag that already exists — bump `version` in
 `Cargo.toml` first.
+
+## Extraction-accuracy eval
+
+An objective judge for comparing models and prompt changes. It runs the **real**
+extraction path (`unwrap_message` → adapter `prompt` → live `/chat/completions`
+with the same params the pipeline uses → `extract_json` → `postprocess` →
+`validate` + routing) over a labeled dataset and scores each field
+(kind / amount / currency / direction / date / merchant / status / routed
+account) against the ground truth, printing a per-model × per-field accuracy
+matrix.
+
+- **Dataset**: `eval/dataset/` — paired `*.txt` (forwarded email body) + `*.json`
+  (ground-truth label). All values are invented/scrubbed.
+- **Pure scorer**: `src/eval/` (`score`, the matrix aggregation) is unit tested
+  under `./test.sh`. Only the live model calls (in `src/bin/eval.rs`) hit the
+  network, so the crate builds and tests offline.
+
+```bash
+# Models in-cluster: port-forward ollama-router first.
+kubectl port-forward -n ai svc/ollama-router 11434:11434 &
+RECEIPT_OLLAMA_URL=http://localhost:11434/v1 cargo run --bin eval
+
+# Specific models + JSON dump:
+RECEIPT_OLLAMA_URL=http://localhost:11434/v1 \
+  cargo run --bin eval -- --models gemma4:e2b,qwen3.6-low --json
+```
+
+Models default to `gemma4:e2b,gemma4:e4b,qwen3.6-low,qwen3.6-medium`
+(override with `--models a,b,c` or `RECEIPT_EVAL_MODELS`). The `eval` binary is
+**not** part of `./test.sh`.
 
 ## License
 

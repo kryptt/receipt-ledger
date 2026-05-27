@@ -1,0 +1,30 @@
+From: Buyer <buyer@example.com>
+Date: Tue, 3 Mar 2026 at 09:42
+Subject: Fwd: You sent a payment of €58.40 EUR
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Tue, 3 Mar 2026, 09:40
+Subject: Receipt for your payment to Tulip Press Studio
+To: buyer@example.com
+
+
+You paid €58.40 EUR to Tulip Press Studio
+
+Merchant Tulip Press Studio
+Transaction date March 3, 2026 09:40:11 AM PST
+Order ID TP2026MAR0007
+
+Subtotal €48.40
+Shipping €10.00
+Total €58.40 EUR
+
+Paid with PayPal balance €58.40 EUR
+
+Transaction ID: 4WC55211KD903412N
+
+Your payment was sent from buyer@example.com
+
+Questions? Visit the Help Center.

@@ -1,0 +1,26 @@
+From: Buyer <buyer@example.com>
+Date: Sat, 9 May 2026 at 13:25
+Subject: Fwd: Your Pay in 4 plan is set up
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Sat, 9 May 2026, 13:22
+Subject: Your Pay in 4 payment plan has been created
+To: buyer@example.com
+
+
+Your Pay in 4 plan is all set.
+
+Here is a summary of your upcoming payments for your purchase at
+Northwind Outfitters:
+
+Payment 2 of 4    €53.00    due May 23, 2026
+Payment 3 of 4    €53.00    due June 6, 2026
+Payment 4 of 4    €53.00    due June 20, 2026
+
+We'll automatically charge your linked payment method on each date.
+No action is needed from you right now.
+
+Manage your plan any time in the PayPal app.

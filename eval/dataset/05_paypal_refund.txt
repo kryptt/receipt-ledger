@@ -1,0 +1,28 @@
+From: Buyer <buyer@example.com>
+Date: Thu, 14 May 2026 at 10:30
+Subject: Fwd: You received a refund
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Thu, 14 May 2026, 10:28
+Subject: Maple & Stone Goods refunded you €72.30 EUR
+To: buyer@example.com
+
+
+Maple & Stone Goods sent you a refund of €72.30 EUR
+
+You paid €72.30 EUR for order MSG-90817 on May 2, 2026, and that
+payment has now been refunded to you.
+
+Merchant Maple & Stone Goods
+Refund date May 14, 2026 10:28:47 AM CEST
+Order ID MSG-90817
+
+Refunded amount €72.30 EUR
+Status Refunded
+
+Transaction ID: 8LD22907RA651130F
+
+The money will appear in your original payment method.

@@ -1,0 +1,28 @@
+From: Buyer <buyer@example.com>
+Date: Fri, 17 Apr 2026 at 18:05
+Subject: Fwd: Your receipt from Harborlight Coffee Roasters
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Fri, 17 Apr 2026, 18:03
+Subject: You sent $24.75 USD to Harborlight Coffee Roasters
+To: buyer@example.com
+
+
+You paid $24.75 USD to Harborlight Coffee Roasters
+
+Merchant Harborlight Coffee Roasters
+Transaction date April 17, 2026 18:03:54 PM EDT
+Invoice ID HCR-7741
+
+Subtotal $22.00
+Tax $2.75
+Total $24.75 USD
+
+Paid with Balance $24.75 USD
+
+Transaction ID: 9KK11876YT442109A
+
+Your payment was sent from buyer@example.com

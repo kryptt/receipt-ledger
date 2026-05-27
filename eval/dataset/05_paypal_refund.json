@@ -1,0 +1,10 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "transaction",
+  "amount": "72.30",
+  "currency": "EUR",
+  "direction": "in",
+  "date": "2026-05-14",
+  "merchant": "Maple & Stone Goods",
+  "status": "declined"
+}

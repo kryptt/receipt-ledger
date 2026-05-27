@@ -1,0 +1,27 @@
+From: Buyer <buyer@example.com>
+Date: Mon, 11 May 2026 at 21:11
+Subject: Fwd: Receipt: Pay Later with PayPal
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Mon, 11 May 2026, 21:09
+Subject: You paid Greenfield Hardware Co. with Pay Later
+To: buyer@example.com
+
+
+You paid €389.95 EUR to Greenfield Hardware Co.
+
+Merchant Greenfield Hardware Co.
+Transaction date May 11, 2026 21:09:33 PM CEST
+Order ID GHC-44120
+
+Total €389.95 EUR
+
+Paid with PayPal Pay Later
+Your payment plan starts next month.
+
+Transaction ID: 2QP66510WE331204C
+
+Your payment was sent from buyer@example.com

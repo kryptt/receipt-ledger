@@ -390,6 +390,16 @@ const PAYPAL_CREDIT_HINTS: &[&str] = &[
     "credit",
 ];
 
+/// Public, pure view of the PayPal funding classification, for the eval harness
+/// (and anything that needs to predict routing without the live client). `true`
+/// → PayPal Credit liability account; `false` → PayPal Balance asset account.
+/// Identical logic to the private [`is_paypal_credit_funding`] the submit path
+/// uses, so the eval scores the *real* routing decision.
+#[must_use]
+pub fn paypal_is_credit_funded(record: &Extracted) -> bool {
+    is_paypal_credit_funding(record)
+}
+
 /// Classify a PayPal record's funding method from its `account_hint`.
 ///
 /// Returns `true` when the hint names a PayPal credit product, so the record

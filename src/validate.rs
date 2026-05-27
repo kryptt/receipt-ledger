@@ -16,7 +16,6 @@
 //!   string is normalized and matched against exact tokens, with an explicit
 //!   reject veto.
 
-use crate::config::ValidationPolicy;
 use crate::schema::{Direction, Extracted};
 
 /// A record that has cleared every validation gate.
@@ -48,9 +47,13 @@ pub enum Verdict {
     Review { reason: String },
 }
 
-/// Run all gates under `policy`. Returns [`Verdict::Booked`] only when the
-/// record is fully trustworthy for automatic submission.
-pub fn validate(record: Extracted, policy: &ValidationPolicy) -> Verdict {
+/// Run all sync gates. Returns [`Verdict::Booked`] only when the record is
+/// fully trustworthy for automatic submission *on the deterministic axes*
+/// (status / direction / positive amount / known currency / non-empty
+/// merchant). The FX-dependent USD-equivalent ceiling (`RECEIPT_MAX_AMOUNT`) is
+/// applied separately in [`crate::process_message`] after this gate, because it
+/// needs a live conversion rate and must therefore stay out of this pure path.
+pub fn validate(record: Extracted) -> Verdict {
     // Status must classify as Approved — never Declined, never the ambiguous
     // Other bucket (pending/processing/refund/reversal/etc.). Fail closed.
     match Status::classify(&record.status) {
@@ -71,17 +74,16 @@ pub fn validate(record: Extracted, policy: &ValidationPolicy) -> Verdict {
         return review("incoming (deposit/refund) transaction routed to review".to_string());
     }
 
-    // Amount must be strictly positive ...
+    // Amount must be strictly positive. The schema's `Amount::parse` already
+    // rejected absurd hallucinations (scientific notation, huge scale), so this
+    // sync gate carries no *magnitude* ceiling: a meaningful ceiling is a USD
+    // threshold, which is inherently FX-dependent (₩100,000 ≈ $72 must NOT flag
+    // while $100,001 must). That conversion needs a live rate, so it lives in
+    // the async pipeline (`crate::process_message`), AFTER this gate mints a
+    // `Validated`. See `RECEIPT_MAX_AMOUNT` (documented as a USD ceiling).
     let amount = record.amount();
     if !amount.is_positive() {
         return review(format!("amount not positive: {amount}"));
-    }
-    // ... and within the configured plausibility ceiling, when one is set. An
-    // unset ceiling means no upper bound (documented in `RECEIPT_MAX_AMOUNT`).
-    if let Some(max) = policy.max_amount
-        && amount.value() > max
-    {
-        return review(format!("amount {amount} exceeds configured maximum {max}"));
     }
 
     // Currency is already a parsed `Currency` (3-letter ISO at construction); we
@@ -265,10 +267,6 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    fn policy() -> ValidationPolicy {
-        ValidationPolicy { max_amount: None }
-    }
-
     fn base() -> Extracted {
         Extracted {
             source: Source::Paypal,
@@ -293,16 +291,16 @@ mod tests {
     }
 
     fn is_review(r: Extracted) -> bool {
-        matches!(validate(r, &policy()), Verdict::Review { .. })
+        matches!(validate(r), Verdict::Review { .. })
     }
 
     fn is_booked(r: Extracted) -> bool {
-        matches!(validate(r, &policy()), Verdict::Booked(_))
+        matches!(validate(r), Verdict::Booked(_))
     }
 
     #[test]
     fn approved_record_books() {
-        match validate(base(), &policy()) {
+        match validate(base()) {
             Verdict::Booked(v) => {
                 assert_eq!(
                     v.as_extracted().amount().value(),
@@ -408,36 +406,17 @@ mod tests {
         assert!(is_review(with_status("Pending")));
     }
 
-    // --- C2: amount bounds -----------------------------------------------
+    // --- C2: amount positivity -------------------------------------------
+    //
+    // The *magnitude* ceiling moved to the async pipeline as a USD-equivalent
+    // gate (it needs a live FX rate); see `crate::usd_ceiling` for its pure
+    // unit tests. Here we only gate positivity, which is FX-independent.
 
     #[test]
     fn non_positive_amount_routes_to_review() {
         let mut r = base();
         r.money = Money::new(Amount::parse("0").unwrap(), Currency::parse("EUR").unwrap());
         assert!(is_review(r));
-    }
-
-    #[test]
-    fn over_max_amount_routes_to_review() {
-        let max = Decimal::from_str("1000000").unwrap();
-        let pol = ValidationPolicy {
-            max_amount: Some(max),
-        };
-        let mut r = base();
-        // A 7-figure amount.
-        r.money = Money::new(
-            Amount::parse("9999999.00").unwrap(),
-            Currency::parse("USD").unwrap(),
-        );
-        assert!(matches!(validate(r, &pol), Verdict::Review { .. }));
-    }
-
-    #[test]
-    fn within_max_amount_books() {
-        let pol = ValidationPolicy {
-            max_amount: Some(Decimal::from_str("1000000").unwrap()),
-        };
-        assert!(matches!(validate(base(), &pol), Verdict::Booked(_)));
     }
 
     // --- M5: direction policy --------------------------------------------

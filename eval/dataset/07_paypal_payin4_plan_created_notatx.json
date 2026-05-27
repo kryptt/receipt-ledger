@@ -1,0 +1,4 @@
+{
+  "from": "Buyer <buyer@example.com>",
+  "kind": "not_a_transaction"
+}
