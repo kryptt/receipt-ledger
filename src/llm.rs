@@ -34,12 +34,22 @@ struct ChatRequest<'a> {
     /// OpenAI JSON-mode hint; ollama honours `format: json` natively and most
     /// routers accept `response_format` too. Harmless if ignored.
     response_format: ResponseFormat,
+    /// Jinja chat-template arguments forwarded by ollama-router to the model.
+    /// Setting `enable_thinking: false` disables Qwen3-family reasoning (the
+    /// model emits an empty `<think></think>` then clean JSON — much faster).
+    /// A no-op for non-Qwen models, which ignore unknown chat-template kwargs.
+    chat_template_kwargs: ChatTemplateKwargs,
 }
 
 #[derive(Serialize)]
 struct ResponseFormat {
     #[serde(rename = "type")]
     kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
 }
 
 #[derive(Serialize)]
@@ -89,6 +99,9 @@ impl<'a> LlmClient<'a> {
             }],
             temperature: 0.0,
             response_format: ResponseFormat { kind: "json_object" },
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: false,
+            },
         };
 
         debug!(%url, model = %self.model, timeout_secs = self.timeout.as_secs(), "requesting extraction");
