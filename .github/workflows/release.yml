@@ -29,6 +29,8 @@ jobs:
           fi
           echo "version=$TAG_VERSION" >> "$GITHUB_ENV"
 
+      - uses: docker/setup-qemu-action@v3
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -41,9 +43,11 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          # amd64 only — receipt-ledger pins to hr-home.xyz/stable (amd64)
-          # nodes, and an arm64 build would compile aws-lc-sys under QEMU.
-          platforms: linux/amd64
+          # Multi-arch: the stable nodes include arm64 (hr-op7/hr-op8), so
+          # ship both. arm64 compiles aws-lc-sys under QEMU emulation, which is
+          # slow but correct; the Dockerfile already keys cache mounts + the
+          # musl target triple off TARGETPLATFORM.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}:${{ env.version }}
