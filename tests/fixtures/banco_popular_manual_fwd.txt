@@ -1,0 +1,29 @@
+From: Jane Doe <jane@example.com>
+Date: Wed, 27 May 2026 at 14:32
+Subject: Fwd: Notificación de Consumo
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: <notificaciones@popularenlinea.com>
+Date: Wed, 27 May 2026, 14:30
+Subject: Notificación de Consumo
+To: jane@example.com
+
+
+Banco Popular Dominicano
+
+Notificación de Consumo
+
+Estimado(a) JANE DOE,
+
+Le informamos que se ha intentado un consumo con su Tarjeta de Crédito
+terminada en 1234. A continuación los detalles de la transacción:
+
+Monto       Fecha        Comercio            Estatus
+EUR$49.08   27/05/2026   Example Shop B.V.   Declinada
+
+Si usted no reconoce esta transacción, comuníquese de inmediato con
+nuestro Centro de Atención Telefónica.
+
+Gracias por preferir el Banco Popular Dominicano.

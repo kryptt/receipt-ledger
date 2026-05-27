@@ -75,6 +75,33 @@ pub fn unwrap_forward(text: &str) -> Option<Unwrapped> {
     })
 }
 
+/// Recover the original sender + body from *any* forwarded receipt, whether a
+/// manual Gmail "Fwd:" (with a "Forwarded message" marker) or a Gmail
+/// *auto*-forward (no marker — the envelope `From:` is preserved as the original
+/// sender and the body IS the original email).
+///
+/// Strategy:
+/// 1. Try the marker-based [`unwrap_forward`] first. A manual forward must
+///    extract the INNER sender from the forwarded header block, not the human
+///    who forwarded it.
+/// 2. If there is no marker, fall back to the envelope `from` header: the
+///    auto-forward path. The whole text body is the original message.
+///
+/// Returns `None` when neither path yields a sender — the caller routes such
+/// messages to `Review` rather than guessing.
+pub fn unwrap_message(from: Option<&str>, text: &str) -> Option<Unwrapped> {
+    if let Some(u) = unwrap_forward(text) {
+        return Some(u);
+    }
+
+    let original_sender = extract_email(from?)?;
+    Some(Unwrapped {
+        original_sender: original_sender.to_ascii_lowercase(),
+        original_subject: None,
+        body: text.to_string(),
+    })
+}
+
 /// Find the value of a `Header:` line (case-insensitive name match) within the
 /// forwarded header block. Only scans until the first blank line so a header
 /// name appearing in the body cannot be mistaken for a real header.
@@ -170,5 +197,39 @@ mod tests {
     #[test]
     fn none_when_not_a_forward() {
         assert!(unwrap_forward("just a regular email, no marker").is_none());
+    }
+
+    #[test]
+    fn auto_forward_uses_envelope_from() {
+        // No "Forwarded message" marker: a Gmail auto-forward where the envelope
+        // From is preserved as the original sender and the body is the original.
+        let body = "Notificación de Consumo\nMonto EUR$1.50\nEstatus Aprobada\n";
+        let u = unwrap_message(Some("<notificaciones@popularenlinea.com>"), body)
+            .expect("auto-forward falls back to envelope from");
+        assert_eq!(u.original_sender, "notificaciones@popularenlinea.com");
+        assert_eq!(u.original_subject, None);
+        // The full text is the original message — nothing stripped.
+        assert_eq!(u.body, body);
+    }
+
+    #[test]
+    fn manual_forward_prefers_inner_sender_over_envelope() {
+        // The envelope From is the human forwarder; the marker block carries the
+        // real original sender. unwrap_message must prefer the inner one.
+        let text = "\
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Subject: receipt
+
+You paid.
+";
+        let u = unwrap_message(Some("Buyer <buyer@example.com>"), text)
+            .expect("manual forward is still unwrapped");
+        assert_eq!(u.original_sender, "service@paypal.com");
+    }
+
+    #[test]
+    fn none_when_neither_marker_nor_from() {
+        assert!(unwrap_message(None, "a plain message").is_none());
     }
 }

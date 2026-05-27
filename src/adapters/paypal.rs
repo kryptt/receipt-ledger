@@ -9,11 +9,10 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use serde_json::Value;
-use std::str::FromStr;
 
 use super::Adapter;
+use super::parse::{collect_objects, opt_string, parse_amount, parse_date_with, string_field};
 use crate::schema::{Direction, Extracted, Source};
 
 /// Sender substring that identifies a PayPal notification.
@@ -69,19 +68,6 @@ PayPal receipt:
     }
 }
 
-/// Normalise the various container shapes a model might emit into a flat list
-/// of candidate objects.
-fn collect_objects(json: &Value) -> Vec<Value> {
-    match json {
-        Value::Array(items) => items.clone(),
-        Value::Object(map) => match map.get("transactions") {
-            Some(Value::Array(items)) => items.clone(),
-            _ => vec![json.clone()],
-        },
-        _ => Vec::new(),
-    }
-}
-
 /// Parse one JSON object into a typed [`Extracted`].
 fn parse_one(obj: &Value) -> Result<Extracted> {
     let map = obj
@@ -117,30 +103,6 @@ fn parse_one(obj: &Value) -> Result<Extracted> {
     })
 }
 
-fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    match map.get(key) {
-        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        _ => None,
-    }
-}
-
-/// Like [`string_field`] but keeps the field absent (`None`) when empty rather
-/// than failing — used for genuinely optional fields.
-fn opt_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    string_field(map, key)
-}
-
-/// Accept the amount as a JSON string ("149.99") or number (149.99).
-fn parse_amount(v: Option<&Value>) -> Result<Decimal> {
-    match v {
-        Some(Value::String(s)) => Decimal::from_str(s.trim())
-            .map_err(|e| anyhow!("amount string {s:?} is not a decimal: {e}")),
-        Some(Value::Number(n)) => Decimal::from_str(&n.to_string())
-            .map_err(|e| anyhow!("amount number {n} is not a decimal: {e}")),
-        other => Err(anyhow!("amount missing or wrong type: {other:?}")),
-    }
-}
-
 /// Default to `out` (a purchase) when the model omits or garbles direction —
 /// PayPal receipts are overwhelmingly outgoing payments, and validation will
 /// still gate on status.
@@ -152,27 +114,19 @@ fn parse_direction(v: Option<&Value>) -> Direction {
 }
 
 /// Accept ISO `YYYY-MM-DD` first, then a couple of human formats PayPal uses
-/// ("May 11, 2026").
+/// ("May 11, 2026") and US `%m/%d/%Y`.
 fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
-    let s = v
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .ok_or_else(|| anyhow!("date missing or not a string"))?;
-
     const FORMATS: &[&str] = &["%Y-%m-%d", "%B %e, %Y", "%b %e, %Y", "%m/%d/%Y"];
-    for fmt in FORMATS {
-        if let Ok(d) = NaiveDate::parse_from_str(s, fmt) {
-            return Ok(d);
-        }
-    }
-    Err(anyhow!("unrecognised date format: {s:?}"))
+    parse_date_with(v, FORMATS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::validate::{Verdict, validate};
+    use rust_decimal::Decimal;
     use serde_json::json;
+    use std::str::FromStr;
 
     /// The JSON a correctly-behaving model produces for the fixture receipt.
     fn fixture_json() -> Value {

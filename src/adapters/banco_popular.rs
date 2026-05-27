@@ -1,0 +1,204 @@
+//! Banco Popular Dominicano adapter.
+//!
+//! Banco Popular sends a Spanish "Notificación de Consumo" whenever a card is
+//! charged. Unlike PayPal there is no stable transaction id, so dedup falls back
+//! to the composite hash (see [`crate::dedup`]). The notification carries a
+//! small table — `Monto | Moneda | Fecha | Comercio | Estatus` (sometimes with
+//! an extra `Razón` column) — which we ask the LLM to flatten into JSON, then
+//! parse here into [`Extracted`].
+//!
+//! Two quirks drive the parsing:
+//! - the amount is prefixed with a currency code (`EUR$1.50`), which must be
+//!   stripped to a bare decimal, and
+//! - dates are `DD/MM/YYYY`, NOT US `m/d` — `27/05/2026` is 27 May, not an
+//!   invalid month. The date format list reflects this.
+
+use anyhow::{Context, Result, anyhow};
+use chrono::NaiveDate;
+use serde_json::Value;
+
+use super::Adapter;
+use super::parse::{collect_objects, opt_string, parse_amount, parse_date_with, string_field};
+use crate::schema::{Direction, Extracted, Source};
+
+/// Sender substring that identifies a Banco Popular consumo notification.
+const BANCO_SENDER: &str = "popularenlinea.com";
+
+pub struct BancoPopularAdapter;
+
+impl Adapter for BancoPopularAdapter {
+    fn name(&self) -> &'static str {
+        "banco_popular"
+    }
+
+    fn matches(&self, original_sender: &str) -> bool {
+        original_sender.contains(BANCO_SENDER)
+    }
+
+    fn prompt(&self, email_text: &str) -> String {
+        format!(
+            r#"Extraes una transacción de una "Notificación de Consumo" del Banco Popular Dominicano.
+Devuelve SOLO un objeto JSON (sin prosa, sin bloques de markdown) con EXACTAMENTE estas claves:
+
+{{
+  "amount": string,        // el Monto como decimal, SIN prefijo de moneda ni "$"; de "EUR$1.50" extrae "1.50"
+  "currency": string,      // ISO-4217: Euro->EUR, Dólares/Dolares->USD, Pesos/Peso Dominicano->DOP. Úsalo de la columna Moneda o del prefijo XXX$
+  "direction": "out",      // un consumo es siempre una compra/cargo: "out"
+  "date": string,          // la Fecha en ISO YYYY-MM-DD. La FUENTE viene en DD/MM/YYYY
+  "merchant": string,      // el valor de la columna Comercio
+  "account_hint": string,  // los últimos 4 dígitos de la tarjeta ("terminada en NNNN"), p.ej. "1234"
+  "status": string,        // el Estatus textual: "Aprobada" o "Declinada"
+  "raw_ref": string        // "" (no hay id de referencia)
+}}
+
+Reglas:
+- La tabla tiene columnas Monto | Moneda | Fecha | Comercio | Estatus (a veces una columna extra Razón).
+- "amount" debe ser un decimal positivo con punto como separador, sin prefijo de moneda.
+- No inventes valores; si un campo realmente no está presente usa "".
+
+Notificación:
+---
+{email_text}
+---"#
+        )
+    }
+
+    fn postprocess(&self, json: &Value) -> Result<Vec<Extracted>> {
+        let objects = collect_objects(json);
+        if objects.is_empty() {
+            return Err(anyhow!("LLM JSON contained no transaction object"));
+        }
+        objects.iter().map(parse_one).collect()
+    }
+}
+
+/// Parse one JSON object into a typed [`Extracted`]. A consumo has no
+/// transaction id, so `external_id` is always `None` and `direction` is always
+/// `Out`.
+fn parse_one(obj: &Value) -> Result<Extracted> {
+    let map = obj
+        .as_object()
+        .ok_or_else(|| anyhow!("expected JSON object, got {obj}"))?;
+
+    let amount = parse_amount(map.get("amount")).context("parsing `amount`")?;
+    let currency = string_field(map, "currency")
+        .map(|s| s.trim().to_ascii_uppercase())
+        .ok_or_else(|| anyhow!("missing `currency`"))?;
+    let date = parse_date(map.get("date")).context("parsing `date`")?;
+    let merchant = string_field(map, "merchant").ok_or_else(|| anyhow!("missing `merchant`"))?;
+    let status = string_field(map, "status").unwrap_or_default();
+
+    let account_hint = opt_string(map, "account_hint");
+    let raw_ref = opt_string(map, "raw_ref").unwrap_or_default();
+
+    Ok(Extracted {
+        source: Source::BancoPopular,
+        // No transaction id — dedup composite-hashes id-less records.
+        external_id: None,
+        amount,
+        currency,
+        // A consumo is always an outgoing charge.
+        direction: Direction::Out,
+        date,
+        merchant,
+        account_hint,
+        status,
+        raw_ref,
+    })
+}
+
+/// Accept ISO `YYYY-MM-DD` first, then Banco Popular's `DD/MM/YYYY`. Crucially
+/// `%d/%m/%Y` (day-first), NOT US `%m/%d/%Y` — `27/05/2026` is 27 May.
+fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
+    const FORMATS: &[&str] = &["%Y-%m-%d", "%d/%m/%Y"];
+    parse_date_with(v, FORMATS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validate::{Verdict, validate};
+    use rust_decimal::Decimal;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    /// JSON a correct model returns for an APPROVED consumo (the autoforward
+    /// fixture): `EUR$1.50  Euro  27/05/2026  Example Cafe Amsterdam  Aprobada`.
+    fn approved_json() -> Value {
+        json!({
+            "amount": "1.50",
+            "currency": "EUR",
+            "direction": "out",
+            "date": "27/05/2026",
+            "merchant": "Example Cafe Amsterdam",
+            "account_hint": "1234",
+            "status": "Aprobada",
+            "raw_ref": ""
+        })
+    }
+
+    #[test]
+    fn matches_banco_sender() {
+        assert!(BancoPopularAdapter.matches("notificaciones@popularenlinea.com"));
+        assert!(BancoPopularAdapter.matches("<notificaciones@popularenlinea.com>"));
+        assert!(!BancoPopularAdapter.matches("service@paypal.com"));
+    }
+
+    #[test]
+    fn approved_consumo_postprocesses_and_books() {
+        let extracted = BancoPopularAdapter
+            .postprocess(&approved_json())
+            .expect("postprocess should succeed");
+        assert_eq!(extracted.len(), 1);
+        let e = &extracted[0];
+
+        assert_eq!(e.source, Source::BancoPopular);
+        assert_eq!(e.external_id, None);
+        assert_eq!(e.amount, Decimal::from_str("1.50").unwrap());
+        assert_eq!(e.currency, "EUR");
+        assert_eq!(e.direction, Direction::Out);
+        assert_eq!(e.merchant, "Example Cafe Amsterdam");
+        assert_eq!(e.account_hint.as_deref(), Some("1234"));
+
+        match validate(e.clone()) {
+            Verdict::Booked(b) => {
+                assert_eq!(b.source, Source::BancoPopular);
+                assert_eq!(b.external_id, None);
+            }
+            Verdict::Review { reason } => panic!("approved consumo should book: {reason}"),
+        }
+    }
+
+    #[test]
+    fn declined_consumo_routes_to_review() {
+        let mut v = approved_json();
+        v["status"] = json!("Declinada");
+        v["amount"] = json!("49.08");
+        v["merchant"] = json!("Example Shop B.V.");
+        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
+        assert!(matches!(validate(e.clone()), Verdict::Review { .. }));
+    }
+
+    #[test]
+    fn date_is_day_first_not_us_month_first() {
+        // 27/05/2026: day 27 > 12, so this is unambiguously DD/MM. A US m/d
+        // parser would reject it (month 27 invalid) — assert the correct day.
+        let e = &BancoPopularAdapter.postprocess(&approved_json()).unwrap()[0];
+        assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
+    }
+
+    #[test]
+    fn strips_currency_prefix_when_model_leaves_it() {
+        // Defensive: a model that fails to strip "EUR$" leaves a non-decimal
+        // amount, which must error rather than book a garbage figure.
+        let mut v = approved_json();
+        v["amount"] = json!("EUR$1.50");
+        assert!(BancoPopularAdapter.postprocess(&v).is_err());
+    }
+
+    #[test]
+    fn accepts_transactions_wrapper() {
+        let v = json!({ "transactions": [approved_json()] });
+        assert_eq!(BancoPopularAdapter.postprocess(&v).unwrap().len(), 1);
+    }
+}

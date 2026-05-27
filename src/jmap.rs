@@ -30,6 +30,11 @@ pub struct FetchedMessage {
     pub id: String,
     /// JMAP envelope subject (the Gmail "Fwd: ..." line).
     pub subject: Option<String>,
+    /// Rendered `From:` header value, e.g. `PayPal <service@paypal.com>` or
+    /// `<notificaciones@popularenlinea.com>`. Used by the unwrap layer to
+    /// recover the original sender of an *auto*-forwarded mail, where Gmail
+    /// preserves the original `From:` and inserts no "Forwarded message" marker.
+    pub from: Option<String>,
     /// Decoded `text/plain` body — input to the forward-unwrap step.
     pub text: String,
 }
@@ -146,6 +151,7 @@ impl Mailbox {
             Property::BlobId,
             Property::MailboxIds,
             Property::Subject,
+            Property::From,
             Property::TextBody,
             Property::BodyValues,
         ]);
@@ -186,6 +192,7 @@ impl Mailbox {
         Ok(Some(FetchedMessage {
             id: id.to_string(),
             subject: email.subject().map(str::to_string),
+            from: render_from(&email),
             text,
         }))
     }
@@ -207,6 +214,20 @@ impl Mailbox {
             .with_context(|| format!("moving {id} to {mailbox_id}"))?;
         Ok(())
     }
+}
+
+/// Render the `From:` header of an email as a single string the unwrap layer
+/// can feed to `extract_email`. JMAP exposes `From` as structured addresses, so
+/// we reconstruct the familiar `Name <addr>` / `<addr>` shapes. Returns `None`
+/// when the message carries no usable from-address.
+fn render_from(email: &jmap_client::email::Email) -> Option<String> {
+    let addr = email.from()?.iter().find(|a| !a.email().is_empty())?;
+    Some(match addr.name() {
+        Some(name) if !name.trim().is_empty() => {
+            format!("{} <{}>", name.trim(), addr.email())
+        }
+        _ => format!("<{}>", addr.email()),
+    })
 }
 
 /// Extract the decoded text body of an email, concatenating any text parts.

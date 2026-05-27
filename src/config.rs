@@ -44,6 +44,10 @@ pub struct Config {
     pub firefly_token: String,
     /// PayPal asset account in Firefly — name or numeric id.
     pub paypal_account: String,
+    /// Banco Popular asset account in Firefly — name or numeric id. `None` when
+    /// unconfigured; a Banco Popular record then routes to Review rather than
+    /// booking against the wrong account.
+    pub banco_popular_account: Option<String>,
 
     pub processed_mailbox: String,
     pub review_mailbox: String,
@@ -77,6 +81,8 @@ impl Config {
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
             // No sensible default — must point at a real Firefly asset account.
             paypal_account: required("RECEIPT_PAYPAL_ACCOUNT")?,
+            // Optional — absent means Banco Popular mail routes to Review.
+            banco_popular_account: optional("RECEIPT_BANCO_POPULAR_ACCOUNT"),
 
             processed_mailbox: env_or("RECEIPT_PROCESSED_MAILBOX", DEFAULT_PROCESSED_MAILBOX),
             review_mailbox: env_or("RECEIPT_REVIEW_MAILBOX", DEFAULT_REVIEW_MAILBOX),
@@ -89,6 +95,13 @@ fn env_or(key: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Read an optional env var, returning `None` when unset or blank. Used for
+/// settings that are legitimately absent (e.g. a per-source account that has
+/// not been provisioned yet).
+fn optional(key: &str) -> Option<String> {
+    env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 fn required(key: &str) -> Result<String> {

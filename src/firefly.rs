@@ -14,7 +14,7 @@ use reqwest::{Client, StatusCode};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::schema::{Direction, Extracted};
+use crate::schema::{Direction, Extracted, Source};
 
 /// Tag attached to every transaction this service books, for easy filtering in
 /// Firefly.
@@ -35,6 +35,9 @@ pub struct FireflyClient<'a> {
     token: String,
     /// PayPal asset account — name or numeric id.
     paypal_account: String,
+    /// Banco Popular asset account — name or numeric id. `None` when
+    /// unconfigured; a Banco Popular record then errors out (→ Review).
+    banco_popular_account: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -71,12 +74,14 @@ impl<'a> FireflyClient<'a> {
         base_url: impl Into<String>,
         token: impl Into<String>,
         paypal_account: impl Into<String>,
+        banco_popular_account: Option<String>,
     ) -> Self {
         Self {
             http,
             base_url: base_url.into(),
             token: token.into(),
             paypal_account: paypal_account.into(),
+            banco_popular_account,
         }
     }
 
@@ -85,7 +90,7 @@ impl<'a> FireflyClient<'a> {
     /// `external_id` is the dedup key computed by [`crate::dedup`].
     pub async fn submit(&self, record: &Extracted, external_id: &str) -> Result<SubmitOutcome> {
         let url = format!("{}/api/v1/transactions", self.base_url.trim_end_matches('/'));
-        let group = self.build_group(record, external_id);
+        let group = self.build_group(record, external_id)?;
 
         let resp = self
             .http
@@ -120,11 +125,26 @@ impl<'a> FireflyClient<'a> {
         anyhow::bail!("Firefly returned {status}: {body}")
     }
 
-    fn build_group<'b>(&'b self, record: &'b Extracted, external_id: &'b str) -> TransactionGroup<'b> {
-        let (source_id, source_name) = if is_numeric(&self.paypal_account) {
-            (Some(self.paypal_account.as_str()), None)
+    fn build_group<'b>(
+        &'b self,
+        record: &'b Extracted,
+        external_id: &'b str,
+    ) -> Result<TransactionGroup<'b>> {
+        // Route to the asset account for this record's source. Exhaustive over
+        // `Source` so a new variant forces a routing decision here rather than
+        // silently booking against PayPal.
+        let account: &str = match record.source {
+            Source::Paypal => &self.paypal_account,
+            Source::BancoPopular => self
+                .banco_popular_account
+                .as_deref()
+                .context("no Firefly account configured for Banco Popular")?,
+        };
+
+        let (source_id, source_name) = if is_numeric(account) {
+            (Some(account), None)
         } else {
-            (None, Some(self.paypal_account.as_str()))
+            (None, Some(account))
         };
 
         let kind = match record.direction {
@@ -132,7 +152,7 @@ impl<'a> FireflyClient<'a> {
             Direction::In => "deposit",
         };
 
-        TransactionGroup {
+        Ok(TransactionGroup {
             error_if_duplicate_hash: true,
             // Let Firefly rules (e.g. the future transit-account rewrite) fire.
             apply_rules: true,
@@ -148,7 +168,7 @@ impl<'a> FireflyClient<'a> {
                 source_name,
                 destination_name: Some(&record.merchant),
             }],
-        }
+        })
     }
 }
 
@@ -189,9 +209,9 @@ mod tests {
     #[test]
     fn builds_withdrawal_with_named_account() {
         let http = Client::new();
-        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "PayPal");
+        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "PayPal", None);
         let rec = record();
-        let group = c.build_group(&rec, "8XY12345AB678901C");
+        let group = c.build_group(&rec, "8XY12345AB678901C").unwrap();
         let json = serde_json::to_value(&group).unwrap();
 
         assert_eq!(json["error_if_duplicate_hash"], true);
@@ -210,12 +230,54 @@ mod tests {
     #[test]
     fn numeric_account_uses_source_id() {
         let http = Client::new();
-        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "42");
+        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "42", None);
         let rec = record();
-        let group = c.build_group(&rec, "id");
+        let group = c.build_group(&rec, "id").unwrap();
         let json = serde_json::to_value(&group).unwrap();
         assert_eq!(json["transactions"][0]["source_id"], "42");
         assert!(json["transactions"][0].get("source_name").is_none());
+    }
+
+    fn banco_record() -> Extracted {
+        Extracted {
+            source: Source::BancoPopular,
+            external_id: None,
+            amount: Decimal::from_str("1.50").unwrap(),
+            currency: "EUR".to_string(),
+            direction: Direction::Out,
+            date: NaiveDate::from_ymd_opt(2026, 5, 27).unwrap(),
+            merchant: "Example Cafe Amsterdam".to_string(),
+            account_hint: Some("1234".to_string()),
+            status: "Aprobada".to_string(),
+            raw_ref: String::new(),
+        }
+    }
+
+    #[test]
+    fn banco_record_routes_to_its_configured_account() {
+        let http = Client::new();
+        let c = FireflyClient::new(
+            &http,
+            "http://firefly:8080",
+            "tok",
+            "42", // PayPal account — must NOT be used for a Banco record.
+            Some("104".to_string()),
+        );
+        let rec = banco_record();
+        let group = c.build_group(&rec, "hash").unwrap();
+        let json = serde_json::to_value(&group).unwrap();
+        // Numeric Banco account → source_id "104", not the PayPal "42".
+        assert_eq!(json["transactions"][0]["source_id"], "104");
+        assert!(json["transactions"][0].get("source_name").is_none());
+    }
+
+    #[test]
+    fn banco_record_without_account_errors() {
+        let http = Client::new();
+        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "42", None);
+        // No Banco account configured → build_group errors, which the pipeline
+        // turns into a per-message Review rather than a panic.
+        assert!(c.build_group(&banco_record(), "hash").is_err());
     }
 
     #[test]

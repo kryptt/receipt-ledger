@@ -61,8 +61,13 @@ pub async fn run() -> Result<Summary> {
         .context("selecting extraction model")?;
     info!(%model, "using extraction model");
     let llm = LlmClient::new(&http, &cfg.ollama_url, model, cfg.llm_timeout);
-    let firefly =
-        FireflyClient::new(&http, &cfg.firefly_url, &cfg.firefly_token, &cfg.paypal_account);
+    let firefly = FireflyClient::new(
+        &http,
+        &cfg.firefly_url,
+        &cfg.firefly_token,
+        &cfg.paypal_account,
+        cfg.banco_popular_account.clone(),
+    );
 
     // --- per-message pipeline --------------------------------------------
     let mut summary = Summary::default();
@@ -112,8 +117,9 @@ async fn process_message(
     llm: &LlmClient<'_>,
     firefly: &FireflyClient<'_>,
 ) -> Result<Disposition> {
-    // 2. Unwrap the Gmail forward + detect the original sender.
-    let unwrapped = match unwrap::unwrap_forward(&msg.text) {
+    // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
+    //    original sender.
+    let unwrapped = match unwrap::unwrap_message(msg.from.as_deref(), &msg.text) {
         Some(u) => u,
         None => return Ok(Disposition::Review("not a recognisable forward".to_string())),
     };

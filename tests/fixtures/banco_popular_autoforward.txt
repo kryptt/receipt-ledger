@@ -1,0 +1,18 @@
+Banco Popular Dominicano
+
+Notificación de Consumo
+
+Estimado(a) JANE DOE,
+
+Le informamos que se ha realizado un consumo con su Tarjeta de Crédito
+terminada en 1234. A continuación los detalles de la transacción:
+
+Monto      Moneda  Fecha        Comercio                Estatus
+EUR$1.50   Euro    27/05/2026   Example Cafe Amsterdam  Aprobada
+
+Si usted no reconoce esta transacción, comuníquese de inmediato con
+nuestro Centro de Atención Telefónica.
+
+Gracias por preferir el Banco Popular Dominicano.
+
+Este es un correo automático, por favor no responda a esta dirección.

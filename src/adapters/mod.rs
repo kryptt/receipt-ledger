@@ -6,6 +6,8 @@
 //! money-touching steps (validate, dedup, submit) live outside the adapter and
 //! treat its output as untrusted.
 
+pub mod banco_popular;
+mod parse;
 pub mod paypal;
 
 use anyhow::Result;
@@ -38,9 +40,12 @@ pub trait Adapter: Send + Sync {
     fn postprocess(&self, json: &Value) -> Result<Vec<Extracted>>;
 }
 
-/// The registry of all enabled adapters. v1 ships PayPal only.
+/// The registry of all enabled adapters, tried in order.
 pub fn adapters() -> Vec<Box<dyn Adapter>> {
-    vec![Box::new(paypal::PaypalAdapter)]
+    vec![
+        Box::new(paypal::PaypalAdapter),
+        Box::new(banco_popular::BancoPopularAdapter),
+    ]
 }
 
 /// Select the adapter whose `matches` accepts `original_sender`, if any.
