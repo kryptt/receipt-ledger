@@ -6,9 +6,11 @@
 //! the allowlist is live do we fall back to the first allowlist entry and let
 //! the router cold-load it.
 //!
-//! The exact "currently loaded models" endpoint exposed by ollama-router is not
-//! yet confirmed, so this module probes a couple of candidate endpoints behind
-//! a clean interface and degrades gracefully. See the TODO below.
+//! Confirmed (2026-05-27): ollama-router exposes `GET /api/ps` at its root
+//! (not under `/v1`), aggregating loaded models across backends in ollama
+//! shape `{"models":[{"name":..,"model":..,"owned_by":..}]}`. We use that as
+//! the liveness signal and fall back to `/v1/models` (available, not
+//! necessarily loaded) only if `/api/ps` is unreachable.
 
 use std::collections::HashSet;
 
@@ -54,14 +56,11 @@ pub async fn select_model(
 
 /// Query the set of currently-loaded model ids from ollama-router.
 ///
-// TODO: confirm ollama-router liveness endpoint. We try, in order:
-//   1. `GET {base}/api/ps`     — ollama-native "running models" shape
-//      (`{"models":[{"name":"...","model":"..."}]}`).
-//   2. `GET {base}/models`     — OpenAI-style `{"data":[{"id":"..."}]}`,
-//      which lists *available* (not necessarily loaded) models; treated as a
-//      weak liveness signal only if (1) is unavailable.
-// Whichever returns parseable model ids first wins. Adjust once the real
-// router endpoint + payload are verified at deploy time.
+// Confirmed against the live router. We try, in order:
+//   1. `GET {root}/api/ps`  — ollama-native "running models"
+//      (`{"models":[{"name":"...","model":"..."}]}`); the real liveness signal.
+//   2. `GET {base}/models`  — OpenAI-style `{"data":[{"id":"..."}]}`, *available*
+//      (not necessarily loaded) models; weak fallback only if (1) is unreachable.
 async fn query_live_models(http: &Client, base_url: &str) -> anyhow::Result<HashSet<String>> {
     let base = base_url.trim_end_matches('/');
 
