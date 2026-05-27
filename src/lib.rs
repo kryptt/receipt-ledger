@@ -60,7 +60,7 @@ pub async fn run() -> Result<Summary> {
         .await
         .context("selecting extraction model")?;
     info!(%model, "using extraction model");
-    let llm = LlmClient::new(&http, &cfg.ollama_url, model);
+    let llm = LlmClient::new(&http, &cfg.ollama_url, model, cfg.llm_timeout);
     let firefly =
         FireflyClient::new(&http, &cfg.firefly_url, &cfg.firefly_token, &cfg.paypal_account);
 
@@ -183,6 +183,10 @@ async fn route(mailbox: &Mailbox, id: &str, processed: bool) {
     }
 }
 
+/// Build the shared HTTP client used by JMAP and Firefly. Its 120s default is a
+/// sane cap for those request/response APIs; the LLM chat-completions path
+/// overrides it per-request (see [`LlmClient`]) because a cold reasoning model
+/// can run for minutes — far longer than mail or ledger calls should ever take.
 fn build_http_client() -> Result<Client> {
     Client::builder()
         .user_agent(concat!("receipt-ledger/", env!("CARGO_PKG_VERSION")))

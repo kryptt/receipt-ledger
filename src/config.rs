@@ -17,6 +17,11 @@ const DEFAULT_JMAP_USER: &str = "ledger@example.test";
 const DEFAULT_STATE_PATH: &str = "/state/jmap.state";
 const DEFAULT_OLLAMA_URL: &str = "http://ollama-router.ai:11434/v1";
 const DEFAULT_MODEL_ALLOWLIST: &str = "gemma4:e2b";
+/// LLM chat-completions request timeout, in seconds. Generous because a cold
+/// reasoning model on slow hardware (e.g. ternary-bonsai-8b on Strix Halo) can
+/// take minutes to produce a full receipt extraction. Applies *only* to the
+/// LLM request path — JMAP and Firefly keep the shared client's shorter timeout.
+const DEFAULT_LLM_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_FIREFLY_URL: &str = "http://firefly:8080";
 const DEFAULT_PROCESSED_MAILBOX: &str = "Processed";
 const DEFAULT_REVIEW_MAILBOX: &str = "Review";
@@ -32,6 +37,8 @@ pub struct Config {
     pub ollama_url: String,
     /// Allowlisted extraction models, highest priority first.
     pub model_allowlist: Vec<String>,
+    /// Per-request timeout for the LLM chat-completions call.
+    pub llm_timeout: std::time::Duration,
 
     pub firefly_url: String,
     pub firefly_token: String,
@@ -61,6 +68,10 @@ impl Config {
 
             ollama_url: env_or("RECEIPT_OLLAMA_URL", DEFAULT_OLLAMA_URL),
             model_allowlist,
+            llm_timeout: std::time::Duration::from_secs(env_u64(
+                "RECEIPT_LLM_TIMEOUT_SECS",
+                DEFAULT_LLM_TIMEOUT_SECS,
+            )?),
 
             firefly_url: env_or("RECEIPT_FIREFLY_URL", DEFAULT_FIREFLY_URL),
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
@@ -87,4 +98,17 @@ fn required(key: &str) -> Result<String> {
         anyhow::bail!("required env var {key} is empty");
     }
     Ok(v)
+}
+
+/// Parse an optional `u64` env var, falling back to `default` when unset/blank.
+/// A present-but-unparseable value is a hard error — a typo'd timeout should
+/// fail the CronJob loudly, not silently revert to the default.
+fn env_u64(key: &str, default: u64) -> Result<u64> {
+    match env::var(key).ok().filter(|v| !v.trim().is_empty()) {
+        None => Ok(default),
+        Some(v) => v
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("env var {key}={v:?} is not a non-negative integer")),
+    }
 }

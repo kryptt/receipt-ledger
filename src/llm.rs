@@ -6,6 +6,8 @@
 //! `postprocess`. The client itself does no validation of the *contents* —
 //! that is the validation gate's job.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,9 @@ pub struct LlmClient<'a> {
     /// OpenAI-compatible base, e.g. `http://ollama-router.ai:11434/v1`.
     base_url: String,
     model: String,
+    /// Per-request timeout, applied only to the chat-completions call so a slow
+    /// cold-loading model does not abort under the shared client's tighter cap.
+    timeout: Duration,
 }
 
 #[derive(Serialize)]
@@ -59,11 +64,17 @@ struct ResponseMessage {
 }
 
 impl<'a> LlmClient<'a> {
-    pub fn new(http: &'a Client, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+    pub fn new(
+        http: &'a Client,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        timeout: Duration,
+    ) -> Self {
         Self {
             http,
             base_url: base_url.into(),
             model: model.into(),
+            timeout,
         }
     }
 
@@ -80,11 +91,14 @@ impl<'a> LlmClient<'a> {
             response_format: ResponseFormat { kind: "json_object" },
         };
 
-        debug!(%url, model = %self.model, "requesting extraction");
+        debug!(%url, model = %self.model, timeout_secs = self.timeout.as_secs(), "requesting extraction");
         let resp = self
             .http
             .post(&url)
             .json(&request)
+            // Per-request override of the shared client's timeout: extraction on
+            // a cold reasoning model can run for minutes.
+            .timeout(self.timeout)
             .send()
             .await
             .context("sending chat-completions request")?
