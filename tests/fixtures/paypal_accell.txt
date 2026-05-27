@@ -1,0 +1,31 @@
+From: Buyer <buyer@example.com>
+Date: Mon, 11 May 2026 at 19:11
+Subject: Fwd: Example Merchant B.V...: €149.99 EUR
+To: ledger <ledger@example.test>
+
+
+---------- Forwarded message ---------
+From: PayPal <service@paypal.com>
+Date: Mon, 11 May 2026, 19:10
+Subject: Example Merchant B.V...: €149.99 EUR
+To: buyer@example.com
+
+
+You paid €149.99 EUR to Example Merchant B.V...
+
+Merchant Example Merchant B.V...
+Transaction date May 11, 2026 10:10:38 AM PDT
+Order ID TESTORDER0123456
+
+Subtotal €120.00
+Tax €29.99
+Total €149.99 EUR
+
+Paid with Pay in 4 $185.00 USD
+(PayPal's conversion rate: 1.0000 USD = 0.8108 EUR)
+
+Transaction ID: 8XY12345AB678901C
+
+Your payment was sent from buyer@example.com
+
+Questions? Visit the Help Center.
