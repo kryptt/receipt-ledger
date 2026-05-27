@@ -121,81 +121,192 @@ impl<'a> LlmClient<'a> {
     }
 }
 
-/// Parse the model's textual answer into JSON, tolerating markdown fences and
-/// leading/trailing prose that small models sometimes add despite JSON mode.
+/// Parse the model's textual answer into JSON, tolerating reasoning blocks,
+/// markdown fences, and trailing prose that models add despite JSON mode.
 fn parse_json_content(content: &str) -> Result<Value> {
-    // Fast path: the whole thing is valid JSON.
-    if let Ok(v) = serde_json::from_str::<Value>(content.trim()) {
-        return Ok(v);
-    }
-    // Strip a ```json ... ``` fence if present.
-    let stripped = strip_fence(content);
-    if let Ok(v) = serde_json::from_str::<Value>(stripped.trim()) {
-        return Ok(v);
-    }
-    // Last resort: grab the outermost {...} or [...] span.
-    if let Some(span) = outermost_json_span(stripped) {
-        return serde_json::from_str::<Value>(span)
-            .with_context(|| format!("extracted JSON span did not parse: {span}"));
-    }
-    Err(anyhow!("model answer was not JSON: {content}"))
+    let json = extract_json(content)
+        .with_context(|| format!("could not locate a JSON object in model answer: {content}"))?;
+    serde_json::from_str::<Value>(&json)
+        .with_context(|| format!("extracted JSON span did not parse: {json}"))
 }
 
-fn strip_fence(s: &str) -> &str {
-    let t = s.trim();
-    let t = t.strip_prefix("```json").or_else(|| t.strip_prefix("```")).unwrap_or(t);
-    t.strip_suffix("```").unwrap_or(t)
+/// Pull a single JSON object out of a model's free-form answer.
+///
+/// The transformation is purely textual and lossless about the object itself:
+///   1. drop any `<think> … </think>` reasoning block(s) (reasoning models),
+///   2. drop Markdown code fences (```json … ``` or ``` … ```),
+///   3. take the slice from the first `{` to its *matching* `}` via a
+///      balanced-brace scan (so trailing prose after the object is ignored,
+///      and a stray `}` in that prose does not over-extend the span).
+///
+/// Returns the object slice as an owned `String` (the `<think>`/fence steps may
+/// reallocate, so a borrow cannot span all cases). Brace counting is done on a
+/// best-effort basis: it does not track strings, so a literal `}` inside a JSON
+/// string value would close the object early — acceptable for the flat receipt
+/// objects this service handles, and the subsequent `from_str` is the real
+/// validity gate.
+fn extract_json(content: &str) -> Option<String> {
+    let without_think = strip_think_blocks(content);
+    let unfenced = strip_fences(&without_think);
+    balanced_object_span(&unfenced).map(str::to_string)
 }
 
-/// Return the smallest slice spanning the first opening bracket to its matching
-/// last closing bracket of the same family. Good enough to rescue an object or
-/// array embedded in prose.
-fn outermost_json_span(s: &str) -> Option<&str> {
-    let obj = (s.find('{'), s.rfind('}'));
-    let arr = (s.find('['), s.rfind(']'));
-    let pick = |open: Option<usize>, close: Option<usize>| match (open, close) {
-        (Some(o), Some(c)) if c > o => Some((o, c)),
-        _ => None,
-    };
-    match (pick(obj.0, obj.1), pick(arr.0, arr.1)) {
-        (Some((o, c)), None) => Some(&s[o..=c]),
-        (None, Some((o, c))) => Some(&s[o..=c]),
-        (Some((oo, oc)), Some((ao, ac))) => {
-            // Prefer whichever opens first.
-            if oo <= ao {
-                Some(&s[oo..=oc])
-            } else {
-                Some(&s[ao..=ac])
+/// Remove every `<think> … </think>` block, case-insensitively and across
+/// newlines. Unterminated `<think>` (no closing tag) drops the remainder, which
+/// is the safe choice — a half-streamed reasoning block carries no JSON.
+fn strip_think_blocks(s: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0usize;
+    while let Some(rel_open) = lower[cursor..].find(OPEN) {
+        let open = cursor + rel_open;
+        out.push_str(&s[cursor..open]);
+        match lower[open + OPEN.len()..].find(CLOSE) {
+            Some(rel_close) => {
+                // Skip past the closing tag and continue scanning.
+                cursor = open + OPEN.len() + rel_close + CLOSE.len();
+            }
+            None => {
+                // No closing tag: discard everything from the open tag onward.
+                return out;
             }
         }
-        (None, None) => None,
     }
+    out.push_str(&s[cursor..]);
+    out
+}
+
+/// Strip a single surrounding Markdown code fence, if the (trimmed) content is
+/// wrapped in one. Handles ```json … ``` and plain ``` … ```.
+fn strip_fences(s: &str) -> String {
+    let t = s.trim();
+    let Some(rest) = t.strip_prefix("```") else {
+        return t.to_string();
+    };
+    // After the opening fence an optional language tag runs to end-of-line.
+    let body = match rest.split_once('\n') {
+        Some((_lang, after)) => after,
+        None => rest,
+    };
+    body.strip_suffix("```")
+        .or_else(|| body.trim_end().strip_suffix("```"))
+        .unwrap_or(body)
+        .to_string()
+}
+
+/// Return the slice from the first `{` to its matching `}` via a balanced-brace
+/// scan. `None` if there is no `{`, or if braces never balance.
+fn balanced_object_span(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    for (offset, ch) in s[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&s[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Extracted;
 
+    /// A complete extraction object the PayPal prompt asks for, used to assert
+    /// the extracted span actually deserializes into the typed schema.
+    const RECEIPT_OBJECT: &str = r#"{
+        "source": "paypal",
+        "external_id": "8XY12345AB678901C",
+        "amount": "1.00",
+        "currency": "EUR",
+        "direction": "out",
+        "date": "2026-05-11",
+        "merchant": "Example Merchant B.V.",
+        "account_hint": "Pay in 4",
+        "status": "approved",
+        "raw_ref": "TESTORDER0123456"
+    }"#;
+
+    fn assert_extracts_receipt(content: &str) {
+        let span = extract_json(content).expect("a JSON object should be located");
+        let extracted: Extracted =
+            serde_json::from_str(&span).expect("extracted span should deserialize to Extracted");
+        assert_eq!(extracted.external_id.as_deref(), Some("8XY12345AB678901C"));
+        assert_eq!(extracted.currency, "EUR");
+        assert_eq!(extracted.merchant, "Example Merchant B.V.");
+    }
+
+    // (a) bare JSON.
     #[test]
-    fn parses_bare_json() {
-        let v = parse_json_content(r#"{"a":1}"#).unwrap();
-        assert_eq!(v["a"], 1);
+    fn extracts_bare_json() {
+        assert_extracts_receipt(RECEIPT_OBJECT);
+    }
+
+    // (b) JSON preceded by a <think> reasoning block.
+    #[test]
+    fn extracts_after_think_block() {
+        let content = format!(
+            "<think>\nThe transaction id is 8XY..., the total is 1.00 EUR.\nLet me format it.\n</think>\n{RECEIPT_OBJECT}"
+        );
+        assert_extracts_receipt(&content);
+    }
+
+    // (c) JSON inside a ```json fence.
+    #[test]
+    fn extracts_from_json_fence() {
+        let content = format!("```json\n{RECEIPT_OBJECT}\n```");
+        assert_extracts_receipt(&content);
+    }
+
+    // (d) JSON followed by trailing prose (with a stray brace, to prove the
+    // balanced scan stops at the matching `}` rather than the last one).
+    #[test]
+    fn extracts_with_trailing_prose() {
+        let content =
+            format!("{RECEIPT_OBJECT}\n\nHope that helps! Let me know if anything looks off }}.");
+        assert_extracts_receipt(&content);
+    }
+
+    // The combination the qwen3.x tiers actually emit: think block, fence, and
+    // trailing prose all at once.
+    #[test]
+    fn extracts_through_think_fence_and_prose() {
+        let content = format!(
+            "<THINK>multi\nline\nreasoning</THINK>\n```json\n{RECEIPT_OBJECT}\n```\nDone."
+        );
+        assert_extracts_receipt(&content);
     }
 
     #[test]
-    fn parses_fenced_json() {
-        let v = parse_json_content("```json\n{\"a\":1}\n```").unwrap();
-        assert_eq!(v["a"], 1);
+    fn balanced_scan_ignores_nested_then_trailing() {
+        // Nested object must not close the outer span early.
+        let s = r#"prefix {"a":{"b":1},"c":2} trailing }"#;
+        assert_eq!(balanced_object_span(s), Some(r#"{"a":{"b":1},"c":2}"#));
     }
 
     #[test]
-    fn rescues_json_from_prose() {
-        let v = parse_json_content("Sure! Here you go: {\"a\":1} hope that helps").unwrap();
-        assert_eq!(v["a"], 1);
+    fn strips_multiple_think_blocks() {
+        let s = "<think>one</think>keep<Think>two</Think>more";
+        assert_eq!(strip_think_blocks(s), "keepmore");
     }
 
     #[test]
-    fn errors_on_non_json() {
+    fn unterminated_think_drops_remainder() {
+        assert_eq!(strip_think_blocks("good<think>oops no close"), "good");
+    }
+
+    #[test]
+    fn parse_json_content_errors_on_non_json() {
         assert!(parse_json_content("no json here").is_err());
     }
 }
