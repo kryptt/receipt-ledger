@@ -5,10 +5,16 @@
 //! `std::env` again. Required secrets that are missing produce a hard error so
 //! the CronJob fails loudly (and the `CronJobFailing` alert can fire) rather
 //! than silently doing nothing.
+//!
+//! Account references are parsed into [`AccountId`] (numeric Firefly id) at this
+//! boundary, so a misconfigured non-numeric account name fails the CronJob here
+//! rather than producing an ambiguous routing path downstream.
 
 use std::env;
 
 use anyhow::{Context, Result};
+use rust_decimal::Decimal;
+use std::str::FromStr;
 
 /// Default JMAP base URL — the in-cluster Stalwart ClusterIP service. The
 /// macvlan `mail.hr-home.xyz` is not reachable from ordinary pods.
@@ -23,12 +29,57 @@ const DEFAULT_MODEL_ALLOWLIST: &str = "gemma4:e2b";
 /// LLM request path — JMAP and Firefly keep the shared client's shorter timeout.
 const DEFAULT_LLM_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_FIREFLY_URL: &str = "http://firefly:8080";
-/// Default FX-rate provider — Frankfurter (ECB rates, key-free). Mirrors
+/// Default FX-rate provider — Frankfurter (ECB rates, key-free). The legacy
+/// `.app` host 301-redirects to the `.dev` host; we pin the working base
+/// directly so a deployment that does not override `RECEIPT_FX_URL` still
+/// resolves rates without depending on redirect-following. Mirrors
 /// [`crate::fx::DEFAULT_FX_URL`]; kept as a literal here so config has no
 /// compile-time dependency on the fx module.
-const DEFAULT_FX_URL: &str = "https://api.frankfurter.app";
+const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
 const DEFAULT_PROCESSED_MAILBOX: &str = "Processed";
 const DEFAULT_REVIEW_MAILBOX: &str = "Review";
+
+/// A Firefly account reference: a numeric account id.
+///
+/// Our deployment routes against numeric ids (103/105/106/107). Parsing at the
+/// config boundary means a non-numeric value (a stale account *name*) is a hard
+/// startup error, not a silent mis-route. The name-based account path is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountId(String);
+
+impl AccountId {
+    /// Parse a numeric account id: trimmed, non-empty, all ASCII digits.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let t = raw.trim();
+        if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+            Ok(AccountId(t.to_string()))
+        } else {
+            anyhow::bail!("account id {raw:?} is not numeric (expected a Firefly account id)")
+        }
+    }
+
+    /// The id as it appears in Firefly API paths and `source_id`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AccountId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Deterministic validation policy, derived from configuration and consumed by
+/// [`crate::validate::validate`]. Carries only the knobs that gate booking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidationPolicy {
+    /// Plausibility ceiling for a single transaction amount. `None` means no
+    /// upper bound. When `Some(max)`, an amount strictly greater than `max`
+    /// routes to Review rather than booking (`RECEIPT_MAX_AMOUNT`).
+    pub max_amount: Option<Decimal>,
+}
 
 /// Fully-resolved runtime configuration.
 #[derive(Debug, Clone)]
@@ -51,22 +102,22 @@ pub struct Config {
     /// booking. An FX failure routes the message to Review rather than booking
     /// the foreign number as the account currency.
     pub fx_url: String,
-    /// PayPal Balance account in Firefly (asset, USD) — name or numeric id.
-    /// Required: a PayPal record whose funding is *not* a credit product books
-    /// here, so this is the safe default and must always be present.
-    pub paypal_balance_account: String,
-    /// PayPal Credit account in Firefly (liability, USD) — name or numeric id.
-    /// `None` when unconfigured; a credit-funded PayPal record then routes to
-    /// Review rather than booking against the balance account.
-    pub paypal_credit_account: Option<String>,
-    /// Banco Popular VISA USD account in Firefly (liability, USD) — name or
-    /// numeric id. `None` when unconfigured; a non-DOP Banco Popular record then
-    /// routes to Review.
-    pub banco_popular_usd_account: Option<String>,
-    /// Banco Popular VISA DOP account in Firefly (liability, DOP) — name or
-    /// numeric id. `None` when unconfigured; a DOP Banco Popular record then
-    /// routes to Review.
-    pub banco_popular_dop_account: Option<String>,
+    /// PayPal Balance account in Firefly (asset, USD), by numeric id. Required:
+    /// a PayPal record whose funding is *not* a credit product books here, so
+    /// this is the safe default and must always be present.
+    pub paypal_balance_account: AccountId,
+    /// PayPal Credit account in Firefly (liability, USD), by numeric id. `None`
+    /// when unconfigured; a credit-funded PayPal record then routes to Review.
+    pub paypal_credit_account: Option<AccountId>,
+    /// Banco Popular VISA USD account (liability, USD), by numeric id. `None`
+    /// when unconfigured; a non-DOP Banco Popular record then routes to Review.
+    pub banco_popular_usd_account: Option<AccountId>,
+    /// Banco Popular VISA DOP account (liability, DOP), by numeric id. `None`
+    /// when unconfigured; a DOP Banco Popular record then routes to Review.
+    pub banco_popular_dop_account: Option<AccountId>,
+
+    /// Deterministic validation policy applied to every extracted record.
+    pub validation: ValidationPolicy,
 
     pub processed_mailbox: String,
     pub review_mailbox: String,
@@ -74,14 +125,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let model_allowlist = env_or(
-            "RECEIPT_MODEL_ALLOWLIST",
-            DEFAULT_MODEL_ALLOWLIST,
-        )
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
+        let model_allowlist = env_or("RECEIPT_MODEL_ALLOWLIST", DEFAULT_MODEL_ALLOWLIST)
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
 
         Ok(Config {
             jmap_url: env_or("RECEIPT_JMAP_URL", DEFAULT_JMAP_URL),
@@ -100,14 +148,18 @@ impl Config {
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
             fx_url: env_or("RECEIPT_FX_URL", DEFAULT_FX_URL),
             // No sensible default — the safe-default PayPal account must always
-            // point at a real Firefly account.
-            paypal_balance_account: required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,
+            // point at a real numeric Firefly account id.
+            paypal_balance_account: account_required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,
             // Optional — absent means credit-funded PayPal mail routes to Review.
-            paypal_credit_account: optional("RECEIPT_PAYPAL_CREDIT_ACCOUNT"),
+            paypal_credit_account: account_optional("RECEIPT_PAYPAL_CREDIT_ACCOUNT")?,
             // Optional — absent means non-DOP Banco Popular mail routes to Review.
-            banco_popular_usd_account: optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT"),
+            banco_popular_usd_account: account_optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT")?,
             // Optional — absent means DOP Banco Popular mail routes to Review.
-            banco_popular_dop_account: optional("RECEIPT_BANCO_POPULAR_DOP_ACCOUNT"),
+            banco_popular_dop_account: account_optional("RECEIPT_BANCO_POPULAR_DOP_ACCOUNT")?,
+
+            validation: ValidationPolicy {
+                max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,
+            },
 
             processed_mailbox: env_or("RECEIPT_PROCESSED_MAILBOX", DEFAULT_PROCESSED_MAILBOX),
             review_mailbox: env_or("RECEIPT_REVIEW_MAILBOX", DEFAULT_REVIEW_MAILBOX),
@@ -122,20 +174,48 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Read an optional env var, returning `None` when unset or blank. Used for
-/// settings that are legitimately absent (e.g. a per-source account that has
-/// not been provisioned yet).
+/// Read an optional env var, returning `None` when unset or blank.
 fn optional(key: &str) -> Option<String> {
-    env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 fn required(key: &str) -> Result<String> {
-    let v = env::var(key)
-        .with_context(|| format!("required env var {key} is not set"))?;
+    let v = env::var(key).with_context(|| format!("required env var {key} is not set"))?;
     if v.trim().is_empty() {
         anyhow::bail!("required env var {key} is empty");
     }
     Ok(v)
+}
+
+/// Parse a required numeric [`AccountId`] env var.
+fn account_required(key: &str) -> Result<AccountId> {
+    AccountId::parse(&required(key)?).with_context(|| format!("env var {key}"))
+}
+
+/// Parse an optional numeric [`AccountId`] env var. Absent → `None`; present but
+/// non-numeric → hard error (a stale account name must not silently disable a
+/// route).
+fn account_optional(key: &str) -> Result<Option<AccountId>> {
+    match optional(key) {
+        None => Ok(None),
+        Some(v) => AccountId::parse(&v)
+            .map(Some)
+            .with_context(|| format!("env var {key}")),
+    }
+}
+
+/// Parse an optional [`Decimal`] env var. Absent → `None`; present but
+/// unparseable → hard error.
+fn decimal_optional(key: &str) -> Result<Option<Decimal>> {
+    match optional(key) {
+        None => Ok(None),
+        Some(v) => Decimal::from_str(&v)
+            .map(Some)
+            .with_context(|| format!("env var {key}={v:?} is not a decimal")),
+    }
 }
 
 /// Parse an optional `u64` env var, falling back to `default` when unset/blank.
@@ -148,5 +228,22 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
             .trim()
             .parse::<u64>()
             .with_context(|| format!("env var {key}={v:?} is not a non-negative integer")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_id_parses_numeric() {
+        assert_eq!(AccountId::parse(" 103 ").unwrap().as_str(), "103");
+    }
+
+    #[test]
+    fn account_id_rejects_non_numeric() {
+        assert!(AccountId::parse("PayPal Balance").is_err());
+        assert!(AccountId::parse("").is_err());
+        assert!(AccountId::parse("10a").is_err());
     }
 }

@@ -35,10 +35,11 @@ use chrono::NaiveDate;
 use reqwest::Client;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::str::FromStr;
 
-/// Default Frankfurter base URL. Key-free, ECB rates.
-pub const DEFAULT_FX_URL: &str = "https://api.frankfurter.app";
+/// Default Frankfurter base URL. Key-free, ECB rates. The historical `.app`
+/// host 301-redirects here; we pin the `.dev` base so no redirect-following is
+/// required. Mirrors [`crate::config`]'s `DEFAULT_FX_URL`.
+pub const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
 
 /// Cache key: the (from, to, date) triple a rate is requested for. `from`/`to`
 /// are stored upper-cased so lookups are case-insensitive.
@@ -79,8 +80,16 @@ impl<'a> FxClient<'a> {
         let to = to.trim().to_ascii_uppercase();
         let key: CacheKey = (from.clone(), to.clone(), date);
 
-        // Cache hit — no network. Scoped lock: released before any await.
-        if let Some(rate) = self.cache.lock().expect("fx cache mutex poisoned").get(&key) {
+        // Cache hit — no network. Scoped lock: released before any await. A
+        // poisoned lock is recovered (a panic in another batch item must not
+        // sink the whole run); the cached data is plain values, never a
+        // half-written invariant.
+        if let Some(rate) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
             return Ok(*rate);
         }
 
@@ -113,7 +122,7 @@ impl<'a> FxClient<'a> {
 
         self.cache
             .lock()
-            .expect("fx cache mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(key, rate);
         Ok(rate)
     }
@@ -182,6 +191,7 @@ fn parse_rate(body: &str, to: &str) -> Result<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn identity_is_case_and_whitespace_insensitive() {
@@ -216,7 +226,10 @@ mod tests {
     #[test]
     fn parse_rate_is_case_insensitive_on_target() {
         let body = r#"{"amount":1.0,"base":"USD","date":"2026-05-27","rates":{"JPY":143.5}}"#;
-        assert_eq!(parse_rate(body, "jpy").unwrap(), Decimal::from_str("143.5").unwrap());
+        assert_eq!(
+            parse_rate(body, "jpy").unwrap(),
+            Decimal::from_str("143.5").unwrap()
+        );
     }
 
     #[test]
@@ -237,7 +250,13 @@ mod tests {
     fn seeded_rate_returns_without_network() {
         let http = Client::new();
         let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
-        let fx = FxClient::with_seeded_rate(&http, "JPY", "USD", date, Decimal::from_str("0.0064").unwrap());
+        let fx = FxClient::with_seeded_rate(
+            &http,
+            "JPY",
+            "USD",
+            date,
+            Decimal::from_str("0.0064").unwrap(),
+        );
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

@@ -7,9 +7,12 @@
 //! an extra `Razón` column) — which we ask the LLM to flatten into JSON, then
 //! parse here into [`Extracted`].
 //!
-//! Two quirks drive the parsing:
+//! Three quirks drive the parsing:
 //! - the amount is prefixed with a currency code (`EUR$1.50`), which must be
-//!   stripped to a bare decimal, and
+//!   stripped to a bare decimal,
+//! - amounts are rendered with a thousands separator (`JPY$5,130.00`), which we
+//!   strip in this adapter's parse step BEFORE the [`crate::schema::Amount`]
+//!   sanitizing gate so the gate sees a clean decimal (`5130.00`), and
 //! - dates are `DD/MM/YYYY`, NOT US `m/d` — `27/05/2026` is 27 May, not an
 //!   invalid month. The date format list reflects this.
 
@@ -17,9 +20,12 @@ use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use serde_json::Value;
 
-use super::Adapter;
-use super::parse::{collect_objects, opt_string, parse_amount, parse_date_with, string_field};
-use crate::schema::{Direction, Extracted, Source};
+use super::parse::{
+    collect_objects, currency_field, parse_amount_with, parse_date_with, string_field,
+    strip_thousands_commas,
+};
+use super::{Adapter, Outcome};
+use crate::schema::{Direction, Extracted, Money, Source};
 
 /// Sender substring that identifies a Banco Popular consumo notification.
 const BANCO_SENDER: &str = "popularenlinea.com";
@@ -70,12 +76,13 @@ Notificación:
         )
     }
 
-    fn postprocess(&self, json: &Value) -> Result<Vec<Extracted>> {
+    fn postprocess(&self, json: &Value) -> Result<Outcome> {
         let objects = collect_objects(json);
         if objects.is_empty() {
             return Err(anyhow!("LLM JSON contained no transaction object"));
         }
-        objects.iter().map(parse_one).collect()
+        let records = objects.iter().map(parse_one).collect::<Result<Vec<_>>>()?;
+        Ok(Outcome::Transaction(records))
     }
 }
 
@@ -87,23 +94,23 @@ fn parse_one(obj: &Value) -> Result<Extracted> {
         .as_object()
         .ok_or_else(|| anyhow!("expected JSON object, got {obj}"))?;
 
-    let amount = parse_amount(map.get("amount")).context("parsing `amount`")?;
-    let currency = string_field(map, "currency")
-        .map(|s| s.trim().to_ascii_uppercase())
-        .ok_or_else(|| anyhow!("missing `currency`"))?;
+    // Strip the thousands separator HERE, before the sanitizing amount gate, so
+    // a legitimately-grouped `5,130.00` becomes a clean `5130.00`.
+    let amount =
+        parse_amount_with(map.get("amount"), strip_thousands_commas).context("parsing `amount`")?;
+    let currency = currency_field(map, "currency")?;
     let date = parse_date(map.get("date")).context("parsing `date`")?;
     let merchant = string_field(map, "merchant").ok_or_else(|| anyhow!("missing `merchant`"))?;
     let status = string_field(map, "status").unwrap_or_default();
 
-    let account_hint = opt_string(map, "account_hint");
-    let raw_ref = opt_string(map, "raw_ref").unwrap_or_default();
+    let account_hint = string_field(map, "account_hint");
+    let raw_ref = string_field(map, "raw_ref").unwrap_or_default();
 
     Ok(Extracted {
         source: Source::BancoPopular,
         // No transaction id — dedup composite-hashes id-less records.
         external_id: None,
-        amount,
-        currency,
+        money: Money::new(amount, currency),
         // A consumo is always an outgoing charge.
         direction: Direction::Out,
         date,
@@ -124,10 +131,16 @@ fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ValidationPolicy;
     use crate::validate::{Verdict, validate};
     use rust_decimal::Decimal;
     use serde_json::json;
     use std::str::FromStr;
+
+    /// No-ceiling validation policy for these adapter-level tests.
+    fn policy() -> ValidationPolicy {
+        ValidationPolicy { max_amount: None }
+    }
 
     /// JSON a correct model returns for an APPROVED consumo (the autoforward
     /// fixture): `EUR$1.50  Euro  27/05/2026  Example Cafe Amsterdam  Aprobada`.
@@ -144,6 +157,19 @@ mod tests {
         })
     }
 
+    /// The single record from a `Transaction` outcome, or a panic.
+    fn one(outcome: Outcome) -> Extracted {
+        match outcome {
+            Outcome::Transaction(mut v) => {
+                assert_eq!(v.len(), 1);
+                v.pop().unwrap()
+            }
+            Outcome::NotATransaction { reason } => {
+                panic!("expected transaction, got skip: {reason}")
+            }
+        }
+    }
+
     #[test]
     fn matches_banco_sender() {
         assert!(BancoPopularAdapter.matches("notificaciones@popularenlinea.com"));
@@ -153,24 +179,20 @@ mod tests {
 
     #[test]
     fn approved_consumo_postprocesses_and_books() {
-        let extracted = BancoPopularAdapter
-            .postprocess(&approved_json())
-            .expect("postprocess should succeed");
-        assert_eq!(extracted.len(), 1);
-        let e = &extracted[0];
+        let e = one(BancoPopularAdapter.postprocess(&approved_json()).unwrap());
 
         assert_eq!(e.source, Source::BancoPopular);
         assert_eq!(e.external_id, None);
-        assert_eq!(e.amount, Decimal::from_str("1.50").unwrap());
-        assert_eq!(e.currency, "EUR");
+        assert_eq!(e.amount().value(), Decimal::from_str("1.50").unwrap());
+        assert_eq!(e.currency().as_str(), "EUR");
         assert_eq!(e.direction, Direction::Out);
         assert_eq!(e.merchant, "Example Cafe Amsterdam");
         assert_eq!(e.account_hint.as_deref(), Some("1234"));
 
-        match validate(e.clone()) {
+        match validate(e, &policy()) {
             Verdict::Booked(b) => {
-                assert_eq!(b.source, Source::BancoPopular);
-                assert_eq!(b.external_id, None);
+                assert_eq!(b.as_extracted().source, Source::BancoPopular);
+                assert_eq!(b.as_extracted().external_id, None);
             }
             Verdict::Review { reason } => panic!("approved consumo should book: {reason}"),
         }
@@ -182,15 +204,15 @@ mod tests {
         v["status"] = json!("Declinada");
         v["amount"] = json!("49.08");
         v["merchant"] = json!("Example Shop B.V.");
-        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
-        assert!(matches!(validate(e.clone()), Verdict::Review { .. }));
+        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
+        assert!(matches!(validate(e, &policy()), Verdict::Review { .. }));
     }
 
     #[test]
     fn date_is_day_first_not_us_month_first() {
         // 27/05/2026: day 27 > 12, so this is unambiguously DD/MM. A US m/d
         // parser would reject it (month 27 invalid) — assert the correct day.
-        let e = &BancoPopularAdapter.postprocess(&approved_json()).unwrap()[0];
+        let e = one(BancoPopularAdapter.postprocess(&approved_json()).unwrap());
         assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
     }
 
@@ -204,9 +226,24 @@ mod tests {
     }
 
     #[test]
+    fn strips_thousands_separator_in_adapter() {
+        // The adapter strips the thousands comma BEFORE the amount gate, so a
+        // legitimately-grouped figure books cleanly even if the model leaves it.
+        let mut v = approved_json();
+        v["currency"] = json!("JPY");
+        v["amount"] = json!("5,130.00");
+        v["merchant"] = json!("Example Ramen Tokyo");
+        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
+        assert_eq!(e.amount().value(), Decimal::from_str("5130.00").unwrap());
+    }
+
+    #[test]
     fn accepts_transactions_wrapper() {
         let v = json!({ "transactions": [approved_json()] });
-        assert_eq!(BancoPopularAdapter.postprocess(&v).unwrap().len(), 1);
+        match BancoPopularAdapter.postprocess(&v).unwrap() {
+            Outcome::Transaction(v) => assert_eq!(v.len(), 1),
+            Outcome::NotATransaction { reason } => panic!("unexpected skip: {reason}"),
+        }
     }
 
     /// The model maps "Moneda" = "Yen" (rendered `JPY$5,130.00`) to ISO "JPY".
@@ -218,11 +255,11 @@ mod tests {
         v["currency"] = json!("JPY");
         v["amount"] = json!("5130.00");
         v["merchant"] = json!("Example Ramen Tokyo");
-        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
-        assert_eq!(e.currency, "JPY");
-        assert_eq!(e.amount, Decimal::from_str("5130.00").unwrap());
+        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
+        assert_eq!(e.currency().as_str(), "JPY");
+        assert_eq!(e.amount().value(), Decimal::from_str("5130.00").unwrap());
         // JPY is a known currency, so an approved row books.
-        assert!(matches!(validate(e.clone()), Verdict::Booked(_)));
+        assert!(matches!(validate(e, &policy()), Verdict::Booked(_)));
     }
 
     /// The model maps "Moneda" = "Won" (rendered `KRW$8,700.00`) to ISO "KRW".
@@ -232,9 +269,27 @@ mod tests {
         v["currency"] = json!("KRW");
         v["amount"] = json!("8700.00");
         v["merchant"] = json!("Example Bibimbap Seoul");
-        let e = &BancoPopularAdapter.postprocess(&v).unwrap()[0];
-        assert_eq!(e.currency, "KRW");
-        assert_eq!(e.amount, Decimal::from_str("8700.00").unwrap());
-        assert!(matches!(validate(e.clone()), Verdict::Booked(_)));
+        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
+        assert_eq!(e.currency().as_str(), "KRW");
+        assert_eq!(e.amount().value(), Decimal::from_str("8700.00").unwrap());
+        assert!(matches!(validate(e, &policy()), Verdict::Booked(_)));
+    }
+
+    // --- property tests --------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Banco Popular dates are day-first (`%d/%m/%Y`): a `DD/MM/YYYY` source
+        /// must parse to exactly that day/month, never the US month-first
+        /// interpretation. Generates day > 12 so the two interpretations differ
+        /// (a US parser would reject month > 12).
+        #[test]
+        fn prop_date_is_day_first(day in 13u32..=28, month in 1u32..=12, year in 2020i32..=2030) {
+            let mut v = approved_json();
+            v["date"] = json!(format!("{day:02}/{month:02}/{year}"));
+            let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
+            prop_assert_eq!(e.date, NaiveDate::from_ymd_opt(year, month, day).unwrap());
+        }
     }
 }

@@ -18,14 +18,30 @@ use rust_decimal::Decimal;
 use serde_json::json;
 use std::str::FromStr;
 
-use receipt_ledger::adapters;
+use receipt_ledger::adapters::{self, Outcome};
+use receipt_ledger::config::ValidationPolicy;
 use receipt_ledger::dedup;
-use receipt_ledger::schema::{Direction, Source};
+use receipt_ledger::schema::{Direction, Extracted, Source};
 use receipt_ledger::unwrap::unwrap_message;
 use receipt_ledger::validate::{Verdict, validate};
 
 const AUTOFORWARD: &str = include_str!("fixtures/banco_popular_autoforward.txt");
 const MANUAL_FWD: &str = include_str!("fixtures/banco_popular_manual_fwd.txt");
+
+fn policy() -> ValidationPolicy {
+    ValidationPolicy { max_amount: None }
+}
+
+/// The single record from a `Transaction` outcome, or a panic.
+fn one(outcome: Outcome) -> Extracted {
+    match outcome {
+        Outcome::Transaction(mut v) => {
+            assert_eq!(v.len(), 1);
+            v.pop().unwrap()
+        }
+        Outcome::NotATransaction { reason } => panic!("expected transaction, got skip: {reason}"),
+    }
+}
 
 #[test]
 fn autoforwarded_consumo_books_with_expected_fields() {
@@ -33,7 +49,10 @@ fn autoforwarded_consumo_books_with_expected_fields() {
     //    From the bank set as the original sender.
     let unwrapped = unwrap_message(Some("<notificaciones@popularenlinea.com>"), AUTOFORWARD)
         .expect("auto-forward resolves via envelope From");
-    assert_eq!(unwrapped.original_sender, "notificaciones@popularenlinea.com");
+    assert_eq!(
+        unwrapped.original_sender,
+        "notificaciones@popularenlinea.com"
+    );
     // The body is the original message verbatim.
     assert!(unwrapped.body.contains("Notificación de Consumo"));
     assert!(unwrapped.body.contains("Example Cafe Amsterdam"));
@@ -60,16 +79,14 @@ fn autoforwarded_consumo_books_with_expected_fields() {
     });
 
     // 4. postprocess → typed record.
-    let records = adapter
+    let record = one(adapter
         .postprocess(&model_json)
-        .expect("postprocess succeeds");
-    assert_eq!(records.len(), 1);
-    let record = records.into_iter().next().unwrap();
+        .expect("postprocess succeeds"));
 
     assert_eq!(record.source, Source::BancoPopular);
     assert_eq!(record.external_id, None);
-    assert_eq!(record.amount, Decimal::from_str("1.50").unwrap());
-    assert_eq!(record.currency, "EUR");
+    assert_eq!(record.amount().value(), Decimal::from_str("1.50").unwrap());
+    assert_eq!(record.currency().as_str(), "EUR");
     assert_eq!(record.direction, Direction::Out);
     // DD/MM/YYYY, not US m/d: 27 May 2026.
     assert_eq!(record.date, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
@@ -77,14 +94,14 @@ fn autoforwarded_consumo_books_with_expected_fields() {
     assert_eq!(record.account_hint.as_deref(), Some("1234"));
 
     // 5. Validation gates → booked.
-    let booked = match validate(record) {
+    let booked = match validate(record, &policy()) {
         Verdict::Booked(b) => b,
         Verdict::Review { reason } => panic!("expected booked, got review: {reason}"),
     };
-    assert_eq!(booked.source, Source::BancoPopular);
+    assert_eq!(booked.as_extracted().source, Source::BancoPopular);
 
     // 6. No transaction id → dedup falls back to a composite hash (64 hex).
-    let id = dedup::external_id(&booked);
+    let id = dedup::external_id(booked.as_extracted());
     assert_eq!(id.len(), 64);
     assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
 }
@@ -95,7 +112,10 @@ fn manual_forward_recovers_inner_bank_sender_and_declined_reviews() {
     //    envelope From is the human forwarder and must be ignored.
     let unwrapped = unwrap_message(Some("Jane Doe <jane@example.com>"), MANUAL_FWD)
         .expect("manual forward is unwrapped via the marker");
-    assert_eq!(unwrapped.original_sender, "notificaciones@popularenlinea.com");
+    assert_eq!(
+        unwrapped.original_sender,
+        "notificaciones@popularenlinea.com"
+    );
 
     // 2. Sender detection still selects the Banco Popular adapter.
     let adapter = adapters::select(&unwrapped.original_sender).expect("banco adapter selected");
@@ -113,14 +133,12 @@ fn manual_forward_recovers_inner_bank_sender_and_declined_reviews() {
         "raw_ref": ""
     });
 
-    let record = adapter
-        .postprocess(&model_json)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
+    let record = one(adapter.postprocess(&model_json).unwrap());
     assert_eq!(record.status, "Declinada");
 
     // 4. A declined consumo never books.
-    assert!(matches!(validate(record), Verdict::Review { .. }));
+    assert!(matches!(
+        validate(record, &policy()),
+        Verdict::Review { .. }
+    ));
 }

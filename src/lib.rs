@@ -20,7 +20,8 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::adapters::Outcome;
+use crate::config::{Config, ValidationPolicy};
 use crate::firefly::{FireflyClient, SubmitOutcome};
 use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
@@ -34,6 +35,8 @@ pub struct Summary {
     pub booked: usize,
     pub duplicates: usize,
     pub review: usize,
+    /// Mail that was not a transaction at all (clean skip → Processed).
+    pub skipped: usize,
 }
 
 /// Run the full one-shot pipeline. Returns the run summary on success; an
@@ -72,7 +75,7 @@ pub async fn run() -> Result<Summary> {
         &cfg.firefly_url,
         &cfg.firefly_token,
         &fx,
-        &cfg.paypal_balance_account,
+        cfg.paypal_balance_account.clone(),
         cfg.paypal_credit_account.clone(),
         cfg.banco_popular_usd_account.clone(),
         cfg.banco_popular_dop_account.clone(),
@@ -82,13 +85,20 @@ pub async fn run() -> Result<Summary> {
     let mut summary = Summary::default();
     for msg in &messages {
         summary.processed += 1;
-        match process_message(msg, &llm, &firefly).await {
+        match process_message(msg, &llm, &firefly, &cfg.validation).await {
             Ok(Disposition::Booked) => {
                 summary.booked += 1;
                 route(&mailbox, &msg.id, true).await;
             }
             Ok(Disposition::Duplicate) => {
                 summary.duplicates += 1;
+                route(&mailbox, &msg.id, true).await;
+            }
+            Ok(Disposition::Skipped(reason)) => {
+                // Not a transaction at all — a clean skip, NOT a review. Move
+                // to Processed: it never needed human eyes.
+                summary.skipped += 1;
+                info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
                 route(&mailbox, &msg.id, true).await;
             }
             Ok(Disposition::Review(reason)) => {
@@ -117,6 +127,8 @@ pub async fn run() -> Result<Summary> {
 enum Disposition {
     Booked,
     Duplicate,
+    /// Not a transaction notification at all — a clean skip (→ Processed).
+    Skipped(String),
     Review(String),
 }
 
@@ -125,12 +137,17 @@ async fn process_message(
     msg: &FetchedMessage,
     llm: &LlmClient<'_>,
     firefly: &FireflyClient<'_>,
+    policy: &ValidationPolicy,
 ) -> Result<Disposition> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
     //    original sender.
     let unwrapped = match unwrap::unwrap_message(msg.from.as_deref(), &msg.text) {
         Some(u) => u,
-        None => return Ok(Disposition::Review("not a recognisable forward".to_string())),
+        None => {
+            return Ok(Disposition::Review(
+                "not a recognisable forward".to_string(),
+            ));
+        }
     };
 
     // 3. Route to the per-sender adapter.
@@ -144,13 +161,30 @@ async fn process_message(
         }
     };
 
+    // 3b. Deterministic pre-filter: if the body clearly is not a transaction
+    //     notification (a PayPal shipping update, plan reminder, survey), skip
+    //     it cleanly without an LLM call. Never a Review — it never was a
+    //     transaction.
+    if !adapter.is_transaction(&unwrapped.body) {
+        return Ok(Disposition::Skipped(format!(
+            "{} mail did not look like a transaction notification",
+            adapter.name()
+        )));
+    }
+
     // 4. LLM extraction via ollama-router.
     let prompt = adapter.prompt(&unwrapped.body);
     let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
-    let records = adapter.postprocess(&json).context("adapter postprocess")?;
+    let records = match adapter.postprocess(&json).context("adapter postprocess")? {
+        Outcome::Transaction(records) => records,
+        // The model classified the mail as a non-transaction → clean skip.
+        Outcome::NotATransaction { reason } => return Ok(Disposition::Skipped(reason)),
+    };
 
     if records.is_empty() {
-        return Ok(Disposition::Review("adapter extracted no records".to_string()));
+        return Ok(Disposition::Review(
+            "adapter extracted no records".to_string(),
+        ));
     }
 
     // For a single-transaction source (PayPal v1) we expect one record. Process
@@ -160,12 +194,14 @@ async fn process_message(
     let mut review_reason: Option<String> = None;
 
     for record in records {
-        // 5. Validation gates (deterministic).
-        match validate(record) {
-            Verdict::Booked(record) => {
+        // 5. Validation gates (deterministic). Only `validate` can mint a
+        //    `Validated`, which `firefly.submit` requires — the gate is
+        //    impossible to bypass.
+        match validate(record, policy) {
+            Verdict::Booked(validated) => {
                 // 6. Dedup key. 7. Submit to Firefly.
-                let external_id = dedup::external_id(&record);
-                match firefly.submit(&record, &external_id).await? {
+                let external_id = dedup::external_id(validated.as_extracted());
+                match firefly.submit(&validated, &external_id).await? {
                     SubmitOutcome::Created => booked_any = true,
                     SubmitOutcome::Duplicate => dup_any = true,
                 }

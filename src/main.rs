@@ -29,6 +29,7 @@ async fn main() -> ExitCode {
                 booked = summary.booked,
                 duplicates = summary.duplicates,
                 review = summary.review,
+                skipped = summary.skipped,
                 "run complete"
             );
             ExitCode::SUCCESS

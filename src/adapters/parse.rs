@@ -9,9 +9,9 @@
 
 use anyhow::{Result, anyhow};
 use chrono::NaiveDate;
-use rust_decimal::Decimal;
 use serde_json::Value;
-use std::str::FromStr;
+
+use crate::schema::{Amount, Currency};
 
 /// Normalise the various container shapes a model might emit into a flat list
 /// of candidate objects: a bare object, an array, or `{"transactions":[...]}`.
@@ -27,6 +27,10 @@ pub fn collect_objects(json: &Value) -> Vec<Value> {
 }
 
 /// A present, non-blank string field, trimmed. Absent/blank/non-string → `None`.
+///
+/// This serves both the "required, error if absent" and the "genuinely
+/// optional" call sites — the distinction is made by the caller (`ok_or_else`
+/// vs. using the `Option` directly), so a single primitive suffices.
 pub fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     match map.get(key) {
         Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
@@ -34,21 +38,41 @@ pub fn string_field(map: &serde_json::Map<String, Value>, key: &str) -> Option<S
     }
 }
 
-/// Like [`string_field`] but named for genuinely optional fields, where an
-/// absent value is expected rather than an error.
-pub fn opt_string(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
-    string_field(map, key)
+/// Parse a [`Currency`] field: present, non-blank, exactly a 3-letter ISO code.
+pub fn currency_field(map: &serde_json::Map<String, Value>, key: &str) -> Result<Currency> {
+    let raw = string_field(map, key).ok_or_else(|| anyhow!("missing `{key}`"))?;
+    Currency::parse(&raw).map_err(|e| anyhow!("parsing `{key}`: {e}"))
 }
 
-/// Accept the amount as a JSON string ("149.99") or number (149.99).
-pub fn parse_amount(v: Option<&Value>) -> Result<Decimal> {
-    match v {
-        Some(Value::String(s)) => Decimal::from_str(s.trim())
-            .map_err(|e| anyhow!("amount string {s:?} is not a decimal: {e}")),
-        Some(Value::Number(n)) => Decimal::from_str(&n.to_string())
-            .map_err(|e| anyhow!("amount number {n} is not a decimal: {e}")),
-        other => Err(anyhow!("amount missing or wrong type: {other:?}")),
-    }
+/// Accept the amount as a JSON string ("149.99") or number (149.99) and run it
+/// through the sanitizing [`Amount::parse`] gate: only a plain non-negative
+/// decimal of bounded scale survives. Scientific notation, digit separators,
+/// thousands commas, signs, and currency symbols are all rejected at this
+/// source-string boundary, before any [`rust_decimal::Decimal`] parsing.
+pub fn parse_amount(v: Option<&Value>) -> Result<Amount> {
+    parse_amount_with(v, |s| s.to_string())
+}
+
+/// Like [`parse_amount`] but applies `normalize` to the *source string* before
+/// the gate. Adapters whose source legitimately embeds a thousands separator
+/// (Banco Popular renders `5,130.00`) pass a stripper here so the gate sees a
+/// clean decimal — the only place a comma is ever removed, and only from the
+/// adapter that genuinely produces it.
+pub fn parse_amount_with(v: Option<&Value>, normalize: impl Fn(&str) -> String) -> Result<Amount> {
+    let raw = match v {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        other => return Err(anyhow!("amount missing or wrong type: {other:?}")),
+    };
+    let cleaned = normalize(&raw);
+    Amount::parse(&cleaned).map_err(|e| anyhow!("amount {raw:?} rejected: {e}"))
+}
+
+/// Strip ASCII thousands separators (`,`) from a decimal source string, leaving
+/// the dot as the decimal point. `"5,130.00"` → `"5130.00"`. Used only by the
+/// Banco Popular adapter, whose notifications render grouped amounts.
+pub fn strip_thousands_commas(s: &str) -> String {
+    s.replace(',', "")
 }
 
 /// Parse a date string against an ordered list of `chrono` format strings,

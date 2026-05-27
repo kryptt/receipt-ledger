@@ -30,6 +30,7 @@ const FORWARD_MARKER: &str = "Forwarded message";
 /// (e.g. an HTML-only forward): we parse the raw blob with `mail-parser` and
 /// take its text rendition (HTML is down-converted to text). Returns `None`
 /// when the message has no recoverable text body.
+#[must_use]
 pub fn text_from_raw(raw: &[u8]) -> Option<String> {
     let message = MessageParser::default().parse(raw)?;
     message.body_text(0).map(|c| c.into_owned())
@@ -52,6 +53,7 @@ pub struct Unwrapped {
 /// Returns `None` when no forwarded block is present or no sender address can
 /// be located — the caller routes such messages to `Review` rather than
 /// guessing.
+#[must_use]
 pub fn unwrap_forward(text: &str) -> Option<Unwrapped> {
     let marker_pos = text.find(FORWARD_MARKER)?;
     // Region after the marker line holds the forwarded headers + body.
@@ -81,19 +83,28 @@ pub fn unwrap_forward(text: &str) -> Option<Unwrapped> {
 /// sender and the body IS the original email).
 ///
 /// Strategy:
-/// 1. Try the marker-based [`unwrap_forward`] first. A manual forward must
-///    extract the INNER sender from the forwarded header block, not the human
-///    who forwarded it.
-/// 2. If there is no marker, fall back to the envelope `from` header: the
-///    auto-forward path. The whole text body is the original message.
+/// 1. If a "Forwarded message" marker is present, this is a *manual* forward:
+///    the real original sender lives in the forwarded header block, NOT the
+///    envelope `From:` (which is the human who forwarded it). We extract the
+///    inner sender via [`unwrap_forward`]. If the marker is present but the
+///    inner sender cannot be parsed, we return `None` — we must NOT fall back to
+///    the human forwarder's envelope `From:`, which would mis-attribute the mail
+///    to a person rather than its bank/PayPal origin. Such a message routes to
+///    Review for human eyes.
+/// 2. Only when there is NO marker (an auto-forward) do we fall back to the
+///    envelope `from` header. The whole text body is the original message.
 ///
-/// Returns `None` when neither path yields a sender — the caller routes such
+/// Returns `None` when no sender can be recovered — the caller routes such
 /// messages to `Review` rather than guessing.
+#[must_use]
 pub fn unwrap_message(from: Option<&str>, text: &str) -> Option<Unwrapped> {
-    if let Some(u) = unwrap_forward(text) {
-        return Some(u);
+    // Marker present → manual forward → the inner sender is authoritative.
+    // Marker-present-but-unparseable yields None (do NOT use the envelope From).
+    if text.contains(FORWARD_MARKER) {
+        return unwrap_forward(text);
     }
 
+    // No marker → auto-forward → the envelope From is the original sender.
     let original_sender = extract_email(from?)?;
     Some(Unwrapped {
         original_sender: original_sender.to_ascii_lowercase(),
@@ -231,5 +242,23 @@ You paid.
     #[test]
     fn none_when_neither_marker_nor_from() {
         assert!(unwrap_message(None, "a plain message").is_none());
+    }
+
+    #[test]
+    fn marker_present_but_unparseable_sender_does_not_fall_back_to_envelope() {
+        // A manual forward whose forwarded header block has no usable From:.
+        // We must NOT attribute it to the human forwarder's envelope From —
+        // that would route a real receipt to the wrong adapter. → None → Review.
+        let text = "\
+---------- Forwarded message ---------
+Date: Mon, 11 May 2026, 19:10
+Subject: receipt
+
+You paid.
+";
+        assert!(
+            unwrap_message(Some("Buyer <buyer@example.com>"), text).is_none(),
+            "marker present but sender unparseable must not use the envelope From"
+        );
     }
 }

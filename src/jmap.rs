@@ -81,7 +81,10 @@ impl Mailbox {
     /// Fetch new messages, using the persisted `Email/changes` state when
     /// present. Returns the messages plus the *new* state string the caller
     /// must persist after a successful run.
-    pub async fn fetch_new(&self, prior_state: Option<String>) -> Result<(Vec<FetchedMessage>, String)> {
+    pub async fn fetch_new(
+        &self,
+        prior_state: Option<String>,
+    ) -> Result<(Vec<FetchedMessage>, String)> {
         let (ids, new_state) = match prior_state {
             Some(state) => self.changed_ids(state).await?,
             None => self.bootstrap_ids().await?,
@@ -264,10 +267,7 @@ async fn mailbox_id_by_name(client: &Client, name: &str) -> Result<Option<String
 
 /// Host portion of a URL, for the JMAP client's redirect allowlist.
 fn host_of(url: &str) -> Vec<String> {
-    let no_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
+    let no_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let host = no_scheme
         .split(['/', ':'])
         .next()
@@ -306,12 +306,14 @@ mod tests {
 
     #[test]
     fn host_extraction() {
-        assert_eq!(host_of("http://stalwart.system.svc.cluster.local:8080"), vec![
-            "stalwart.system.svc.cluster.local".to_string()
-        ]);
-        assert_eq!(host_of("https://mail.example.com/jmap"), vec![
-            "mail.example.com".to_string()
-        ]);
+        assert_eq!(
+            host_of("http://stalwart.system.svc.cluster.local:8080"),
+            vec!["stalwart.system.svc.cluster.local".to_string()]
+        );
+        assert_eq!(
+            host_of("https://mail.example.com/jmap"),
+            vec!["mail.example.com".to_string()]
+        );
     }
 
     #[test]

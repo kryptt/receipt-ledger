@@ -98,7 +98,9 @@ impl<'a> LlmClient<'a> {
                 content: prompt,
             }],
             temperature: 0.0,
-            response_format: ResponseFormat { kind: "json_object" },
+            response_format: ResponseFormat {
+                kind: "json_object",
+            },
             chat_template_kwargs: ChatTemplateKwargs {
                 enable_thinking: false,
             },
@@ -145,20 +147,24 @@ fn parse_json_content(content: &str) -> Result<Value> {
 
 /// Pull a single JSON object out of a model's free-form answer.
 ///
-/// The transformation is purely textual and lossless about the object itself:
+/// Fast path: if the trimmed content already parses as a JSON value, return it
+/// verbatim — no surgery, so a perfectly-formed answer (the common case under
+/// JSON mode) is never disturbed.
+///
+/// Slow path (only when the trimmed content is not itself valid JSON):
 ///   1. drop any `<think> … </think>` reasoning block(s) (reasoning models),
 ///   2. drop Markdown code fences (```json … ``` or ``` … ```),
 ///   3. take the slice from the first `{` to its *matching* `}` via a
-///      balanced-brace scan (so trailing prose after the object is ignored,
-///      and a stray `}` in that prose does not over-extend the span).
+///      string-aware balanced-brace scan (so trailing prose after the object is
+///      ignored, and a `}` inside a JSON string value does not truncate).
 ///
 /// Returns the object slice as an owned `String` (the `<think>`/fence steps may
-/// reallocate, so a borrow cannot span all cases). Brace counting is done on a
-/// best-effort basis: it does not track strings, so a literal `}` inside a JSON
-/// string value would close the object early — acceptable for the flat receipt
-/// objects this service handles, and the subsequent `from_str` is the real
-/// validity gate.
+/// reallocate, so a borrow cannot span all cases).
 fn extract_json(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if serde_json::from_str::<Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
     let without_think = strip_think_blocks(content);
     let unfenced = strip_fences(&without_think);
     balanced_object_span(&unfenced).map(str::to_string)
@@ -209,13 +215,31 @@ fn strip_fences(s: &str) -> String {
         .to_string()
 }
 
-/// Return the slice from the first `{` to its matching `}` via a balanced-brace
-/// scan. `None` if there is no `{`, or if braces never balance.
+/// Return the slice from the first `{` to its matching `}` via a *string-aware*
+/// balanced-brace scan. `None` if there is no `{`, or if braces never balance.
+///
+/// Braces *inside a JSON string value* are ignored, so a merchant name like
+/// `"Tasty } Burgers"` does not truncate the object early. The scanner tracks
+/// whether it is inside a `"…"` string and honours `\`-escapes so an escaped
+/// quote (`\"`) does not falsely toggle string state.
 fn balanced_object_span(s: &str) -> Option<&str> {
     let start = s.find('{')?;
     let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
     for (offset, ch) in s[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
         match ch {
+            '"' => in_string = true,
             '{' => depth += 1,
             '}' => {
                 depth -= 1;
@@ -255,7 +279,7 @@ mod tests {
         let extracted: Extracted =
             serde_json::from_str(&span).expect("extracted span should deserialize to Extracted");
         assert_eq!(extracted.external_id.as_deref(), Some("8XY12345AB678901C"));
-        assert_eq!(extracted.currency, "EUR");
+        assert_eq!(extracted.currency().as_str(), "EUR");
         assert_eq!(extracted.merchant, "Example Merchant B.V.");
     }
 
@@ -294,9 +318,8 @@ mod tests {
     // trailing prose all at once.
     #[test]
     fn extracts_through_think_fence_and_prose() {
-        let content = format!(
-            "<THINK>multi\nline\nreasoning</THINK>\n```json\n{RECEIPT_OBJECT}\n```\nDone."
-        );
+        let content =
+            format!("<THINK>multi\nline\nreasoning</THINK>\n```json\n{RECEIPT_OBJECT}\n```\nDone.");
         assert_extracts_receipt(&content);
     }
 
@@ -305,6 +328,33 @@ mod tests {
         // Nested object must not close the outer span early.
         let s = r#"prefix {"a":{"b":1},"c":2} trailing }"#;
         assert_eq!(balanced_object_span(s), Some(r#"{"a":{"b":1},"c":2}"#));
+    }
+
+    // M2: a `}` inside a JSON string value must not truncate the object.
+    #[test]
+    fn balanced_scan_ignores_brace_inside_string() {
+        let s = r#"{"merchant":"Tasty } Burgers","amount":"1.00"}"#;
+        assert_eq!(balanced_object_span(s), Some(s));
+    }
+
+    #[test]
+    fn balanced_scan_honours_escaped_quote_in_string() {
+        // An escaped quote must not end the string early, so the `}` after it
+        // (still inside the string) does not truncate.
+        let s = r#"{"merchant":"He said \"hi} there\"","amount":"1.00"}"#;
+        assert_eq!(balanced_object_span(s), Some(s));
+    }
+
+    // M2: the string-brace case end-to-end through the extractor (with prose).
+    #[test]
+    fn extracts_object_with_brace_in_merchant_name() {
+        let content = r#"```json
+{"source":"paypal","external_id":"X","amount":"1.00","currency":"EUR","direction":"out","date":"2026-05-11","merchant":"Tasty } Burgers","account_hint":"","status":"approved","raw_ref":"X"}
+```
+Done."#;
+        let span = extract_json(content).expect("a JSON object should be located");
+        let v: serde_json::Value = serde_json::from_str(&span).unwrap();
+        assert_eq!(v["merchant"], "Tasty } Burgers");
     }
 
     #[test]
@@ -321,5 +371,37 @@ mod tests {
     #[test]
     fn parse_json_content_errors_on_non_json() {
         assert!(parse_json_content("no json here").is_err());
+    }
+
+    // --- property tests --------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Round-trip: a flat JSON object, wrapped in arbitrary prose before and
+        /// after (including stray braces), is recovered byte-for-byte by the
+        /// string-aware span scan and re-parses to the same value — even when a
+        /// string value itself contains `{`/`}`.
+        #[test]
+        fn prop_balanced_span_roundtrip(
+            merchant in "[A-Za-z{} ]{0,24}",
+            amount in "[0-9]{1,6}\\.[0-9]{2}",
+            pre in "[a-z .}]{0,12}",
+            post in "[a-z .}]{0,12}",
+        ) {
+            // Build a real object so the embedded braces are inside a JSON
+            // string, and serde gives us the canonical escaped form.
+            let obj = serde_json::json!({"merchant": merchant, "amount": amount});
+            let canonical = serde_json::to_string(&obj).unwrap();
+            let wrapped = format!("{pre}{canonical}{post}");
+
+            let span = balanced_object_span(&wrapped)
+                .expect("span scan must find the object");
+            // The recovered span is exactly the canonical object text ...
+            prop_assert_eq!(span, canonical.as_str());
+            // ... and re-parses to the same value, merchant intact.
+            let v: serde_json::Value = serde_json::from_str(span).unwrap();
+            prop_assert_eq!(v["merchant"].as_str().unwrap(), merchant.as_str());
+        }
     }
 }

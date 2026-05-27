@@ -14,13 +14,30 @@ use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde_json::json;
 
-use receipt_ledger::adapters;
+use receipt_ledger::adapters::{self, Outcome};
+use receipt_ledger::config::ValidationPolicy;
 use receipt_ledger::dedup;
-use receipt_ledger::schema::{Direction, Source};
+use receipt_ledger::schema::{Direction, Extracted, Source};
 use receipt_ledger::unwrap::unwrap_forward;
 use receipt_ledger::validate::{Verdict, validate};
 
 const FIXTURE: &str = include_str!("fixtures/paypal_accell.txt");
+
+/// No-ceiling policy for the deterministic-core tests.
+fn policy() -> ValidationPolicy {
+    ValidationPolicy { max_amount: None }
+}
+
+/// The single record from a `Transaction` outcome, or a panic.
+fn one(outcome: Outcome) -> Extracted {
+    match outcome {
+        Outcome::Transaction(mut v) => {
+            assert_eq!(v.len(), 1);
+            v.pop().unwrap()
+        }
+        Outcome::NotATransaction { reason } => panic!("expected transaction, got skip: {reason}"),
+    }
+}
 
 #[test]
 fn paypal_fixture_books_with_expected_fields() {
@@ -33,6 +50,9 @@ fn paypal_fixture_books_with_expected_fields() {
     let adapter = adapters::select(&unwrapped.original_sender).expect("paypal adapter selected");
     assert_eq!(adapter.name(), "paypal");
 
+    // The deterministic pre-filter recognises this as a real receipt.
+    assert!(adapter.is_transaction(&unwrapped.body));
+
     // The adapter builds a prompt from the unwrapped body (sanity: it embeds
     // the receipt so the model sees the figures).
     let prompt = adapter.prompt(&unwrapped.body);
@@ -41,6 +61,7 @@ fn paypal_fixture_books_with_expected_fields() {
 
     // 3. The JSON a correct model returns for this receipt.
     let model_json = json!({
+        "kind": "transaction",
         "external_id": "8XY12345AB678901C",
         "amount": "149.99",
         "currency": "EUR",
@@ -53,28 +74,32 @@ fn paypal_fixture_books_with_expected_fields() {
     });
 
     // 4. postprocess → typed record.
-    let records = adapter
+    let record = one(adapter
         .postprocess(&model_json)
-        .expect("postprocess succeeds");
-    assert_eq!(records.len(), 1);
-    let record = records.into_iter().next().unwrap();
+        .expect("postprocess succeeds"));
 
     assert_eq!(record.source, Source::Paypal);
     assert_eq!(record.external_id.as_deref(), Some("8XY12345AB678901C"));
-    assert_eq!(record.amount, Decimal::from_str("149.99").unwrap());
-    assert_eq!(record.currency, "EUR");
+    assert_eq!(
+        record.amount().value(),
+        Decimal::from_str("149.99").unwrap()
+    );
+    assert_eq!(record.currency().as_str(), "EUR");
     assert_eq!(record.direction, Direction::Out);
     assert_eq!(record.date, NaiveDate::from_ymd_opt(2026, 5, 11).unwrap());
     assert!(record.merchant.contains("Example Merchant"));
 
     // 5. Validation gates → booked.
-    let booked = match validate(record) {
+    let booked = match validate(record, &policy()) {
         Verdict::Booked(b) => b,
         Verdict::Review { reason } => panic!("expected booked, got review: {reason}"),
     };
 
     // 6. Dedup uses the PayPal Transaction ID verbatim.
-    assert_eq!(dedup::external_id(&booked), "8XY12345AB678901C");
+    assert_eq!(
+        dedup::external_id(booked.as_extracted()),
+        "8XY12345AB678901C"
+    );
 }
 
 #[test]
@@ -84,6 +109,7 @@ fn declined_paypal_goes_to_review() {
 
     // Same receipt, but the model reports a declined payment.
     let model_json = json!({
+        "kind": "transaction",
         "external_id": "8XY12345AB678901C",
         "amount": "149.99",
         "currency": "EUR",
@@ -94,13 +120,19 @@ fn declined_paypal_goes_to_review() {
         "raw_ref": "TESTORDER0123456"
     });
 
-    let record = adapter
-        .postprocess(&model_json)
-        .unwrap()
-        .into_iter()
-        .next()
-        .unwrap();
-    assert!(matches!(validate(record), Verdict::Review { .. }));
+    let record = one(adapter.postprocess(&model_json).unwrap());
+    assert!(matches!(
+        validate(record, &policy()),
+        Verdict::Review { .. }
+    ));
+}
+
+/// M1: non-receipt PayPal mail (a shipping update) is a clean skip via the
+/// deterministic pre-filter — never a Review.
+#[test]
+fn shipping_update_is_not_a_transaction() {
+    let adapter = adapters::select("service@paypal.com").unwrap();
+    assert!(!adapter.is_transaction("Good news! Your order is on its way."));
 }
 
 #[test]
