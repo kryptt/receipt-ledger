@@ -12,7 +12,7 @@ ARG TARGETPLATFORM
 # `reqwest/rustls` feature even though our own TLS path uses ring. (reqwest
 # 0.13's `rustls` feature unconditionally enables the aws-lc-rs backend; feature
 # unification means we cannot opt out of it while depending on jmap-client.)
-RUN apk add --no-cache musl-dev cmake make perl clang g++ linux-headers
+RUN apk add --no-cache musl-dev cmake make perl clang g++ linux-headers ca-certificates
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -55,6 +55,9 @@ FROM scratch
 
 COPY --from=release /empty-tmp /tmp
 COPY --from=release /receipt-ledger /receipt-ledger
+# CA bundle — reqwest's rustls client loads system roots at build time, and a
+# scratch image has none ("No CA certificates were loaded from the system").
+COPY --from=release /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 # One-shot job, not a server — no EXPOSE. Runs once and exits with a status
 # code the Kubernetes CronJob uses to fire CronJobFailing on real errors.
