@@ -1,6 +1,6 @@
 [package]
 name = "receipt-ledger"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 description = "Transaction-notification-email → Firefly III ingestor (one-shot CronJob)"
