@@ -42,12 +42,22 @@ pub struct Config {
 
     pub firefly_url: String,
     pub firefly_token: String,
-    /// PayPal asset account in Firefly — name or numeric id.
-    pub paypal_account: String,
-    /// Banco Popular asset account in Firefly — name or numeric id. `None` when
-    /// unconfigured; a Banco Popular record then routes to Review rather than
-    /// booking against the wrong account.
-    pub banco_popular_account: Option<String>,
+    /// PayPal Balance account in Firefly (asset, USD) — name or numeric id.
+    /// Required: a PayPal record whose funding is *not* a credit product books
+    /// here, so this is the safe default and must always be present.
+    pub paypal_balance_account: String,
+    /// PayPal Credit account in Firefly (liability, USD) — name or numeric id.
+    /// `None` when unconfigured; a credit-funded PayPal record then routes to
+    /// Review rather than booking against the balance account.
+    pub paypal_credit_account: Option<String>,
+    /// Banco Popular VISA USD account in Firefly (liability, USD) — name or
+    /// numeric id. `None` when unconfigured; a non-DOP Banco Popular record then
+    /// routes to Review.
+    pub banco_popular_usd_account: Option<String>,
+    /// Banco Popular VISA DOP account in Firefly (liability, DOP) — name or
+    /// numeric id. `None` when unconfigured; a DOP Banco Popular record then
+    /// routes to Review.
+    pub banco_popular_dop_account: Option<String>,
 
     pub processed_mailbox: String,
     pub review_mailbox: String,
@@ -79,10 +89,15 @@ impl Config {
 
             firefly_url: env_or("RECEIPT_FIREFLY_URL", DEFAULT_FIREFLY_URL),
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
-            // No sensible default — must point at a real Firefly asset account.
-            paypal_account: required("RECEIPT_PAYPAL_ACCOUNT")?,
-            // Optional — absent means Banco Popular mail routes to Review.
-            banco_popular_account: optional("RECEIPT_BANCO_POPULAR_ACCOUNT"),
+            // No sensible default — the safe-default PayPal account must always
+            // point at a real Firefly account.
+            paypal_balance_account: required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,
+            // Optional — absent means credit-funded PayPal mail routes to Review.
+            paypal_credit_account: optional("RECEIPT_PAYPAL_CREDIT_ACCOUNT"),
+            // Optional — absent means non-DOP Banco Popular mail routes to Review.
+            banco_popular_usd_account: optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT"),
+            // Optional — absent means DOP Banco Popular mail routes to Review.
+            banco_popular_dop_account: optional("RECEIPT_BANCO_POPULAR_DOP_ACCOUNT"),
 
             processed_mailbox: env_or("RECEIPT_PROCESSED_MAILBOX", DEFAULT_PROCESSED_MAILBOX),
             review_mailbox: env_or("RECEIPT_REVIEW_MAILBOX", DEFAULT_REVIEW_MAILBOX),

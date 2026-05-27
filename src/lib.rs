@@ -65,8 +65,10 @@ pub async fn run() -> Result<Summary> {
         &http,
         &cfg.firefly_url,
         &cfg.firefly_token,
-        &cfg.paypal_account,
-        cfg.banco_popular_account.clone(),
+        &cfg.paypal_balance_account,
+        cfg.paypal_credit_account.clone(),
+        cfg.banco_popular_usd_account.clone(),
+        cfg.banco_popular_dop_account.clone(),
     );
 
     // --- per-message pipeline --------------------------------------------

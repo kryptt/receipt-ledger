@@ -33,11 +33,18 @@ pub struct FireflyClient<'a> {
     http: &'a Client,
     base_url: String,
     token: String,
-    /// PayPal asset account — name or numeric id.
-    paypal_account: String,
-    /// Banco Popular asset account — name or numeric id. `None` when
-    /// unconfigured; a Banco Popular record then errors out (→ Review).
-    banco_popular_account: Option<String>,
+    /// PayPal Balance account — name or numeric id. The safe default for any
+    /// PayPal record whose funding is not a credit product, so always present.
+    paypal_balance_account: String,
+    /// PayPal Credit account — name or numeric id. `None` when unconfigured; a
+    /// credit-funded PayPal record then errors out (→ Review).
+    paypal_credit_account: Option<String>,
+    /// Banco Popular VISA USD account — name or numeric id. `None` when
+    /// unconfigured; a non-DOP Banco Popular record then errors out (→ Review).
+    banco_popular_usd_account: Option<String>,
+    /// Banco Popular VISA DOP account — name or numeric id. `None` when
+    /// unconfigured; a DOP Banco Popular record then errors out (→ Review).
+    banco_popular_dop_account: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -57,10 +64,10 @@ struct Split<'a> {
     description: &'a str,
     external_id: &'a str,
     tags: Vec<&'a str>,
-    /// Source account by id (numeric `paypal_account`) ...
+    /// Source account by id (numeric account ref) ...
     #[serde(skip_serializing_if = "Option::is_none")]
     source_id: Option<&'a str>,
-    /// ... or by name (non-numeric `paypal_account`).
+    /// ... or by name (non-numeric account ref).
     #[serde(skip_serializing_if = "Option::is_none")]
     source_name: Option<&'a str>,
     /// The merchant becomes the expense (destination) account for a withdrawal.
@@ -73,15 +80,19 @@ impl<'a> FireflyClient<'a> {
         http: &'a Client,
         base_url: impl Into<String>,
         token: impl Into<String>,
-        paypal_account: impl Into<String>,
-        banco_popular_account: Option<String>,
+        paypal_balance_account: impl Into<String>,
+        paypal_credit_account: Option<String>,
+        banco_popular_usd_account: Option<String>,
+        banco_popular_dop_account: Option<String>,
     ) -> Self {
         Self {
             http,
             base_url: base_url.into(),
             token: token.into(),
-            paypal_account: paypal_account.into(),
-            banco_popular_account,
+            paypal_balance_account: paypal_balance_account.into(),
+            paypal_credit_account,
+            banco_popular_usd_account,
+            banco_popular_dop_account,
         }
     }
 
@@ -130,15 +141,33 @@ impl<'a> FireflyClient<'a> {
         record: &'b Extracted,
         external_id: &'b str,
     ) -> Result<TransactionGroup<'b>> {
-        // Route to the asset account for this record's source. Exhaustive over
+        // Route to the Firefly account for this record. Exhaustive over
         // `Source` so a new variant forces a routing decision here rather than
-        // silently booking against PayPal.
+        // silently booking against the wrong account. Within each source the
+        // funding/currency rules pick balance-vs-credit (PayPal) or
+        // USD-vs-DOP (Banco Popular). A needed-but-unconfigured Option account
+        // is an `Err`, which the pipeline turns into a per-message Review.
         let account: &str = match record.source {
-            Source::Paypal => &self.paypal_account,
-            Source::BancoPopular => self
-                .banco_popular_account
-                .as_deref()
-                .context("no Firefly account configured for Banco Popular")?,
+            Source::Paypal => {
+                if is_paypal_credit_funding(record) {
+                    self.paypal_credit_account
+                        .as_deref()
+                        .context("no Firefly account configured for PayPal Credit")?
+                } else {
+                    &self.paypal_balance_account
+                }
+            }
+            Source::BancoPopular => {
+                if record.currency.trim().to_ascii_uppercase() == "DOP" {
+                    self.banco_popular_dop_account
+                        .as_deref()
+                        .context("no Firefly account configured for Banco Popular DOP")?
+                } else {
+                    self.banco_popular_usd_account
+                        .as_deref()
+                        .context("no Firefly account configured for Banco Popular USD")?
+                }
+            }
         };
 
         let (source_id, source_name) = if is_numeric(account) {
@@ -176,6 +205,36 @@ fn is_numeric(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_digit())
 }
 
+/// Funding hints that mark a PayPal record as funded by a credit product (→ the
+/// PayPal Credit liability account) rather than the PayPal balance. Matched
+/// case-insensitively as substrings of the trimmed `account_hint`. "credit" is
+/// deliberately broad: in a PayPal funding hint it can only mean the credit
+/// product. An empty/absent hint is not a credit signal — it defaults to the
+/// balance account.
+const PAYPAL_CREDIT_HINTS: &[&str] = &[
+    "paypal credit",
+    "pay later",
+    "pay in 4",
+    "pay in4",
+    "pay monthly",
+    "credit",
+];
+
+/// Classify a PayPal record's funding method from its `account_hint`.
+///
+/// Returns `true` when the hint names a PayPal credit product, so the record
+/// books against the PayPal Credit liability account; `false` (the default)
+/// routes it to the PayPal Balance account. Pure — depends only on the record.
+fn is_paypal_credit_funding(record: &Extracted) -> bool {
+    match record.account_hint.as_deref() {
+        Some(hint) => {
+            let hint = hint.trim().to_ascii_lowercase();
+            PAYPAL_CREDIT_HINTS.iter().any(|needle| hint.contains(needle))
+        }
+        None => false,
+    }
+}
+
 /// Heuristic match for Firefly's duplicate-hash validation message. Firefly
 /// phrases it as "Duplicate of transaction #N." inside the 422 error body.
 fn is_duplicate_error(body: &str) -> bool {
@@ -191,59 +250,30 @@ mod tests {
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
-    fn record() -> Extracted {
+    /// A PayPal record with a configurable funding hint and currency. Defaults
+    /// to a balance-funded EUR purchase.
+    fn paypal_record(account_hint: Option<&str>, currency: &str) -> Extracted {
         Extracted {
             source: Source::Paypal,
             external_id: Some("8XY12345AB678901C".to_string()),
             amount: Decimal::from_str("149.99").unwrap(),
-            currency: "EUR".to_string(),
+            currency: currency.to_string(),
             direction: Direction::Out,
             date: NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
             merchant: "Example Merchant B.V.".to_string(),
-            account_hint: None,
+            account_hint: account_hint.map(str::to_string),
             status: "approved".to_string(),
             raw_ref: "TESTORDER0123456".to_string(),
         }
     }
 
-    #[test]
-    fn builds_withdrawal_with_named_account() {
-        let http = Client::new();
-        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "PayPal", None);
-        let rec = record();
-        let group = c.build_group(&rec, "8XY12345AB678901C").unwrap();
-        let json = serde_json::to_value(&group).unwrap();
-
-        assert_eq!(json["error_if_duplicate_hash"], true);
-        let split = &json["transactions"][0];
-        assert_eq!(split["type"], "withdrawal");
-        assert_eq!(split["amount"], "149.99");
-        assert_eq!(split["currency_code"], "EUR");
-        assert_eq!(split["external_id"], "8XY12345AB678901C");
-        assert_eq!(split["source_name"], "PayPal");
-        assert!(split.get("source_id").is_none());
-        assert_eq!(split["destination_name"], "Example Merchant B.V.");
-        assert_eq!(split["tags"][0], "receipt-ledger");
-        assert_eq!(split["date"], "2026-05-11");
-    }
-
-    #[test]
-    fn numeric_account_uses_source_id() {
-        let http = Client::new();
-        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "42", None);
-        let rec = record();
-        let group = c.build_group(&rec, "id").unwrap();
-        let json = serde_json::to_value(&group).unwrap();
-        assert_eq!(json["transactions"][0]["source_id"], "42");
-        assert!(json["transactions"][0].get("source_name").is_none());
-    }
-
-    fn banco_record() -> Extracted {
+    /// A Banco Popular record with a configurable currency.
+    fn banco_record(currency: &str) -> Extracted {
         Extracted {
             source: Source::BancoPopular,
             external_id: None,
             amount: Decimal::from_str("1.50").unwrap(),
-            currency: "EUR".to_string(),
+            currency: currency.to_string(),
             direction: Direction::Out,
             date: NaiveDate::from_ymd_opt(2026, 5, 27).unwrap(),
             merchant: "Example Cafe Amsterdam".to_string(),
@@ -253,31 +283,144 @@ mod tests {
         }
     }
 
+    /// A client wired with the four production account ids.
+    fn client<'a>(http: &'a Client) -> FireflyClient<'a> {
+        FireflyClient::new(
+            http,
+            "http://firefly:8080",
+            "tok",
+            "103",                       // PayPal Balance
+            Some("105".to_string()),     // PayPal Credit
+            Some("106".to_string()),     // Banco Popular USD
+            Some("107".to_string()),     // Banco Popular DOP
+        )
+    }
+
     #[test]
-    fn banco_record_routes_to_its_configured_account() {
+    fn builds_withdrawal_with_named_account() {
         let http = Client::new();
+        // A non-numeric balance account exercises the name (not id) path.
         let c = FireflyClient::new(
             &http,
             "http://firefly:8080",
             "tok",
-            "42", // PayPal account — must NOT be used for a Banco record.
-            Some("104".to_string()),
+            "PayPal Balance",
+            None,
+            None,
+            None,
         );
-        let rec = banco_record();
-        let group = c.build_group(&rec, "hash").unwrap();
+        let rec = paypal_record(Some("Balance"), "EUR");
+        let group = c.build_group(&rec, "8XY12345AB678901C").unwrap();
         let json = serde_json::to_value(&group).unwrap();
-        // Numeric Banco account → source_id "104", not the PayPal "42".
-        assert_eq!(json["transactions"][0]["source_id"], "104");
-        assert!(json["transactions"][0].get("source_name").is_none());
+
+        assert_eq!(json["error_if_duplicate_hash"], true);
+        let split = &json["transactions"][0];
+        assert_eq!(split["type"], "withdrawal");
+        assert_eq!(split["amount"], "149.99");
+        assert_eq!(split["currency_code"], "EUR");
+        assert_eq!(split["external_id"], "8XY12345AB678901C");
+        assert_eq!(split["source_name"], "PayPal Balance");
+        assert!(split.get("source_id").is_none());
+        assert_eq!(split["destination_name"], "Example Merchant B.V.");
+        assert_eq!(split["tags"][0], "receipt-ledger");
+        assert_eq!(split["date"], "2026-05-11");
+    }
+
+    fn source_id_of(c: &FireflyClient, rec: &Extracted) -> String {
+        let group = c.build_group(rec, "hash").unwrap();
+        let json = serde_json::to_value(&group).unwrap();
+        assert!(
+            json["transactions"][0].get("source_name").is_none(),
+            "numeric account must use source_id, not source_name"
+        );
+        json["transactions"][0]["source_id"]
+            .as_str()
+            .expect("numeric account → source_id string")
+            .to_string()
+    }
+
+    // --- routing -----------------------------------------------------------
+
+    #[test]
+    fn paypal_credit_funded_routes_to_credit_account() {
+        let http = Client::new();
+        let c = client(&http);
+        for hint in ["Pay in 4", "PayPal Credit"] {
+            let rec = paypal_record(Some(hint), "USD");
+            assert_eq!(source_id_of(&c, &rec), "105", "hint {hint:?} should be credit");
+        }
     }
 
     #[test]
-    fn banco_record_without_account_errors() {
+    fn paypal_balance_funded_routes_to_balance_account() {
         let http = Client::new();
-        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "42", None);
-        // No Banco account configured → build_group errors, which the pipeline
-        // turns into a per-message Review rather than a panic.
-        assert!(c.build_group(&banco_record(), "hash").is_err());
+        let c = client(&http);
+        // Explicit balance hint and an absent hint both default to balance.
+        assert_eq!(source_id_of(&c, &paypal_record(Some("Balance"), "USD")), "103");
+        assert_eq!(source_id_of(&c, &paypal_record(None, "USD")), "103");
+    }
+
+    #[test]
+    fn banco_dop_routes_to_dop_account() {
+        let http = Client::new();
+        let c = client(&http);
+        assert_eq!(source_id_of(&c, &banco_record("DOP")), "107");
+        // Currency is uppercased before comparison.
+        assert_eq!(source_id_of(&c, &banco_record("dop")), "107");
+    }
+
+    #[test]
+    fn banco_non_dop_routes_to_usd_account() {
+        let http = Client::new();
+        let c = client(&http);
+        for cur in ["USD", "EUR"] {
+            assert_eq!(source_id_of(&c, &banco_record(cur)), "106", "currency {cur} → USD acct");
+        }
+    }
+
+    #[test]
+    fn needed_but_unconfigured_account_errors() {
+        let http = Client::new();
+        // Only the required balance account is configured; everything else None.
+        // A credit-funded PayPal record and either Banco record must error
+        // (→ Review) rather than booking against the wrong account.
+        let c = FireflyClient::new(&http, "http://firefly:8080", "tok", "103", None, None, None);
+        assert!(c.build_group(&paypal_record(Some("Pay in 4"), "USD"), "h").is_err());
+        assert!(c.build_group(&banco_record("DOP"), "h").is_err());
+        assert!(c.build_group(&banco_record("USD"), "h").is_err());
+        // ...but a balance-funded PayPal record still books.
+        assert!(c.build_group(&paypal_record(Some("Balance"), "USD"), "h").is_ok());
+    }
+
+    // --- classifier --------------------------------------------------------
+
+    #[test]
+    fn classifier_flags_credit_hints() {
+        for hint in [
+            "PayPal Credit",
+            "Pay Later",
+            "Pay in 4",
+            "Pay in4",
+            "Pay Monthly",
+            "credit",
+            // Substring + case/whitespace insensitivity.
+            "  funded by PAYPAL CREDIT  ",
+        ] {
+            assert!(
+                is_paypal_credit_funding(&paypal_record(Some(hint), "USD")),
+                "hint {hint:?} should classify as credit"
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_rejects_non_credit_hints() {
+        for hint in [None, Some(""), Some("   "), Some("Balance"), Some("Visa ending 1234"), Some("bank")] {
+            assert!(
+                !is_paypal_credit_funding(&paypal_record(hint, "USD")),
+                "hint {hint:?} should NOT classify as credit"
+            );
+        }
     }
 
     #[test]

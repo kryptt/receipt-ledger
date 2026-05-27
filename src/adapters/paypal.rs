@@ -41,7 +41,7 @@ Return ONLY a JSON object (no prose, no markdown fences) with EXACTLY these keys
   "direction": "out" | "in", // "out" if the user paid/sent money, "in" if received
   "date": string,          // the transaction date as ISO YYYY-MM-DD
   "merchant": string,      // the merchant / payee name
-  "account_hint": string,  // funding source / card last4 if stated, else ""
+  "account_hint": string,  // the FUNDING METHOD/SOURCE, stated plainly, else ""
   "status": string,        // the payment status text, e.g. "approved" / "completed"
   "raw_ref": string        // the Order ID if present, else the Transaction ID
 }}
@@ -50,6 +50,11 @@ Rules:
 - Use the purchase TOTAL and its currency, not any converted funding amount.
 - "amount" must be a positive decimal string with a dot separator.
 - If the payment clearly succeeded, set "status" to "approved".
+- For "account_hint", report HOW the payment was funded as clearly as the
+  receipt states it. Use the PayPal funding product name when present —
+  "PayPal Credit", "Pay in 4", "Pay Later", "Pay Monthly" — or "Balance" when
+  funded from the PayPal balance, or the card/bank when funded that way, e.g.
+  "Visa ending 1234" or "bank". If the funding source is not stated, use "".
 - Do not invent values; if a field is genuinely absent use "".
 
 PayPal receipt:
