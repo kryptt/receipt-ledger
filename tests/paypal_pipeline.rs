@@ -175,11 +175,9 @@ fn cross_currency_books_the_usd_total() {
         "raw_ref": "NW-2026-7741"
     });
 
-    let record = one(
-        adapter
-            .postprocess_with_body(&model_json, &unwrapped.body)
-            .expect("postprocess_with_body succeeds"),
-    );
+    let record = one(adapter
+        .postprocess_with_body(&model_json, &unwrapped.body)
+        .expect("postprocess_with_body succeeds"));
     assert_eq!(
         record.amount().value(),
         Decimal::from_str("54.50").unwrap(),
@@ -220,11 +218,9 @@ fn promo_mastercard_funds_balance_not_credit() {
         "raw_ref": "LCR-55012"
     });
 
-    let record = one(
-        adapter
-            .postprocess_with_body(&model_json, &unwrapped.body)
-            .expect("postprocess_with_body succeeds"),
-    );
+    let record = one(adapter
+        .postprocess_with_body(&model_json, &unwrapped.body)
+        .expect("postprocess_with_body succeeds"));
     assert!(
         !paypal_is_credit_funded(&record),
         "a linked VISA card funds the balance; the Mastercard promo is ignored"

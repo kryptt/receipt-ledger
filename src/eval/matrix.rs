@@ -14,7 +14,14 @@ use super::scorer::{FieldScore, FieldScores};
 
 /// The eight scored fields, in display order. Mirrors [`FieldScores::iter`].
 pub const FIELDS: [&str; 8] = [
-    "kind", "amount", "currency", "direction", "date", "merchant", "status", "account",
+    "kind",
+    "amount",
+    "currency",
+    "direction",
+    "date",
+    "merchant",
+    "status",
+    "account",
 ];
 
 /// A running (correct, applicable) tally for one field.

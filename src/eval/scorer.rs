@@ -433,7 +433,11 @@ mod tests {
         let expected = Produced::not_a_transaction();
         let produced = tx();
         let s = score(&expected, &produced);
-        assert_eq!(s.kind, FieldScore::Wrong, "kind must catch the hallucination");
+        assert_eq!(
+            s.kind,
+            FieldScore::Wrong,
+            "kind must catch the hallucination"
+        );
         // Transaction fields stay N/A — kind already captures the error.
         assert_eq!(s.amount, FieldScore::NotApplicable);
     }
@@ -466,7 +470,10 @@ mod tests {
         let expected = tx();
         let mut produced = tx();
         produced.routed_account = Some(RoutedAccount::PaypalCredit);
-        assert_eq!(score(&expected, &produced).routed_account, FieldScore::Wrong);
+        assert_eq!(
+            score(&expected, &produced).routed_account,
+            FieldScore::Wrong
+        );
     }
 
     #[test]
