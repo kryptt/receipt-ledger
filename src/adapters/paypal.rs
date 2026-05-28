@@ -13,6 +13,8 @@
 //! deterministically ([`PaypalAdapter::is_transaction`]) and via a `kind`
 //! discriminant the model fills in — never a date-parse error polluting Review.
 
+use std::borrow::Cow;
+
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use serde_json::Value;
@@ -75,6 +77,7 @@ impl Adapter for PaypalAdapter {
     }
 
     fn prompt(&self, email_text: &str) -> String {
+        let email_text = trim_paypal_noise(email_text);
         format!(
             r#"You classify and extract a single financial transaction from a PayPal email.
 Return ONLY a JSON object (no prose, no markdown fences) with EXACTLY these keys:
@@ -319,6 +322,90 @@ pub fn usd_transaction_total(body: &str) -> Option<Amount> {
         let tail = &line[idx + USD_TXN_TOTAL_LABEL.len()..];
         first_decimal(tail).and_then(|d| Amount::parse(&d).ok())
     })
+}
+
+/// Strip noise from a Gmail-forwarded PayPal receipt that wastes LLM context
+/// without carrying extraction signal: tracking-URL blocks (`<https://...>`,
+/// often line-wrapped), inline image alt-text markers (`[image: ...]`), and
+/// the marketing footer (everything from `Help & Contact` onward). A real
+/// forwarded receipt is ~10 kB of which ~88% is this noise — enough to blow
+/// past a small model's 8 K context window and crash the request with a 400
+/// before generation even starts.
+///
+/// Idempotent: when none of the markers are present (the case for the
+/// scrubbed test fixtures and for short native bank alerts), the original
+/// slice is returned without allocation. Pure: no I/O, deterministic.
+///
+/// The full original body is still passed to [`postprocess_with_body`], so
+/// the P1 cross-currency `Total amount of this Transaction: $X USD` check
+/// runs against untrimmed input — trimming only the LLM input cannot change
+/// the booked amount.
+fn trim_paypal_noise(body: &str) -> Cow<'_, str> {
+    let has_url = body.contains("<http://") || body.contains("<https://");
+    let has_image = body.contains("[image:");
+    let footer_at = body.find("Help & Contact");
+    if !has_url && !has_image && footer_at.is_none() {
+        return Cow::Borrowed(body);
+    }
+
+    // Cut the marketing footer first; everything after `Help & Contact` is
+    // social-media links and phishing-awareness boilerplate the LLM does not
+    // need to see.
+    let core = match footer_at {
+        Some(i) => &body[..i],
+        None => body,
+    };
+
+    let mut out = String::with_capacity(core.len());
+    let mut rest = core;
+    while !rest.is_empty() {
+        let url_at = rest
+            .find("<http")
+            .filter(|&i| rest[i..].starts_with("<http://") || rest[i..].starts_with("<https://"));
+        let image_at = rest.find("[image:");
+        let (cut, after_open, close) = match (url_at, image_at) {
+            (Some(u), Some(i)) if u <= i => (u, u + 1, '>'),
+            (Some(u), None) => (u, u + 1, '>'),
+            (_, Some(i)) => (i, i + "[image:".len(), ']'),
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        out.push_str(&rest[..cut]);
+        match rest[after_open..].find(close) {
+            Some(rel) => {
+                rest = &rest[after_open + rel + 1..];
+            }
+            None => {
+                // Unterminated marker (defensive — real PayPal mails always
+                // close `<…>` and `[image:…]`). Drop the tail rather than
+                // emitting half-stripped noise.
+                break;
+            }
+        }
+    }
+    Cow::Owned(collapse_blank_runs(&out))
+}
+
+/// Collapse runs of 3+ consecutive newlines down to 2. Stripping `<URL>` and
+/// `[image:…]` blocks routinely leaves behind 4–5 blank lines in a row; the
+/// LLM does not care, but it costs tokens.
+fn collapse_blank_runs(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut newlines = 0usize;
+    for c in s.chars() {
+        if c == '\n' {
+            newlines += 1;
+            if newlines <= 2 {
+                out.push('\n');
+            }
+        } else {
+            newlines = 0;
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Extract the first plain decimal token from `s`, ignoring a leading currency
@@ -586,6 +673,114 @@ mod tests {
                 .unwrap(),
             Outcome::NotATransaction { .. }
         ));
+    }
+
+    // --- LLM-input trimming (8K-ctx guard) ---------------------------------
+
+    #[test]
+    fn trim_is_idempotent_on_clean_fixture_body() {
+        // The scrubbed dataset fixtures never contain <URL>, [image:…], or
+        // a "Help & Contact" footer. The trim must pass them through with no
+        // allocation (Borrowed) and no content change.
+        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
+            Total €44.80 EUR\n\
+            Total amount of this Transaction: $54.50 USD\n\
+            Payment method: Visa ending x-9981\n\
+            Transaction ID: 7AA11122BB333444C\n\
+            Your payment was sent from buyer@example.com";
+        match trim_paypal_noise(body) {
+            Cow::Borrowed(s) => assert_eq!(s, body),
+            Cow::Owned(_) => panic!("clean body must be returned borrowed"),
+        }
+    }
+
+    #[test]
+    fn trim_strips_url_blocks_and_image_markers() {
+        let body = "You paid $10.65 USD to DigitalOcean\n\
+            [image: PayPal]\n\
+            View Payment Details\n\
+            <https://www.paypal.com/very/long/tracking?\n\
+            spanning=multiple&lines=true>\n\
+            Transaction ID: 6VJ47975E7611463Y";
+        let trimmed = trim_paypal_noise(body);
+        assert!(matches!(trimmed, Cow::Owned(_)));
+        let t = trimmed.as_ref();
+        assert!(!t.contains("[image:"), "[image: marker remained: {t}");
+        assert!(!t.contains("paypal.com/very"), "URL block remained: {t}");
+        // The meaningful content survives.
+        assert!(t.contains("You paid $10.65 USD to DigitalOcean"));
+        assert!(t.contains("Transaction ID: 6VJ47975E7611463Y"));
+    }
+
+    #[test]
+    fn trim_cuts_at_help_and_contact_footer() {
+        let body = "You paid $1.00 USD to Shop\nTransaction ID: ABC123\n\
+            ------------------------------\n\
+            Help & Contact | Security | Apps\n\
+            PayPal is committed to preventing fraudulent emails…";
+        let trimmed = trim_paypal_noise(body);
+        let t = trimmed.as_ref();
+        assert!(t.contains("Transaction ID: ABC123"));
+        assert!(!t.contains("Help & Contact"));
+        assert!(!t.contains("preventing fraudulent emails"));
+    }
+
+    #[test]
+    fn trim_preserves_p1_cross_currency_signal() {
+        // The USD-line check runs on the UNTRIMMED body in the pipeline, so
+        // this is belt-and-suspenders, but the trim must still leave it.
+        let body = "You paid €44.80 EUR to Shop\n\
+            <https://www.paypal.com/track/foo>\n\
+            [image: PayPal]\n\
+            Total €44.80 EUR\n\
+            Total amount of this Transaction: $54.50 USD\n\
+            Payment method: Visa";
+        let t = trim_paypal_noise(body);
+        assert!(t.contains("Total amount of this Transaction: $54.50 USD"));
+        assert!(t.contains("Payment method: Visa"));
+    }
+
+    #[test]
+    fn trim_handles_unterminated_marker_safely() {
+        // An unterminated <http://… (no closing '>') is defensive-dropped.
+        // The meaningful prefix survives; we just lose the open-ended tail.
+        let body = "You paid $1.00 USD to Shop\nTransaction ID: ABC\n\
+            <https://truncated.example.com/no/close";
+        let t = trim_paypal_noise(body);
+        assert!(t.contains("Transaction ID: ABC"));
+        assert!(!t.contains("truncated.example.com"));
+    }
+
+    #[test]
+    fn trim_real_world_paypal_forward_shrinks_dramatically() {
+        // A 5× repetition of the noisy-block pattern observed in the failing
+        // production emails (DigitalOcean / Drakenrijk). The trimmed body
+        // must end up well under the original size while keeping every field
+        // the prompt cares about.
+        let noisy_block = "View Payment Details\n\
+            <https://www.paypal.com/mobile-app/myaccount/activities/\n\
+            details/6VJ47975E7611463Y?source=RT001736&pp_web_dl=custom&\n\
+            link_ref=view-payment-status-btn-RT001736&v=1&utm_source=unp&\n\
+            utm_medium=email&utm_campaign=RT001736>\n\
+            [image: A dark blue PayPal Cashback Mastercard card image with\n\
+            a 3% cash back icon.]\n";
+        let body = format!(
+            "You paid $10.65 USD to DigitalOcean\n\
+             Transaction ID: 6VJ47975E7611463Y\n\
+             Paid DigitalOcean with PayPal Credit $10.65 USD\n\
+             {repeat}\
+             Your payment was sent from kryptt@gmail.com\n\
+             ------------------------------\n\
+             Help & Contact | Security | Apps\n",
+            repeat = noisy_block.repeat(5),
+        );
+        let t = trim_paypal_noise(&body);
+        assert!(t.len() < body.len() / 2, "expected substantial shrink");
+        assert!(t.contains("You paid $10.65 USD to DigitalOcean"));
+        assert!(t.contains("Transaction ID: 6VJ47975E7611463Y"));
+        assert!(t.contains("PayPal Credit"));
+        assert!(!t.contains("Help & Contact"));
+        assert!(!t.contains("[image:"));
     }
 
     // --- P3: promo-Mastercard ignored → funding from the real method --------
