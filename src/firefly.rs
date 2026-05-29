@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
+use chrono::NaiveDate;
 use reqwest::{Client, StatusCode};
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,7 @@ use tracing::{info, warn};
 use crate::config::AccountId;
 use crate::fx::FxClient;
 use crate::schema::{Direction, Extracted, Source};
+use crate::statement::reconcile::ExistingJournal;
 use crate::validate::Validated;
 
 /// Tag attached to every transaction this service books, for easy filtering in
@@ -273,6 +275,149 @@ impl<'a> FireflyClient<'a> {
             .insert(account.to_string(), target.clone());
         Ok(target)
     }
+
+    /// List this service's previously-booked **withdrawals** on `account` in the
+    /// `[start, end]` window, as [`ExistingJournal`]s — the input the statement
+    /// reconciler matches its charges against.
+    ///
+    /// Calls `GET {base}/api/v1/accounts/{id}/transactions?type=withdrawal&start&end`
+    /// and walks `meta.pagination` to the last page. Only `receipt-ledger`-tagged
+    /// splits are returned, so manually-entered transactions are not mistaken for
+    /// our bookings.
+    pub async fn list_transactions(
+        &self,
+        account: &AccountId,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> Result<Vec<ExistingJournal>> {
+        let mut out = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let url = format!(
+                "{}/api/v1/accounts/{}/transactions?type=withdrawal&start={start}&end={end}&page={page}",
+                self.base_url.trim_end_matches('/'),
+                account.as_str(),
+            );
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&self.token)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .send()
+                .await
+                .with_context(|| format!("listing transactions for account {}", account.as_str()))?;
+
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "Firefly returned {status} listing account {}: {body}",
+                    account.as_str()
+                );
+            }
+
+            let (mut journals, pagination) = parse_transactions_page(&body)
+                .with_context(|| format!("parsing transactions page {page} for {}", account.as_str()))?;
+            out.append(&mut journals);
+
+            if pagination.total_pages == 0 || page >= pagination.total_pages {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+}
+
+/// Firefly's transaction-list envelope: `{"data":[...], "meta":{"pagination":{...}}}`.
+#[derive(Deserialize)]
+struct TxListEnvelope {
+    #[serde(default)]
+    data: Vec<TxGroup>,
+    #[serde(default)]
+    meta: TxMeta,
+}
+
+/// A transaction *group* (the `{id}` a later `PUT /transactions/{id}` targets),
+/// holding one or more splits under `attributes.transactions`.
+#[derive(Deserialize)]
+struct TxGroup {
+    id: String,
+    attributes: TxAttributes,
+}
+
+#[derive(Deserialize)]
+struct TxAttributes {
+    #[serde(default)]
+    transactions: Vec<TxSplit>,
+}
+
+#[derive(Deserialize)]
+struct TxSplit {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    amount: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    external_id: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct TxMeta {
+    #[serde(default)]
+    pagination: Pagination,
+}
+
+/// Firefly pagination block. `total_pages` 0 (absent) → single page.
+#[derive(Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+struct Pagination {
+    #[serde(default)]
+    total_pages: u32,
+}
+
+/// Parse one page of the transaction-list response into [`ExistingJournal`]s
+/// (one per `receipt-ledger`-tagged split) plus the pagination block. Pure — no
+/// I/O — so the JSON contract and date/amount handling are unit-testable.
+fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Pagination)> {
+    let env: TxListEnvelope =
+        serde_json::from_str(body).context("decoding Firefly transaction list JSON")?;
+    let mut journals = Vec::new();
+    for group in env.data {
+        for split in group.attributes.transactions {
+            if !split.tags.iter().any(|t| t == IMPORT_TAG) {
+                continue;
+            }
+            let Some(date) = parse_firefly_date(&split.date) else {
+                continue;
+            };
+            let Ok(amount) = Decimal::from_str_exact(split.amount.trim()) else {
+                continue;
+            };
+            journals.push(ExistingJournal {
+                id: group.id.clone(),
+                date,
+                amount,
+                merchant: split.description.trim().to_string(),
+                external_id: split.external_id.filter(|s| !s.trim().is_empty()),
+            });
+        }
+    }
+    Ok((journals, env.meta.pagination))
+}
+
+/// Firefly dates are RFC3339 (`2026-04-21T00:00:00-04:00`); fall back to the
+/// leading `YYYY-MM-DD`. Returns the calendar date.
+fn parse_firefly_date(s: &str) -> Option<NaiveDate> {
+    let t = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(dt.date_naive());
+    }
+    t.get(..10)
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
 }
 
 /// The Firefly single-account envelope: `{"data":{"attributes":{...}}}`.
@@ -909,5 +1054,57 @@ mod tests {
             // And the booked amount carries no more than `decimals` places.
             prop_assert!(booked.scale() <= decimals);
         }
+    }
+
+    // --- transaction-list parsing (reconcile read path) --------------------
+
+    #[test]
+    fn parses_tagged_withdrawals_and_pagination() {
+        let body = r#"{
+          "data": [
+            {"id":"100","attributes":{"transactions":[
+               {"date":"2026-04-21T00:00:00-04:00","amount":"50.93","description":"JR EAST","external_id":"bpstmt:1","tags":["receipt-ledger"]}
+            ]}},
+            {"id":"101","attributes":{"transactions":[
+               {"date":"2026-04-22T00:00:00-04:00","amount":"9.99","description":"MANUAL ENTRY","tags":["other"]}
+            ]}}
+          ],
+          "meta":{"pagination":{"total_pages":3}}
+        }"#;
+        let (js, pag) = parse_transactions_page(body).unwrap();
+        assert_eq!(js.len(), 1, "only the receipt-ledger-tagged split is returned");
+        assert_eq!(js[0].id, "100");
+        assert_eq!(js[0].date, NaiveDate::from_ymd_opt(2026, 4, 21).unwrap());
+        assert_eq!(js[0].amount, Decimal::from_str_exact("50.93").unwrap());
+        assert_eq!(js[0].merchant, "JR EAST");
+        assert_eq!(js[0].external_id.as_deref(), Some("bpstmt:1"));
+        assert_eq!(pag.total_pages, 3);
+    }
+
+    #[test]
+    fn empty_list_is_single_page() {
+        let (js, pag) = parse_transactions_page(r#"{"data":[],"meta":{}}"#).unwrap();
+        assert!(js.is_empty());
+        assert_eq!(pag.total_pages, 0);
+    }
+
+    #[test]
+    fn skips_splits_with_unparseable_date_or_amount() {
+        let body = r#"{"data":[{"id":"1","attributes":{"transactions":[
+            {"date":"nope","amount":"1.00","description":"x","tags":["receipt-ledger"]},
+            {"date":"2026-04-21","amount":"notnum","description":"y","tags":["receipt-ledger"]}
+        ]}}],"meta":{"pagination":{"total_pages":1}}}"#;
+        let (js, _) = parse_transactions_page(body).unwrap();
+        assert!(js.is_empty(), "malformed splits are skipped, not fatal");
+    }
+
+    #[test]
+    fn firefly_date_rfc3339_or_plain_or_none() {
+        assert_eq!(
+            parse_firefly_date("2026-04-21T00:00:00-04:00"),
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+        );
+        assert_eq!(parse_firefly_date("2026-04-21"), NaiveDate::from_ymd_opt(2026, 4, 21));
+        assert_eq!(parse_firefly_date("garbage"), None);
     }
 }
