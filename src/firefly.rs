@@ -517,9 +517,12 @@ fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Paginati
 }
 
 /// Build an [`ExistingJournal`] from a tagged split, or `None` if any field is
-/// unusable. The booked amount is taken as a positive magnitude (`abs`,
-/// trailing zeros trimmed) so it compares cleanly against a statement charge's
-/// non-negative [`Amount`], regardless of the sign convention Firefly returns.
+/// unusable (unparseable date/amount/currency, or an amount whose scale exceeds
+/// [`Amount::MAX_SCALE`] — not a real currency figure). The booked amount is
+/// taken as a positive magnitude (`abs`, trailing zeros trimmed) so it compares
+/// cleanly against a statement charge's non-negative [`Amount`], regardless of
+/// the sign convention Firefly returns. `None` here is counted as a skip by the
+/// caller (never silently dropped).
 fn existing_journal(group_id: &str, split: &TxSplit) -> Option<ExistingJournal> {
     let date = parse_firefly_date(&split.date)?;
     let magnitude = Decimal::from_str_exact(split.amount.trim()).ok()?.abs().normalize();

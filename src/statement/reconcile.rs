@@ -64,8 +64,11 @@ pub struct ReconcileParams {
     /// `|statement − booked|` at or below this counts the amounts as equal
     /// (absorbs the ECB-estimate vs billed gap for foreign charges).
     pub amount_tolerance: Decimal,
-    /// If a charge's two best candidates are within this similarity of each
-    /// other, the match is ambiguous → Review.
+    /// Similarity gap below which two confident options are "too close to call".
+    /// Governs **two** comparisons: intra-charge (a charge's two best journals)
+    /// and inter-charge (the two strongest claimants of one journal). Both →
+    /// Review when within `score_epsilon`. (Kept as one knob deliberately; split
+    /// if calibration ever needs them tuned independently.)
     pub score_epsilon: f64,
 }
 
@@ -162,7 +165,8 @@ pub fn reconcile(
     }
 
     // --- 2a. compute each undecided charge's intent over the FREE journals --
-    //         (no consumption here — that is what makes the result order-free)
+    //         (free = after the exact-`bpstmt` pass above consumed its journals;
+    //          no further consumption here — that is what makes 2 order-free)
     let mut intents: Vec<(usize, Intent)> = Vec::new();
     for (ci, charge) in charges.iter().enumerate() {
         if outcome[ci].is_some() {
@@ -187,7 +191,13 @@ pub fn reconcile(
         }
         // Highest score wins only if it clears the runner-up by `score_epsilon`;
         // otherwise the journal is too contested to assign → everyone reviews.
-        claimants.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Tie-break on charge index so the contest is fully deterministic (not
+        // reliant on sort stability + input order).
+        claimants.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         let clear = claimants[0].1 - claimants[1].1 >= p.score_epsilon;
         if clear {
             winner.insert(claimants[0].0, ji);
@@ -496,6 +506,33 @@ mod tests {
             let confirmed = kinds(&r).iter().filter(|k| **k == "confirmed").count();
             assert!(confirmed <= 1);
         }
+    }
+
+    /// Contention with a fallback: A and B both claim J1 (their best); A wins.
+    /// B is *not* re-matched against the free J2 it could also have taken — it
+    /// routes to Review and J2 surfaces as unmatched. This is a deliberate
+    /// conservative under-match (single-shot resolution, never an optimal
+    /// assignment): erring toward Review for a money tool is the safe direction.
+    /// Pinned so the behavior can't silently drift in a future "optimization".
+    #[test]
+    fn contested_loser_is_reviewed_not_matched_to_its_fallback() {
+        let journals = [
+            journal("J1", "JR EAST SIBUYAKU", "50.93", 21),
+            journal("J2", "JR EAST", "50.93", 21),
+        ];
+        let a = charge("0601000001", "JR EAST SIBUYAKU", "50.93", 21); // best = J1 (exact)
+        let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21); // best = J1 too
+        let r = reconcile(&[a, b], &journals, &ReconcileParams::default());
+
+        assert!(matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }), "A wins J1");
+        assert!(
+            matches!(r.charges[1].1, ChargeOutcome::Review { .. }),
+            "B loses the J1 contest and is reviewed (not matched to free J2): {:?}",
+            r.charges[1].1
+        );
+        // No double-book, and the fallback journal is surfaced for the human.
+        assert!(!kinds(&r).contains(&"book"));
+        assert!(r.unmatched_journals.iter().any(|j| j.id == "J2"));
     }
 
     /// Permutation invariance: the multiset of outcomes is independent of input
