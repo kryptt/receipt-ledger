@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::config::AccountId;
 use crate::fx::FxClient;
-use crate::schema::{Direction, Extracted, Source};
+use crate::schema::{Amount, Currency, Direction, Extracted, Money, Source};
 use crate::statement::reconcile::ExistingJournal;
 use crate::validate::{Validated, ValidatedTransfer};
 
@@ -90,6 +90,41 @@ struct TransactionGroup<'a> {
     transactions: Vec<Split<'a>>,
 }
 
+impl<'a> TransactionGroup<'a> {
+    /// A one-split group with the standard guards — the single place
+    /// `error_if_duplicate_hash` (idempotency) and `apply_rules` are set, so the
+    /// withdrawal and transfer builders can't drift on them.
+    fn single(split: Split<'a>) -> Self {
+        TransactionGroup {
+            error_if_duplicate_hash: true,
+            // Let Firefly rules fire (operator-authored, part of the trusted base).
+            apply_rules: true,
+            transactions: vec![split],
+        }
+    }
+}
+
+/// A split's destination: either a name (Firefly creates/looks-up an expense
+/// account — for withdrawals) or an existing account id (for transfers). A sum
+/// type so a split can never set both or neither; it serializes to exactly one
+/// of `destination_name` / `destination_id` (flattened into the split).
+enum Destination<'a> {
+    Name(&'a str),
+    Id(&'a str),
+}
+
+impl Serialize for Destination<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(1))?;
+        match self {
+            Destination::Name(n) => m.serialize_entry("destination_name", n)?,
+            Destination::Id(id) => m.serialize_entry("destination_id", id)?,
+        }
+        m.end()
+    }
+}
+
 #[derive(Serialize)]
 struct Split<'a> {
     #[serde(rename = "type")]
@@ -102,13 +137,10 @@ struct Split<'a> {
     tags: Vec<&'a str>,
     /// Source account by numeric id.
     source_id: &'a str,
-    /// The merchant becomes the expense (destination) account for a withdrawal.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination_name: Option<&'a str>,
-    /// Destination account by numeric id — used for a `transfer` (paying account
-    /// → card liability), where the destination is a real account, not a name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination_id: Option<&'a str>,
+    /// Destination — name (withdrawal) or account id (transfer). Flattened to a
+    /// single `destination_name`/`destination_id` key.
+    #[serde(flatten)]
+    destination: Destination<'a>,
     /// Original (pre-conversion) amount as a string, set only when the charge
     /// currency differs from the account currency. Firefly stores this as the
     /// transaction's "foreign amount" alongside the converted `amount`.
@@ -161,11 +193,6 @@ impl<'a> FireflyClient<'a> {
     /// pipeline turns into a per-message Review (never a mis-booked amount).
     pub async fn submit(&self, record: &Validated, external_id: &str) -> Result<SubmitOutcome> {
         let record = record.as_extracted();
-        let url = format!(
-            "{}/api/v1/transactions",
-            self.base_url.trim_end_matches('/')
-        );
-
         let account = self.route_account(record)?;
         let target = self.account_target(account.as_str()).await?;
         let rate = self
@@ -175,39 +202,48 @@ impl<'a> FireflyClient<'a> {
             .context("resolving FX rate for conversion")?;
 
         let group = build_group(record, external_id, account.as_str(), &target, rate);
+        self.post_group(&group, external_id, "transaction").await
+    }
 
+    /// POST a transaction group and classify the response — the one place that
+    /// decides Created vs Duplicate vs hard failure, shared by [`submit`] and
+    /// [`submit_transfer`]. A 422 whose body is Firefly's duplicate-hash shape is
+    /// success-as-duplicate (idempotent re-run); any other 422 (or non-2xx) is a
+    /// real failure that bails (→ the pipeline routes the message to Review),
+    /// never silently treated as Processed.
+    async fn post_group(
+        &self,
+        group: &TransactionGroup<'_>,
+        external_id: &str,
+        kind: &str,
+    ) -> Result<SubmitOutcome> {
+        let url = format!("{}/api/v1/transactions", self.base_url.trim_end_matches('/'));
         let resp = self
             .http
             .post(&url)
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "application/json")
-            .json(&group)
+            .json(group)
             .send()
             .await
-            .context("sending Firefly transaction request")?;
+            .with_context(|| format!("sending Firefly {kind} request"))?;
 
         let status = resp.status();
         if status.is_success() {
-            info!(%external_id, "booked transaction in Firefly");
+            info!(%external_id, %kind, "booked in Firefly");
             return Ok(SubmitOutcome::Created);
         }
-
-        // Firefly returns 422 with a validation body for duplicate hashes. We
-        // parse the body as JSON and match the specific duplicate-hash shape;
-        // any OTHER 422 is a real validation failure (→ Review), never silently
-        // treated as Processed.
         if status == StatusCode::UNPROCESSABLE_ENTITY {
             let body = resp.text().await.unwrap_or_default();
             if is_duplicate_error(&body) {
-                info!(%external_id, "transaction already imported (duplicate hash)");
+                info!(%external_id, %kind, "already imported (duplicate hash)");
                 return Ok(SubmitOutcome::Duplicate);
             }
-            warn!(%external_id, %body, "Firefly 422 was not a duplicate");
-            anyhow::bail!("Firefly rejected transaction (422): {body}");
+            warn!(%external_id, %kind, %body, "Firefly 422 was not a duplicate");
+            anyhow::bail!("Firefly rejected {kind} (422): {body}");
         }
-
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Firefly returned {status}: {body}")
+        anyhow::bail!("Firefly returned {status} on {kind}: {body}")
     }
 
     /// Route to the Firefly account id for this record. Exhaustive over
@@ -298,35 +334,7 @@ impl<'a> FireflyClient<'a> {
     pub async fn submit_transfer(&self, transfer: &ValidatedTransfer) -> Result<SubmitOutcome> {
         let (source, dest) = self.route_transfer_accounts(transfer)?;
         let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
-        let url = format!("{}/api/v1/transactions", self.base_url.trim_end_matches('/'));
-        let external_id = transfer.external_id();
-
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .header(reqwest::header::ACCEPT, "application/json")
-            .json(&group)
-            .send()
-            .await
-            .context("sending Firefly transfer request")?;
-
-        let status = resp.status();
-        if status.is_success() {
-            info!(%external_id, "booked transfer in Firefly");
-            return Ok(SubmitOutcome::Created);
-        }
-        if status == StatusCode::UNPROCESSABLE_ENTITY {
-            let body = resp.text().await.unwrap_or_default();
-            if is_duplicate_error(&body) {
-                info!(%external_id, "transfer already imported (duplicate hash)");
-                return Ok(SubmitOutcome::Duplicate);
-            }
-            warn!(%external_id, %body, "Firefly 422 was not a duplicate");
-            anyhow::bail!("Firefly rejected transfer (422): {body}");
-        }
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Firefly returned {status} on transfer: {body}")
+        self.post_group(&group, transfer.external_id(), "transfer").await
     }
 
     /// Resolve `(source paying account, destination card account)` for a transfer
@@ -368,7 +376,14 @@ impl<'a> FireflyClient<'a> {
         start: NaiveDate,
         end: NaiveDate,
     ) -> Result<Vec<ExistingJournal>> {
+        // A safety cap on the page walk: we trust the server's `total_pages`, but
+        // a buggy/misbehaving endpoint reporting a huge value must not spin this
+        // CronJob forever. A statement cycle is dozens of rows; 1000 pages is
+        // astronomically more than real.
+        const MAX_PAGES: u32 = 1000;
+
         let mut out = Vec::new();
+        let mut skipped_total = 0usize;
         let mut page = 1u32;
         loop {
             let url = format!(
@@ -394,14 +409,28 @@ impl<'a> FireflyClient<'a> {
                 );
             }
 
-            let (mut journals, pagination) = parse_transactions_page(&body)
+            let (mut journals, pagination, skipped) = parse_transactions_page(&body)
                 .with_context(|| format!("parsing transactions page {page} for {}", account.as_str()))?;
             out.append(&mut journals);
+            skipped_total += skipped;
 
             if pagination.total_pages == 0 || page >= pagination.total_pages {
                 break;
             }
+            if page >= MAX_PAGES {
+                warn!(account = account.as_str(), total_pages = pagination.total_pages, "pagination cap hit; stopping");
+                break;
+            }
             page += 1;
+        }
+        if skipped_total > 0 {
+            // Loud, not silent: a non-zero skip means tagged splits failed to
+            // parse — the wiring should treat this cycle's reconcile as suspect.
+            warn!(
+                account = account.as_str(),
+                skipped = skipped_total,
+                "skipped unparseable receipt-ledger transactions while listing"
+            );
         }
         Ok(out)
     }
@@ -437,6 +466,8 @@ struct TxSplit {
     #[serde(default)]
     amount: String,
     #[serde(default)]
+    currency_code: String,
+    #[serde(default)]
     description: String,
     #[serde(default)]
     external_id: Option<String>,
@@ -458,33 +489,52 @@ struct Pagination {
 }
 
 /// Parse one page of the transaction-list response into [`ExistingJournal`]s
-/// (one per `receipt-ledger`-tagged split) plus the pagination block. Pure — no
-/// I/O — so the JSON contract and date/amount handling are unit-testable.
-fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Pagination)> {
+/// (one per `receipt-ledger`-tagged split), the pagination block, and a count of
+/// tagged splits that were **skipped** because their date/amount/currency would
+/// not parse. Pure — no I/O — so the JSON contract is unit-testable.
+///
+/// The skip count is surfaced (not swallowed) so the caller can react if a
+/// Firefly serialization change ever silently drops every split — which would
+/// otherwise make the reconciler treat every charge as missing and mass-book
+/// duplicates. See [`crate::statement`] notes / `feedback_no_silent_catchall`.
+fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Pagination, usize)> {
     let env: TxListEnvelope =
         serde_json::from_str(body).context("decoding Firefly transaction list JSON")?;
     let mut journals = Vec::new();
+    let mut skipped = 0usize;
     for group in env.data {
         for split in group.attributes.transactions {
             if !split.tags.iter().any(|t| t == IMPORT_TAG) {
-                continue;
+                continue; // not ours — not a skip
             }
-            let Some(date) = parse_firefly_date(&split.date) else {
-                continue;
-            };
-            let Ok(amount) = Decimal::from_str_exact(split.amount.trim()) else {
-                continue;
-            };
-            journals.push(ExistingJournal {
-                id: group.id.clone(),
-                date,
-                amount,
-                merchant: split.description.trim().to_string(),
-                external_id: split.external_id.filter(|s| !s.trim().is_empty()),
-            });
+            match existing_journal(&group.id, &split) {
+                Some(j) => journals.push(j),
+                None => skipped += 1,
+            }
         }
     }
-    Ok((journals, env.meta.pagination))
+    Ok((journals, env.meta.pagination, skipped))
+}
+
+/// Build an [`ExistingJournal`] from a tagged split, or `None` if any field is
+/// unusable. The booked amount is taken as a positive magnitude (`abs`,
+/// trailing zeros trimmed) so it compares cleanly against a statement charge's
+/// non-negative [`Amount`], regardless of the sign convention Firefly returns.
+fn existing_journal(group_id: &str, split: &TxSplit) -> Option<ExistingJournal> {
+    let date = parse_firefly_date(&split.date)?;
+    let magnitude = Decimal::from_str_exact(split.amount.trim()).ok()?.abs().normalize();
+    let amount = Amount::parse(&magnitude.to_string()).ok()?;
+    let currency = Currency::parse(split.currency_code.trim()).ok()?;
+    Some(ExistingJournal {
+        id: group_id.to_string(),
+        date,
+        amount: Money::new(amount, currency),
+        merchant: split.description.trim().to_string(),
+        external_id: split
+            .external_id
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
+    })
 }
 
 /// Firefly dates are RFC3339 (`2026-04-21T00:00:00-04:00`); fall back to the
@@ -576,27 +626,20 @@ fn build_group<'b>(
         )
     };
 
-    TransactionGroup {
-        error_if_duplicate_hash: true,
-        // Let Firefly rules fire (e.g. a planned transit-account rewrite).
-        // Firefly's own rule engine is part of the trusted base: rules are
-        // operator-authored, so applying them here is deliberate, not a risk.
-        apply_rules: true,
-        transactions: vec![Split {
-            kind,
-            date: record.date.to_string(),
-            amount,
-            currency_code: &target.currency,
-            description: &record.merchant,
-            external_id,
-            tags: vec![IMPORT_TAG],
-            source_id: account,
-            destination_name: Some(&record.merchant),
-            destination_id: None,
-            foreign_amount,
-            foreign_currency_code,
-        }],
-    }
+    TransactionGroup::single(Split {
+        kind,
+        date: record.date.to_string(),
+        amount,
+        currency_code: &target.currency,
+        description: &record.merchant,
+        external_id,
+        tags: vec![IMPORT_TAG],
+        source_id: account,
+        // The merchant becomes the expense (destination) account.
+        destination: Destination::Name(&record.merchant),
+        foreign_amount,
+        foreign_currency_code,
+    })
 }
 
 /// Build a `transfer` group for a statement payment: paying bank account
@@ -607,24 +650,19 @@ fn build_transfer_group<'b>(
     source: &'b str,
     dest: &'b str,
 ) -> TransactionGroup<'b> {
-    TransactionGroup {
-        error_if_duplicate_hash: true,
-        apply_rules: true,
-        transactions: vec![Split {
-            kind: "transfer",
-            date: transfer.date().to_string(),
-            amount: transfer.money().amount.value().normalize().to_string(),
-            currency_code: transfer.money().currency.as_str(),
-            description: transfer.description(),
-            external_id: transfer.external_id(),
-            tags: vec![IMPORT_TAG],
-            source_id: source,
-            destination_name: None,
-            destination_id: Some(dest),
-            foreign_amount: None,
-            foreign_currency_code: None,
-        }],
-    }
+    TransactionGroup::single(Split {
+        kind: "transfer",
+        date: transfer.date().to_string(),
+        amount: transfer.money().amount.value().normalize().to_string(),
+        currency_code: transfer.money().currency.as_str(),
+        description: transfer.description(),
+        external_id: transfer.external_id(),
+        tags: vec![IMPORT_TAG],
+        source_id: source,
+        destination: Destination::Id(dest),
+        foreign_amount: None,
+        foreign_currency_code: None,
+    })
 }
 
 /// Funding hints that mark a PayPal record as funded by a credit product (→ the
@@ -692,10 +730,11 @@ fn is_duplicate_error(body: &str) -> bool {
     let Ok(parsed) = serde_json::from_str::<ValidationError>(body) else {
         return false;
     };
-    let mentions_duplicate = |s: &str| {
-        let l = s.to_ascii_lowercase();
-        l.contains("duplicate") && l.contains("transaction")
-    };
+    // Firefly's exact phrasing is "Duplicate of transaction #N." Match that
+    // contiguous phrase rather than the looser "duplicate" + "transaction"
+    // anywhere, so an unrelated rule message mentioning both words is not
+    // misread as a duplicate (which would silently drop a real charge).
+    let mentions_duplicate = |s: &str| s.to_ascii_lowercase().contains("duplicate of transaction");
     if mentions_duplicate(&parsed.message) {
         return true;
     }
@@ -902,13 +941,15 @@ mod tests {
     // --- transfer booking (statement payments) -----------------------------
 
     fn transfer(currency: &str, amount: &str) -> crate::validate::ValidatedTransfer {
-        crate::validate::validate_transfer(
+        match crate::validate::validate_transfer(
             Money::new(Amount::parse(amount).unwrap(), Currency::parse(currency).unwrap()),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
             "Pago Via App".to_string(),
             format!("bpstmt:{currency}"),
-        )
-        .unwrap()
+        ) {
+            crate::validate::TransferVerdict::Booked(t) => t,
+            crate::validate::TransferVerdict::Review { reason } => panic!("transfer should validate: {reason}"),
+        }
     }
 
     #[test]
@@ -1238,39 +1279,56 @@ mod tests {
         let body = r#"{
           "data": [
             {"id":"100","attributes":{"transactions":[
-               {"date":"2026-04-21T00:00:00-04:00","amount":"50.93","description":"JR EAST","external_id":"bpstmt:1","tags":["receipt-ledger"]}
+               {"date":"2026-04-21T00:00:00-04:00","amount":"50.93","currency_code":"USD","description":"JR EAST","external_id":"bpstmt:1","tags":["receipt-ledger"]}
             ]}},
             {"id":"101","attributes":{"transactions":[
-               {"date":"2026-04-22T00:00:00-04:00","amount":"9.99","description":"MANUAL ENTRY","tags":["other"]}
+               {"date":"2026-04-22T00:00:00-04:00","amount":"9.99","currency_code":"USD","description":"MANUAL ENTRY","tags":["other"]}
             ]}}
           ],
           "meta":{"pagination":{"total_pages":3}}
         }"#;
-        let (js, pag) = parse_transactions_page(body).unwrap();
+        let (js, pag, skipped) = parse_transactions_page(body).unwrap();
         assert_eq!(js.len(), 1, "only the receipt-ledger-tagged split is returned");
+        assert_eq!(skipped, 0);
         assert_eq!(js[0].id, "100");
         assert_eq!(js[0].date, NaiveDate::from_ymd_opt(2026, 4, 21).unwrap());
-        assert_eq!(js[0].amount, Decimal::from_str_exact("50.93").unwrap());
+        assert_eq!(js[0].amount.amount.value(), Decimal::from_str_exact("50.93").unwrap());
+        assert_eq!(js[0].amount.currency.as_str(), "USD");
         assert_eq!(js[0].merchant, "JR EAST");
         assert_eq!(js[0].external_id.as_deref(), Some("bpstmt:1"));
         assert_eq!(pag.total_pages, 3);
     }
 
     #[test]
+    fn negative_booked_amount_is_stored_as_magnitude() {
+        // H3: whatever sign Firefly uses, the journal magnitude is positive so it
+        // compares cleanly against a non-negative statement Amount.
+        let body = r#"{"data":[{"id":"1","attributes":{"transactions":[
+            {"date":"2026-04-21","amount":"-50.9300","currency_code":"USD","description":"x","tags":["receipt-ledger"]}
+        ]}}],"meta":{"pagination":{"total_pages":1}}}"#;
+        let (js, _, _) = parse_transactions_page(body).unwrap();
+        assert_eq!(js.len(), 1);
+        assert_eq!(js[0].amount.amount.value(), Decimal::from_str_exact("50.93").unwrap());
+    }
+
+    #[test]
     fn empty_list_is_single_page() {
-        let (js, pag) = parse_transactions_page(r#"{"data":[],"meta":{}}"#).unwrap();
+        let (js, pag, skipped) = parse_transactions_page(r#"{"data":[],"meta":{}}"#).unwrap();
         assert!(js.is_empty());
+        assert_eq!(skipped, 0);
         assert_eq!(pag.total_pages, 0);
     }
 
     #[test]
-    fn skips_splits_with_unparseable_date_or_amount() {
+    fn skips_and_counts_unparseable_splits() {
         let body = r#"{"data":[{"id":"1","attributes":{"transactions":[
-            {"date":"nope","amount":"1.00","description":"x","tags":["receipt-ledger"]},
-            {"date":"2026-04-21","amount":"notnum","description":"y","tags":["receipt-ledger"]}
+            {"date":"nope","amount":"1.00","currency_code":"USD","description":"x","tags":["receipt-ledger"]},
+            {"date":"2026-04-21","amount":"notnum","currency_code":"USD","description":"y","tags":["receipt-ledger"]},
+            {"date":"2026-04-21","amount":"1.00","currency_code":"","description":"z","tags":["receipt-ledger"]}
         ]}}],"meta":{"pagination":{"total_pages":1}}}"#;
-        let (js, _) = parse_transactions_page(body).unwrap();
+        let (js, _, skipped) = parse_transactions_page(body).unwrap();
         assert!(js.is_empty(), "malformed splits are skipped, not fatal");
+        assert_eq!(skipped, 3, "skips are counted, not silently dropped");
     }
 
     #[test]

@@ -74,28 +74,41 @@ impl ValidatedTransfer {
     }
 }
 
+/// Outcome of the transfer gate — mirrors [`Verdict`] so a caller handling both
+/// the withdrawal and transfer paths writes symmetric `match` arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferVerdict {
+    /// Cleared the gate — safe to `submit_transfer`.
+    Booked(ValidatedTransfer),
+    /// Failed a gate — route to review, do not book.
+    Review { reason: String },
+}
+
 /// Gate a statement payment into a [`ValidatedTransfer`]. Mirrors [`validate`]'s
 /// money checks (positive amount, currency we book in) plus a non-empty
-/// description and dedup key. `Err` carries the Review reason. Pure.
+/// description and dedup key. Pure.
+#[must_use]
 pub fn validate_transfer(
     money: Money,
     date: NaiveDate,
     description: String,
     external_id: String,
-) -> Result<ValidatedTransfer, String> {
-    if !money.amount.is_positive() {
-        return Err(format!("transfer amount not positive: {}", money.amount));
+) -> TransferVerdict {
+    let reason = if !money.amount.is_positive() {
+        Some(format!("transfer amount not positive: {}", money.amount))
+    } else if !is_known_currency(money.currency.as_str()) {
+        Some(format!("unknown transfer currency: {}", money.currency))
+    } else if description.trim().is_empty() {
+        Some("transfer description is empty".to_string())
+    } else if external_id.trim().is_empty() {
+        Some("transfer external_id is empty".to_string())
+    } else {
+        None
+    };
+    match reason {
+        Some(reason) => TransferVerdict::Review { reason },
+        None => TransferVerdict::Booked(ValidatedTransfer { money, date, description, external_id }),
     }
-    if !is_known_currency(money.currency.as_str()) {
-        return Err(format!("unknown transfer currency: {}", money.currency));
-    }
-    if description.trim().is_empty() {
-        return Err("transfer description is empty".to_string());
-    }
-    if external_id.trim().is_empty() {
-        return Err("transfer external_id is empty".to_string());
-    }
-    Ok(ValidatedTransfer { money, date, description, external_id })
 }
 
 /// Outcome of running the gates over an [`Extracted`] record.
@@ -525,20 +538,30 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
     }
 
+    fn is_transfer_review(money: Money, desc: &str, ext: &str) -> bool {
+        matches!(
+            validate_transfer(money, day(), desc.into(), ext.into()),
+            TransferVerdict::Review { .. }
+        )
+    }
+
     #[test]
     fn valid_payment_mints_transfer() {
-        let t = validate_transfer(money("60999.81", "DOP"), day(), "Pago Via App".into(), "bpstmt:1".into())
-            .expect("a positive DOP payment should validate");
-        assert_eq!(t.money().currency.as_str(), "DOP");
-        assert_eq!(t.external_id(), "bpstmt:1");
-        assert_eq!(t.date(), day());
+        match validate_transfer(money("60999.81", "DOP"), day(), "Pago Via App".into(), "bpstmt:1".into()) {
+            TransferVerdict::Booked(t) => {
+                assert_eq!(t.money().currency.as_str(), "DOP");
+                assert_eq!(t.external_id(), "bpstmt:1");
+                assert_eq!(t.date(), day());
+            }
+            TransferVerdict::Review { reason } => panic!("expected booked, got review: {reason}"),
+        }
     }
 
     #[test]
     fn transfer_gate_rejects_bad_inputs() {
-        assert!(validate_transfer(money("0", "USD"), day(), "x".into(), "id".into()).is_err());
-        assert!(validate_transfer(money("1.00", "XYZ"), day(), "x".into(), "id".into()).is_err());
-        assert!(validate_transfer(money("1.00", "USD"), day(), "  ".into(), "id".into()).is_err());
-        assert!(validate_transfer(money("1.00", "USD"), day(), "x".into(), "".into()).is_err());
+        assert!(is_transfer_review(money("0", "USD"), "x", "id"));
+        assert!(is_transfer_review(money("1.00", "XYZ"), "x", "id"));
+        assert!(is_transfer_review(money("1.00", "USD"), "  ", "id"));
+        assert!(is_transfer_review(money("1.00", "USD"), "x", ""));
     }
 }
