@@ -44,8 +44,8 @@ const FOOTER_MIN_DECIMAL_CELLS: usize = 4;
 enum RowKind<'a> {
     /// `VISA PRESTIGE DOP|USD` — opens a section.
     SectionTitle(SectionCurrency),
-    /// `****-****-****-NNNN … <corte> …` — the card/header row.
-    Card { last4: Last4, cut: NaiveDate },
+    /// `****-****-****-NNNN … <corte> … <balance anterior>` — the card/header row.
+    Card { last4: Last4, cut: NaiveDate, balance_anterior: Option<rust_decimal::Decimal> },
     /// A transaction row. The reference is already parsed during classification
     /// (it needs no section context); only the year-inference of the dates is
     /// deferred to the fold, where the cut date is known.
@@ -77,7 +77,7 @@ pub fn parse_statement(rows: &[TextRow]) -> Result<ParsedStatement> {
         match classify_row(row) {
             RowKind::SectionTitle(cur) => current = Some(cur),
 
-            RowKind::Card { last4, cut } => {
+            RowKind::Card { last4, cut, balance_anterior } => {
                 let cur = current.context("card row before any section title")?;
                 cut_date = Some(cut);
                 // The card header repeats on every page; collapse consecutive
@@ -88,6 +88,7 @@ pub fn parse_statement(rows: &[TextRow]) -> Result<ParsedStatement> {
                         currency: cur,
                         primary_last4: last4,
                         cut_date: cut,
+                        balance_anterior,
                         balance_total: None,
                     });
                 }
@@ -135,8 +136,8 @@ fn classify_row(row: &TextRow) -> RowKind<'_> {
     if let Some(cur) = section_title(&joined) {
         return RowKind::SectionTitle(cur);
     }
-    if let Some((last4, cut)) = card_row(row) {
-        return RowKind::Card { last4, cut };
+    if let Some((last4, cut, balance_anterior)) = card_row(row) {
+        return RowKind::Card { last4, cut, balance_anterior };
     }
     if let Some(reference) = txn_reference(row) {
         return RowKind::Txn { reference, row };
@@ -170,14 +171,14 @@ fn section_title(joined: &str) -> Option<SectionCurrency> {
     }
 }
 
-/// The card/header row: first cell `****-****-****-NNNN` plus a `DD/MM/YYYY`
-/// FECHA DE CORTE somewhere in the row.
-fn card_row(row: &TextRow) -> Option<(Last4, NaiveDate)> {
+/// The card/header row: first cell `****-****-****-NNNN`, a `DD/MM/YYYY`
+/// FECHA DE CORTE, and (last decimal cell) the BALANCE ANTERIOR.
+fn card_row(row: &TextRow) -> Option<(Last4, NaiveDate, Option<Decimal>)> {
     let first = row.cells.first()?.text.trim();
     let rest = first.strip_prefix("****-****-****-")?;
     let last4 = Last4::parse(rest)?;
     let cut = first_full_date(row)?;
-    Some((last4, cut))
+    Some((last4, cut, last_decimal(row)))
 }
 
 /// The first `DD/MM/YYYY` cell in a row (the card row's FECHA DE CORTE).
@@ -436,6 +437,11 @@ mod tests {
         assert_eq!(
             s.sections[0].cut_date,
             NaiveDate::from_ymd_opt(2026, 5, 22).unwrap()
+        );
+        assert_eq!(
+            s.sections[0].balance_anterior,
+            Some(Decimal::from_str("60999.77").unwrap()),
+            "BALANCE ANTERIOR = last decimal of the card row"
         );
         assert_eq!(s.sections[1].currency, SectionCurrency::Usd);
     }

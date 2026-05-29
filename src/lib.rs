@@ -51,6 +51,9 @@ pub struct Summary {
 /// `Err` here is a real (non-zero-exit) failure.
 pub async fn run() -> Result<Summary> {
     let cfg = Config::from_env().context("loading configuration")?;
+    if cfg.dry_run {
+        info!("DRY RUN enabled (RECEIPT_DRY_RUN): no Firefly writes, no mailbox moves, no state advance");
+    }
     let http = build_http_client()?;
 
     // --- 1. JMAP read -----------------------------------------------------
@@ -63,7 +66,9 @@ pub async fn run() -> Result<Summary> {
 
     if messages.is_empty() {
         info!("no new messages");
-        jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
+        if !cfg.dry_run {
+            jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
+        }
         return Ok(Summary::default());
     }
     info!(count = messages.len(), "new messages to process");
@@ -111,51 +116,56 @@ pub async fn run() -> Result<Summary> {
                     } else {
                         warn!(id = %msg.id, ?report, "statement has flags → review");
                     }
-                    route(&mailbox, &msg.id, clean).await;
+                    route(&mailbox, &msg.id, clean, cfg.dry_run).await;
                 }
                 Err(e) => {
                     summary.review += 1;
                     warn!(id = %msg.id, error = ?e, "statement processing error; routing to review");
-                    route(&mailbox, &msg.id, false).await;
+                    route(&mailbox, &msg.id, false, cfg.dry_run).await;
                 }
             }
             continue;
         }
 
-        match process_message(msg, &llm, &firefly, &fx, &cfg.validation).await {
+        match process_message(msg, &llm, &firefly, &fx, &cfg.validation, cfg.dry_run).await {
             Ok(Disposition::Booked) => {
                 summary.booked += 1;
-                route(&mailbox, &msg.id, true).await;
+                route(&mailbox, &msg.id, true, cfg.dry_run).await;
             }
             Ok(Disposition::Duplicate) => {
                 summary.duplicates += 1;
-                route(&mailbox, &msg.id, true).await;
+                route(&mailbox, &msg.id, true, cfg.dry_run).await;
             }
             Ok(Disposition::Skipped(reason)) => {
                 // Not a transaction at all — a clean skip, NOT a review. Move
                 // to Processed: it never needed human eyes.
                 summary.skipped += 1;
                 info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
-                route(&mailbox, &msg.id, true).await;
+                route(&mailbox, &msg.id, true, cfg.dry_run).await;
             }
             Ok(Disposition::Review(reason)) => {
                 summary.review += 1;
                 warn!(id = %msg.id, %reason, "routing to review");
-                route(&mailbox, &msg.id, false).await;
+                route(&mailbox, &msg.id, false, cfg.dry_run).await;
             }
             Err(e) => {
                 // A per-message processing error is not fatal to the job.
                 summary.review += 1;
                 warn!(id = %msg.id, error = ?e, "processing error; routing to review");
-                route(&mailbox, &msg.id, false).await;
+                route(&mailbox, &msg.id, false, cfg.dry_run).await;
             }
         }
     }
 
     // --- 7. Persist state cursor -----------------------------------------
     // Only after the batch is fully handled; a crash mid-batch re-processes
-    // (dedup makes that safe) rather than skipping unprocessed mail.
-    jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
+    // (dedup makes that safe) rather than skipping unprocessed mail. Skipped in
+    // dry-run so the same messages can be re-observed.
+    if cfg.dry_run {
+        info!("DRY RUN: not advancing JMAP state");
+    } else {
+        jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
+    }
 
     Ok(summary)
 }
@@ -176,6 +186,7 @@ async fn process_message(
     firefly: &FireflyClient<'_>,
     fx: &FxClient<'_>,
     policy: &ValidationPolicy,
+    dry_run: bool,
 ) -> Result<Disposition> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
     //    original sender.
@@ -256,11 +267,16 @@ async fn process_message(
                     continue;
                 }
 
-                // 6. Dedup key. 7. Submit to Firefly.
+                // 6. Dedup key. 7. Submit to Firefly (skipped in dry-run).
                 let external_id = dedup::external_id(validated.as_extracted());
-                match firefly.submit(&validated, &external_id).await? {
-                    SubmitOutcome::Created => booked_any = true,
-                    SubmitOutcome::Duplicate => dup_any = true,
+                if dry_run {
+                    info!(%external_id, "DRY RUN: would book withdrawal");
+                    booked_any = true;
+                } else {
+                    match firefly.submit(&validated, &external_id).await? {
+                        SubmitOutcome::Created => booked_any = true,
+                        SubmitOutcome::Duplicate => dup_any = true,
+                    }
                 }
             }
             Verdict::Review { reason } => {
@@ -309,7 +325,12 @@ pub(crate) async fn usd_ceiling_review(
 
 /// Move a message, logging (but not failing the run) on error — the
 /// transaction is already booked/idempotent, so a failed move is non-fatal.
-async fn route(mailbox: &Mailbox, id: &str, processed: bool) {
+/// In dry-run the move is skipped (the message stays put to be re-observed).
+async fn route(mailbox: &Mailbox, id: &str, processed: bool, dry_run: bool) {
+    if dry_run {
+        info!(%id, target = if processed { "Processed" } else { "Review" }, "DRY RUN: would move message");
+        return;
+    }
     let result = if processed {
         mailbox.move_to_processed(id).await
     } else {

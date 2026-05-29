@@ -159,6 +159,11 @@ pub struct Section {
     /// `FECHA DE CORTE` — the cycle cut date. Anchors year inference for the
     /// year-less `DD/MM` transaction dates.
     pub cut_date: NaiveDate,
+    /// `BALANCE ANTERIOR` (header) — the prior-cycle closing balance. With
+    /// `balance_total` it gives the internal-consistency check
+    /// `anterior + Σcharges − Σpayments ≈ total`. Signed [`Decimal`] (a balance
+    /// can be negative), never booked.
+    pub balance_anterior: Option<Decimal>,
     /// `BALANCE TOTAL` (footer) — the authoritative closing balance, used by the
     /// Phase-1 closing-balance check. Deliberately a bare (signed) [`Decimal`]
     /// and not a [`Money`]: a statement balance can be negative, which the

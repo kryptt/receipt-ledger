@@ -16,7 +16,8 @@
 
 use anyhow::{Result, anyhow};
 use chrono::Duration;
-use tracing::{info, warn};
+use rust_decimal::Decimal;
+use tracing::{debug, info, warn};
 
 use super::reconcile::{ChargeOutcome, ReconcileParams, reconcile};
 use super::{SectionCurrency, StatementTxn, parse, pdf};
@@ -74,16 +75,24 @@ pub struct StatementReport {
     pub payments_booked: usize,
     /// Journals in the window with no matching statement charge (audit signal).
     pub unmatched_booked: usize,
+    /// Sections whose `BALANCE ANTERIOR + Σcharges − Σpayments` did not reconcile
+    /// to `BALANCE TOTAL` within tolerance (a parse-completeness / unmodeled
+    /// fee-or-interest signal).
+    pub balance_mismatch: usize,
     /// Rows that could not be confidently handled → human review.
     pub review: usize,
 }
 
 impl StatementReport {
     /// Whether the statement is fully clean (→ Processed). Any mismatch,
-    /// unmatched journal, or review item routes the message to Review.
+    /// unmatched journal, balance discrepancy, or review item routes the message
+    /// to Review.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.amount_mismatch == 0 && self.unmatched_booked == 0 && self.review == 0
+        self.amount_mismatch == 0
+            && self.unmatched_booked == 0
+            && self.balance_mismatch == 0
+            && self.review == 0
     }
 }
 
@@ -151,29 +160,89 @@ pub async fn process_statement(
 
         let recon = reconcile(&charges, &journals, &params);
         report.unmatched_booked += recon.unmatched_journals.len();
+        for j in &recon.unmatched_journals {
+            info!(journal = j.id, merchant = j.merchant, "unmatched Firefly journal (audit) → review");
+        }
 
         // recon.charges is positional with `charges`.
         for ((_, outcome), charge) in recon.charges.iter().zip(&charges) {
+            // In dry-run, surface the per-row plan (merchant/amount is the point
+            // of observing); in production it stays at debug (financial PII).
+            let line = format!(
+                "{} | {} {} | {:?}",
+                charge.reference.as_str(),
+                charge.money.amount.value().normalize(),
+                charge.money.currency.as_str(),
+                outcome
+            );
+            if cfg.dry_run {
+                info!(merchant = charge.merchant, plan = %line, "charge plan");
+            } else {
+                debug!(merchant = charge.merchant, plan = %line, "charge");
+            }
+
             match outcome {
                 ChargeOutcome::Confirmed { .. } => report.reconciled += 1,
                 ChargeOutcome::AmountMismatch { .. } => report.amount_mismatch += 1,
-                ChargeOutcome::Review { reason } => {
-                    info!(reference = charge.reference.as_str(), %reason, "charge → review");
-                    report.review += 1;
-                }
+                ChargeOutcome::Review { .. } => report.review += 1,
                 ChargeOutcome::BookNew => {
                     book_charge(charge, section, firefly, fx, cfg, &mut report).await;
                 }
             }
         }
 
-        for payment in payments {
+        for &payment in &payments {
             book_payment(payment, firefly, fx, cfg, &mut report).await;
         }
+
+        check_balance(section, &charges, &payments, &mut report);
     }
 
     info!(?report, "statement reconciliation complete");
     Ok(report)
+}
+
+/// Closing-balance internal consistency: `BALANCE ANTERIOR + Σcharges −
+/// Σpayments` should reconcile to `BALANCE TOTAL`. Logs the full breakdown
+/// (always — it's the most useful dry-run signal) and flags a mismatch beyond
+/// tolerance. Note: interest/fee rows are not yet modeled, so a non-zero delta
+/// is a *signal to read*, not necessarily a parse bug. Skipped when either
+/// balance is absent.
+fn check_balance(
+    section: &super::Section,
+    charges: &[StatementTxn],
+    payments: &[&StatementTxn],
+    report: &mut StatementReport,
+) {
+    let (Some(anterior), Some(stated)) = (section.balance_anterior, section.balance_total) else {
+        debug!(currency = ?section.currency, "closing-balance check skipped (missing anterior/total)");
+        return;
+    };
+    let sum_charges: Decimal = charges.iter().map(|c| c.money.amount.value()).sum();
+    let sum_payments: Decimal = payments.iter().map(|p| p.money.amount.value()).sum();
+    let computed = anterior + sum_charges - sum_payments;
+    let delta = (computed - stated).abs();
+    // Tight tolerance: surface any real discrepancy (missed row / unmodeled
+    // fee or interest) for a human to read, especially during dry-run.
+    let tolerance = Decimal::new(1, 2); // 0.01
+    info!(
+        currency = ?section.currency,
+        anterior = %anterior,
+        charges = %sum_charges,
+        payments = %sum_payments,
+        computed = %computed,
+        stated = %stated,
+        delta = %delta,
+        "closing-balance check"
+    );
+    if delta > tolerance {
+        report.balance_mismatch += 1;
+        warn!(
+            currency = ?section.currency,
+            delta = %delta,
+            "closing balance does not reconcile (missed rows, or unmodeled fees/interest) → review"
+        );
+    }
 }
 
 /// Book a not-yet-present charge via the canonical gate, tallying the outcome.
@@ -210,6 +279,11 @@ async fn book_charge(
         }
     }
     let external_id = crate::dedup::external_id(validated.as_extracted());
+    if cfg.dry_run {
+        info!(reference = charge.reference.as_str(), %external_id, "DRY RUN: would book new charge");
+        report.booked_new += 1;
+        return;
+    }
     match firefly.submit(&validated, &external_id).await {
         Ok(SubmitOutcome::Created) => report.booked_new += 1,
         Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
@@ -266,6 +340,11 @@ async fn book_payment(
             return;
         }
     };
+    if cfg.dry_run {
+        info!(reference = payment.reference.as_str(), "DRY RUN: would book payment transfer");
+        report.payments_booked += 1;
+        return;
+    }
     match firefly.submit_transfer(&transfer).await {
         Ok(SubmitOutcome::Created) => report.payments_booked += 1,
         Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
@@ -337,6 +416,7 @@ mod tests {
         assert!(clean.is_clean());
         assert!(!StatementReport { amount_mismatch: 1, ..Default::default() }.is_clean());
         assert!(!StatementReport { unmatched_booked: 1, ..Default::default() }.is_clean());
+        assert!(!StatementReport { balance_mismatch: 1, ..Default::default() }.is_clean());
         assert!(!StatementReport { review: 1, ..Default::default() }.is_clean());
     }
 }

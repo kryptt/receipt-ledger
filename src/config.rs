@@ -140,6 +140,10 @@ pub struct Config {
     /// address). Combined with a PDF attachment to classify a message as a
     /// statement. `None` falls back to subject-based detection only.
     pub bp_statement_sender: Option<String>,
+    /// Dry-run (`RECEIPT_DRY_RUN`): compute + log the full plan but perform **no**
+    /// Firefly writes, **no** mailbox moves, and **no** JMAP state advance — so a
+    /// run can be repeated and observed (via logs) before booking for real.
+    pub dry_run: bool,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -187,6 +191,7 @@ impl Config {
             bp_paying_dop_account: account_optional("RECEIPT_BP_PAYING_DOP_ACCOUNT")?,
             bp_statement_password: optional("RECEIPT_BP_STATEMENT_PASSWORD"),
             bp_statement_sender: optional("RECEIPT_BP_STATEMENT_SENDER"),
+            dry_run: env_bool("RECEIPT_DRY_RUN"),
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,
@@ -203,6 +208,12 @@ fn env_or(key: &str, default: &str) -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Read a boolean env var: true for `1`/`true`/`yes` (case-insensitive), else
+/// false (incl. unset).
+fn env_bool(key: &str) -> bool {
+    optional(key).is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// Read an optional env var, returning `None` when unset or blank.

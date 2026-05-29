@@ -19,11 +19,16 @@
 use anyhow::{Context, Result, anyhow};
 use pdf::content::{Op, Point};
 use pdf::file::FileOptions;
+use pdf::object::{Resolve, Resources, XObject};
+use pdf::primitive::Primitive;
 
 use super::{Cell, Run, TextRow};
 
 /// Runs whose `y` differ by less than this (PDF points) belong to one row.
 const ROW_Y_TOLERANCE: f32 = 2.5;
+
+/// Max Form-XObject nesting we recurse into (loop/runaway guard).
+const MAX_FORM_DEPTH: u8 = 8;
 
 /// A 2-D affine transform `[a b c d e f]` (PDF's row-vector convention:
 /// `[x y 1] · M`). Used for both the CTM and the text matrix.
@@ -94,7 +99,9 @@ pub fn extract_rows(pdf_bytes: Vec<u8>, password: &str) -> Result<Vec<TextRow>> 
         let ops = content
             .operations(&resolver)
             .with_context(|| format!("decoding page {page_num} content"))?;
-        let runs = runs_from_ops(&ops);
+        let resources = page.resources().ok().map(|r| &**r);
+        let mut runs = Vec::new();
+        collect_runs(&ops, Affine::identity(), &resolver, resources, &mut runs, 0);
         rows.extend(group_runs(runs));
     }
     if rows.is_empty() {
@@ -103,15 +110,24 @@ pub fn extract_rows(pdf_bytes: Vec<u8>, password: &str) -> Result<Vec<TextRow>> 
     Ok(rows)
 }
 
-/// Walk one page's operations, tracking the CTM and text matrix, and collect a
-/// positioned [`Run`] for every text-drawing operator.
-fn runs_from_ops(ops: &[Op]) -> Vec<Run> {
-    let mut ctm = Affine::identity();
+/// Walk a content stream's operations, tracking the CTM (seeded with `base_ctm`)
+/// and text matrix, collecting a positioned [`Run`] for every text-drawing
+/// operator. Recurses into Form XObjects (the statement's footer summary — incl.
+/// `BALANCE TOTAL` — lives in one), applying the form's matrix on top of the CTM
+/// at the `Do` site, bounded by [`MAX_FORM_DEPTH`].
+fn collect_runs<R: Resolve>(
+    ops: &[Op],
+    base_ctm: Affine,
+    resolve: &R,
+    resources: Option<&Resources>,
+    runs: &mut Vec<Run>,
+    depth: u8,
+) {
+    let mut ctm = base_ctm;
     let mut ctm_stack: Vec<Affine> = Vec::new();
     let mut tlm = Affine::identity(); // text line matrix
     let mut tm = Affine::identity(); // text matrix
     let mut leading = 0f32;
-    let mut runs = Vec::new();
 
     for op in ops {
         match op {
@@ -140,7 +156,7 @@ fn runs_from_ops(ops: &[Op]) -> Vec<Run> {
                 tm = tlm;
             }
             Op::TextDraw { text } => {
-                push_run(&mut runs, &ctm, &tm, &decode_win1252(text.as_bytes()));
+                push_run(runs, &ctm, &tm, &decode_win1252(text.as_bytes()));
             }
             Op::TextDrawAdjusted { array } => {
                 let mut s = String::new();
@@ -151,7 +167,12 @@ fn runs_from_ops(ops: &[Op]) -> Vec<Run> {
                         s.push_str(&decode_win1252(t.as_bytes()));
                     }
                 }
-                push_run(&mut runs, &ctm, &tm, &s);
+                push_run(runs, &ctm, &tm, &s);
+            }
+            Op::XObject { name } => {
+                if depth < MAX_FORM_DEPTH {
+                    recurse_xobject(name, ctm, resolve, resources, runs, depth);
+                }
             }
             // Deliberately ignored: graphics/path/color operators (no text) and
             // text-state operators that do not move the glyph origin we track —
@@ -161,7 +182,48 @@ fn runs_from_ops(ops: &[Op]) -> Vec<Run> {
             _ => {}
         }
     }
-    runs
+}
+
+/// Resolve a named Form XObject and recurse into its content with the current
+/// CTM (× the form's own matrix). Image/PostScript XObjects and resolution
+/// failures are silently ignored — we only want text.
+fn recurse_xobject<R: Resolve>(
+    name: &pdf::primitive::Name,
+    ctm: Affine,
+    resolve: &R,
+    resources: Option<&Resources>,
+    runs: &mut Vec<Run>,
+    depth: u8,
+) {
+    let Some(res) = resources else { return };
+    let Some(xref) = res.xobjects.get(name) else { return };
+    let Ok(xobj) = resolve.get(*xref) else { return };
+    let XObject::Form(form) = &*xobj else { return };
+    let Ok(form_ops) = form.operations(resolve) else { return };
+    let dict = form.dict();
+    let form_ctm = form_matrix(&dict.matrix).then(&ctm);
+    // The form may carry its own resource dictionary; fall back to the parent's.
+    let form_res = dict.resources.as_deref().or(resources);
+    collect_runs(&form_ops, form_ctm, resolve, form_res, runs, depth + 1);
+}
+
+/// Parse a Form XObject `/Matrix` (a 6-number array) into an [`Affine`];
+/// identity when absent or malformed.
+fn form_matrix(matrix: &Option<Primitive>) -> Affine {
+    let Some(Primitive::Array(a)) = matrix else {
+        return Affine::identity();
+    };
+    if a.len() != 6 {
+        return Affine::identity();
+    }
+    let mut v = [0f32; 6];
+    for (slot, p) in v.iter_mut().zip(a) {
+        match p.as_number() {
+            Ok(n) => *slot = n,
+            Err(_) => return Affine::identity(),
+        }
+    }
+    Affine { a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] }
 }
 
 /// Record a run at the current text origin (mapped through `Tm × CTM`), unless
