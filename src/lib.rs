@@ -83,6 +83,8 @@ pub async fn run() -> Result<Summary> {
         cfg.paypal_credit_account.clone(),
         cfg.banco_popular_usd_account.clone(),
         cfg.banco_popular_dop_account.clone(),
+        cfg.bp_paying_usd_account.clone(),
+        cfg.bp_paying_dop_account.clone(),
     );
 
     // --- per-message pipeline --------------------------------------------

@@ -16,7 +16,9 @@
 //!   string is normalized and matched against exact tokens, with an explicit
 //!   reject veto.
 
-use crate::schema::{Direction, Extracted};
+use chrono::NaiveDate;
+
+use crate::schema::{Direction, Extracted, Money};
 
 /// A record that has cleared every validation gate.
 ///
@@ -33,6 +35,67 @@ impl Validated {
     pub fn as_extracted(&self) -> &Extracted {
         &self.0
     }
+}
+
+/// A statement card **payment** that has cleared the transfer gate — booked as a
+/// Firefly `transfer` (paying bank account → card liability), not a withdrawal.
+///
+/// The withdrawal [`validate`] gate deliberately routes `Direction::In` to
+/// Review (a refund/deposit notice must not auto-book). Statement payments are a
+/// *different, trusted* shape — the bank's own statement says the card was paid —
+/// so they get their own gate + token. Like [`Validated`], construction is
+/// private to this module; [`crate::firefly::submit_transfer`] requires a
+/// `&ValidatedTransfer`, so the gate cannot be skipped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedTransfer {
+    money: Money,
+    date: NaiveDate,
+    description: String,
+    external_id: String,
+}
+
+impl ValidatedTransfer {
+    /// The transfer amount + currency (same currency on both legs).
+    #[must_use]
+    pub fn money(&self) -> &Money {
+        &self.money
+    }
+    #[must_use]
+    pub fn date(&self) -> NaiveDate {
+        self.date
+    }
+    #[must_use]
+    pub fn description(&self) -> &str {
+        &self.description
+    }
+    #[must_use]
+    pub fn external_id(&self) -> &str {
+        &self.external_id
+    }
+}
+
+/// Gate a statement payment into a [`ValidatedTransfer`]. Mirrors [`validate`]'s
+/// money checks (positive amount, currency we book in) plus a non-empty
+/// description and dedup key. `Err` carries the Review reason. Pure.
+pub fn validate_transfer(
+    money: Money,
+    date: NaiveDate,
+    description: String,
+    external_id: String,
+) -> Result<ValidatedTransfer, String> {
+    if !money.amount.is_positive() {
+        return Err(format!("transfer amount not positive: {}", money.amount));
+    }
+    if !is_known_currency(money.currency.as_str()) {
+        return Err(format!("unknown transfer currency: {}", money.currency));
+    }
+    if description.trim().is_empty() {
+        return Err("transfer description is empty".to_string());
+    }
+    if external_id.trim().is_empty() {
+        return Err("transfer external_id is empty".to_string());
+    }
+    Ok(ValidatedTransfer { money, date, description, external_id })
 }
 
 /// Outcome of running the gates over an [`Extracted`] record.
@@ -451,5 +514,31 @@ mod tests {
         let mut r = base();
         r.merchant = "   ".to_string();
         assert!(is_review(r));
+    }
+
+    // --- transfer gate (statement payments) ------------------------------
+
+    fn money(amount: &str, currency: &str) -> Money {
+        Money::new(Amount::parse(amount).unwrap(), Currency::parse(currency).unwrap())
+    }
+    fn day() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
+    }
+
+    #[test]
+    fn valid_payment_mints_transfer() {
+        let t = validate_transfer(money("60999.81", "DOP"), day(), "Pago Via App".into(), "bpstmt:1".into())
+            .expect("a positive DOP payment should validate");
+        assert_eq!(t.money().currency.as_str(), "DOP");
+        assert_eq!(t.external_id(), "bpstmt:1");
+        assert_eq!(t.date(), day());
+    }
+
+    #[test]
+    fn transfer_gate_rejects_bad_inputs() {
+        assert!(validate_transfer(money("0", "USD"), day(), "x".into(), "id".into()).is_err());
+        assert!(validate_transfer(money("1.00", "XYZ"), day(), "x".into(), "id".into()).is_err());
+        assert!(validate_transfer(money("1.00", "USD"), day(), "  ".into(), "id".into()).is_err());
+        assert!(validate_transfer(money("1.00", "USD"), day(), "x".into(), "".into()).is_err());
     }
 }

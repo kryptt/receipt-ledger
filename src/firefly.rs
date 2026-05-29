@@ -25,7 +25,7 @@ use crate::config::AccountId;
 use crate::fx::FxClient;
 use crate::schema::{Direction, Extracted, Source};
 use crate::statement::reconcile::ExistingJournal;
-use crate::validate::Validated;
+use crate::validate::{Validated, ValidatedTransfer};
 
 /// Tag attached to every transaction this service books, for easy filtering in
 /// Firefly.
@@ -70,6 +70,12 @@ pub struct FireflyClient<'a> {
     /// Banco Popular VISA DOP account id. `None` when unconfigured; a DOP Banco
     /// Popular record then errors out (→ Review).
     banco_popular_dop_account: Option<AccountId>,
+    /// Banco Popular USD savings account — the source of a USD-card statement
+    /// payment booked as a transfer. `None` → such payments error out (→ Review).
+    bp_paying_usd_account: Option<AccountId>,
+    /// Banco Popular DOP checking account — the source of a DOP-card statement
+    /// payment booked as a transfer. `None` → such payments error out (→ Review).
+    bp_paying_dop_account: Option<AccountId>,
     /// Per-account-id target cache: numeric account id → its Firefly
     /// `currency_code` + `decimal_places`. Authoritative source of the
     /// conversion target so we book in the account's real currency at its real
@@ -99,6 +105,10 @@ struct Split<'a> {
     /// The merchant becomes the expense (destination) account for a withdrawal.
     #[serde(skip_serializing_if = "Option::is_none")]
     destination_name: Option<&'a str>,
+    /// Destination account by numeric id — used for a `transfer` (paying account
+    /// → card liability), where the destination is a real account, not a name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    destination_id: Option<&'a str>,
     /// Original (pre-conversion) amount as a string, set only when the charge
     /// currency differs from the account currency. Firefly stores this as the
     /// transaction's "foreign amount" alongside the converted `amount`.
@@ -121,6 +131,8 @@ impl<'a> FireflyClient<'a> {
         paypal_credit_account: Option<AccountId>,
         banco_popular_usd_account: Option<AccountId>,
         banco_popular_dop_account: Option<AccountId>,
+        bp_paying_usd_account: Option<AccountId>,
+        bp_paying_dop_account: Option<AccountId>,
     ) -> Self {
         Self {
             http,
@@ -131,6 +143,8 @@ impl<'a> FireflyClient<'a> {
             paypal_credit_account,
             banco_popular_usd_account,
             banco_popular_dop_account,
+            bp_paying_usd_account,
+            bp_paying_dop_account,
             account_target: Mutex::new(HashMap::new()),
         }
     }
@@ -274,6 +288,70 @@ impl<'a> FireflyClient<'a> {
             .unwrap_or_else(|e| e.into_inner())
             .insert(account.to_string(), target.clone());
         Ok(target)
+    }
+
+    /// Submit a statement payment as a Firefly `transfer` (paying bank account →
+    /// card liability). Requires a [`ValidatedTransfer`], so the gate cannot be
+    /// skipped. Routes both legs by the transfer currency (DOP → checking→107,
+    /// else → savings→106); a needed-but-unconfigured account is an `Err`
+    /// (→ Review). No FX: both legs are the same currency.
+    pub async fn submit_transfer(&self, transfer: &ValidatedTransfer) -> Result<SubmitOutcome> {
+        let (source, dest) = self.route_transfer_accounts(transfer)?;
+        let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
+        let url = format!("{}/api/v1/transactions", self.base_url.trim_end_matches('/'));
+        let external_id = transfer.external_id();
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&group)
+            .send()
+            .await
+            .context("sending Firefly transfer request")?;
+
+        let status = resp.status();
+        if status.is_success() {
+            info!(%external_id, "booked transfer in Firefly");
+            return Ok(SubmitOutcome::Created);
+        }
+        if status == StatusCode::UNPROCESSABLE_ENTITY {
+            let body = resp.text().await.unwrap_or_default();
+            if is_duplicate_error(&body) {
+                info!(%external_id, "transfer already imported (duplicate hash)");
+                return Ok(SubmitOutcome::Duplicate);
+            }
+            warn!(%external_id, %body, "Firefly 422 was not a duplicate");
+            anyhow::bail!("Firefly rejected transfer (422): {body}");
+        }
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Firefly returned {status} on transfer: {body}")
+    }
+
+    /// Resolve `(source paying account, destination card account)` for a transfer
+    /// by its currency. DOP → checking + DOP card (107); anything else → USD
+    /// savings + USD card (106). A needed-but-unconfigured account is an `Err`.
+    fn route_transfer_accounts(
+        &self,
+        transfer: &ValidatedTransfer,
+    ) -> Result<(&AccountId, &AccountId)> {
+        let dop = transfer.money().currency.as_str() == "DOP";
+        let (source, dest) = if dop {
+            (
+                self.bp_paying_dop_account.as_ref(),
+                self.banco_popular_dop_account.as_ref(),
+            )
+        } else {
+            (
+                self.bp_paying_usd_account.as_ref(),
+                self.banco_popular_usd_account.as_ref(),
+            )
+        };
+        let kind = if dop { "DOP" } else { "USD" };
+        let source = source.with_context(|| format!("no Banco Popular {kind} paying account configured"))?;
+        let dest = dest.with_context(|| format!("no Banco Popular {kind} card account configured"))?;
+        Ok((source, dest))
     }
 
     /// List this service's previously-booked **withdrawals** on `account` in the
@@ -514,8 +592,37 @@ fn build_group<'b>(
             tags: vec![IMPORT_TAG],
             source_id: account,
             destination_name: Some(&record.merchant),
+            destination_id: None,
             foreign_amount,
             foreign_currency_code,
+        }],
+    }
+}
+
+/// Build a `transfer` group for a statement payment: paying bank account
+/// (`source`) → card liability (`dest`), same currency on both legs (no FX).
+/// Pure — unit-testable without a live Firefly.
+fn build_transfer_group<'b>(
+    transfer: &'b ValidatedTransfer,
+    source: &'b str,
+    dest: &'b str,
+) -> TransactionGroup<'b> {
+    TransactionGroup {
+        error_if_duplicate_hash: true,
+        apply_rules: true,
+        transactions: vec![Split {
+            kind: "transfer",
+            date: transfer.date().to_string(),
+            amount: transfer.money().amount.value().normalize().to_string(),
+            currency_code: transfer.money().currency.as_str(),
+            description: transfer.description(),
+            external_id: transfer.external_id(),
+            tags: vec![IMPORT_TAG],
+            source_id: source,
+            destination_name: None,
+            destination_id: Some(dest),
+            foreign_amount: None,
+            foreign_currency_code: None,
         }],
     }
 }
@@ -663,7 +770,7 @@ mod tests {
         FxClient::new(http, "http://fx.invalid")
     }
 
-    /// A client wired with the four production account ids.
+    /// A client wired with the production account ids.
     fn client<'a>(http: &'a Client, fx: &'a FxClient<'a>) -> FireflyClient<'a> {
         FireflyClient::new(
             http,
@@ -674,6 +781,8 @@ mod tests {
             Some(acct("105")), // PayPal Credit
             Some(acct("106")), // Banco Popular USD
             Some(acct("107")), // Banco Popular DOP
+            Some(acct("201")), // BP USD savings (paying)
+            Some(acct("202")), // BP DOP checking (paying)
         )
     }
 
@@ -775,6 +884,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         );
         assert!(
             c.route_account(&paypal_record(Some("Pay in 4"), "USD"))
@@ -786,6 +897,70 @@ mod tests {
             c.route_account(&paypal_record(Some("Balance"), "USD"))
                 .is_ok()
         );
+    }
+
+    // --- transfer booking (statement payments) -----------------------------
+
+    fn transfer(currency: &str, amount: &str) -> crate::validate::ValidatedTransfer {
+        crate::validate::validate_transfer(
+            Money::new(Amount::parse(amount).unwrap(), Currency::parse(currency).unwrap()),
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+            "Pago Via App".to_string(),
+            format!("bpstmt:{currency}"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn dop_transfer_routes_checking_to_dop_card_and_builds() {
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        let t = transfer("DOP", "60999.81");
+        let (src, dst) = c.route_transfer_accounts(&t).unwrap();
+        assert_eq!(src.as_str(), "202", "DOP checking is the source");
+        assert_eq!(dst.as_str(), "107", "DOP card is the destination");
+
+        let json = serde_json::to_value(build_transfer_group(&t, src.as_str(), dst.as_str())).unwrap();
+        let split = &json["transactions"][0];
+        assert_eq!(split["type"], "transfer");
+        assert_eq!(split["amount"], "60999.81");
+        assert_eq!(split["currency_code"], "DOP");
+        assert_eq!(split["source_id"], "202");
+        assert_eq!(split["destination_id"], "107");
+        assert!(split.get("destination_name").is_none(), "transfer uses dest id, not name");
+        assert!(split.get("foreign_amount").is_none(), "same-currency transfer, no FX");
+    }
+
+    #[test]
+    fn usd_transfer_routes_savings_to_usd_card() {
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        let (src, dst) = c.route_transfer_accounts(&transfer("USD", "2491.46")).unwrap();
+        assert_eq!(src.as_str(), "201", "USD savings is the source");
+        assert_eq!(dst.as_str(), "106", "USD card is the destination");
+    }
+
+    #[test]
+    fn transfer_with_unconfigured_paying_account_errors() {
+        let http = Client::new();
+        let fx = fx(&http);
+        // Card accounts present, paying accounts absent.
+        let c = FireflyClient::new(
+            &http,
+            "http://firefly:8080",
+            "tok",
+            &fx,
+            acct("103"),
+            None,
+            Some(acct("106")),
+            Some(acct("107")),
+            None,
+            None,
+        );
+        assert!(c.route_transfer_accounts(&transfer("DOP", "1.00")).is_err());
+        assert!(c.route_transfer_accounts(&transfer("USD", "1.00")).is_err());
     }
 
     // --- conversion / foreign amount ---------------------------------------

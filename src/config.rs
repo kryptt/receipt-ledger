@@ -124,6 +124,14 @@ pub struct Config {
     /// Banco Popular VISA DOP account (liability, DOP), by numeric id. `None`
     /// when unconfigured; a DOP Banco Popular record then routes to Review.
     pub banco_popular_dop_account: Option<AccountId>,
+    /// Banco Popular USD savings account (asset, USD), by numeric id — the
+    /// source of a USD-card statement payment booked as a transfer. `None` when
+    /// unconfigured; a USD payment row then routes to Review.
+    pub bp_paying_usd_account: Option<AccountId>,
+    /// Banco Popular DOP checking account (asset, DOP), by numeric id — the
+    /// source of a DOP-card statement payment booked as a transfer. `None` when
+    /// unconfigured; a DOP payment row then routes to Review.
+    pub bp_paying_dop_account: Option<AccountId>,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -165,6 +173,10 @@ impl Config {
             banco_popular_usd_account: account_optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT")?,
             // Optional — absent means DOP Banco Popular mail routes to Review.
             banco_popular_dop_account: account_optional("RECEIPT_BANCO_POPULAR_DOP_ACCOUNT")?,
+            // Optional paying accounts for statement payments booked as transfers
+            // — absent means the matching payment rows route to Review.
+            bp_paying_usd_account: account_optional("RECEIPT_BP_PAYING_USD_ACCOUNT")?,
+            bp_paying_dop_account: account_optional("RECEIPT_BP_PAYING_DOP_ACCOUNT")?,
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,
