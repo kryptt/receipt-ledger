@@ -1,6 +1,6 @@
 [package]
 name = "receipt-ledger"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "MIT"
 description = "Transaction-notification-email → Firefly III ingestor (one-shot CronJob)"
@@ -12,6 +12,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# OAuth2 token request bodies (application/x-www-form-urlencoded). reqwest is
+# built without its `urlencoded` feature, so we encode the form ourselves; this
+# crate is already in the tree transitively via reqwest.
+serde_urlencoded = "0.7"
 rust_decimal = { version = "1", features = ["serde-with-str"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 sha2 = "0.10"

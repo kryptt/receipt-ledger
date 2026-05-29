@@ -82,7 +82,19 @@ pub async fn run() -> Result<Summary> {
     // FX over the shared client; converts foreign charges into the target
     // account's currency before booking. An FX error propagates from `submit`
     // and routes the message to Review (never books at a wrong amount).
-    let fx = FxClient::new(&http, &cfg.fx_url);
+    let mut fx = FxClient::new(&http, &cfg.fx_url);
+    // Frankfurter has no Dominican Peso; attach Banco Popular's consultaTasa as a
+    // DOP override when its credentials are configured.
+    if let Some(d) = &cfg.dop_rate {
+        fx = fx.with_dop(crate::fx::DopRate::new(
+            &http,
+            &d.rates_url,
+            &d.token_url,
+            &d.client_id,
+            &d.client_secret,
+            &d.scope,
+        ));
+    }
     let firefly = FireflyClient::new(
         &http,
         &cfg.firefly_url,

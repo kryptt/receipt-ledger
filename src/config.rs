@@ -36,6 +36,17 @@ const DEFAULT_FIREFLY_URL: &str = "http://firefly:8080";
 /// [`crate::fx::DEFAULT_FX_URL`]; kept as a literal here so config has no
 /// compile-time dependency on the fx module.
 const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
+/// Default Banco Popular `BPDConsultaTasa` rates endpoint (IBM API Connect
+/// sandbox) — the full `consultaTasa` URL. Production and development share this
+/// host per the OpenAPI `servers` block. Override with `RECEIPT_DOP_RATES_URL`.
+const DEFAULT_DOP_RATES_URL: &str =
+    "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/consultatasa/consultaTasa";
+/// Default OAuth2 token endpoint (client-credentials grant) for the DOP rates
+/// API. Override with `RECEIPT_DOP_TOKEN_URL`.
+const DEFAULT_DOP_TOKEN_URL: &str =
+    "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/bpd/Authentication/oauth2/token";
+/// Default OAuth2 scope for the DOP rates API. Override with `RECEIPT_DOP_SCOPE`.
+const DEFAULT_DOP_SCOPE: &str = "scope_1";
 const DEFAULT_PROCESSED_MAILBOX: &str = "Processed";
 const DEFAULT_REVIEW_MAILBOX: &str = "Review";
 
@@ -111,6 +122,10 @@ pub struct Config {
     /// booking. An FX failure routes the message to Review rather than booking
     /// the foreign number as the account currency.
     pub fx_url: String,
+    /// Banco Popular DOP-rate provider (`BPDConsultaTasa`). `None` when its
+    /// credentials are unset — DOP conversions then fall through to Frankfurter
+    /// (which has no DOP) and route to Review. See [`DopRateConfig`].
+    pub dop_rate: Option<DopRateConfig>,
     /// PayPal Balance account in Firefly (asset, USD), by numeric id. Required:
     /// a PayPal record whose funding is *not* a credit product books here, so
     /// this is the safe default and must always be present.
@@ -181,6 +196,7 @@ impl Config {
             firefly_url: env_or("RECEIPT_FIREFLY_URL", DEFAULT_FIREFLY_URL),
             firefly_token: required("FIREFLY_III_ACCESS_TOKEN")?,
             fx_url: env_or("RECEIPT_FX_URL", DEFAULT_FX_URL),
+            dop_rate: dop_rate_from_env()?,
             // No sensible default — the safe-default PayPal account must always
             // point at a real numeric Firefly account id.
             paypal_balance_account: account_required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,
@@ -206,6 +222,38 @@ impl Config {
             processed_mailbox: env_or("RECEIPT_PROCESSED_MAILBOX", DEFAULT_PROCESSED_MAILBOX),
             review_mailbox: env_or("RECEIPT_REVIEW_MAILBOX", DEFAULT_REVIEW_MAILBOX),
         })
+    }
+}
+
+/// Credentials + endpoints for the Banco Popular `BPDConsultaTasa` DOP-rate API.
+/// Present only when both `RECEIPT_DOP_CLIENT_ID` and `RECEIPT_DOP_CLIENT_SECRET`
+/// are set (URLs and scope default to the sandbox values). The client id doubles
+/// as the OAuth2 client id *and* the `X-IBM-Client-Id` header.
+#[derive(Debug, Clone)]
+pub struct DopRateConfig {
+    pub rates_url: String,
+    pub token_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scope: String,
+}
+
+/// Build [`DopRateConfig`] from the environment. Absent credentials → `None`
+/// (DOP support disabled). Exactly one of id/secret set is a hard error — a
+/// half-configured provider must fail loudly, not silently disable DOP.
+fn dop_rate_from_env() -> Result<Option<DopRateConfig>> {
+    match (optional("RECEIPT_DOP_CLIENT_ID"), optional("RECEIPT_DOP_CLIENT_SECRET")) {
+        (None, None) => Ok(None),
+        (Some(client_id), Some(client_secret)) => Ok(Some(DopRateConfig {
+            rates_url: env_or("RECEIPT_DOP_RATES_URL", DEFAULT_DOP_RATES_URL),
+            token_url: env_or("RECEIPT_DOP_TOKEN_URL", DEFAULT_DOP_TOKEN_URL),
+            client_id,
+            client_secret,
+            scope: env_or("RECEIPT_DOP_SCOPE", DEFAULT_DOP_SCOPE),
+        })),
+        _ => anyhow::bail!(
+            "RECEIPT_DOP_CLIENT_ID and RECEIPT_DOP_CLIENT_SECRET must be set together (or neither)"
+        ),
     }
 }
 
