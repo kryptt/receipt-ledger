@@ -23,7 +23,7 @@
 //! earlier charge consumed its match (which would double-book). Two charges that
 //! contend for one journal route to Review, not to a duplicate booking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -184,38 +184,18 @@ pub fn reconcile(
         }
     }
     let mut winner: HashMap<usize, usize> = HashMap::new(); // charge → journal
-    let mut conflict: HashMap<usize, String> = HashMap::new(); // charge → reason
-    for (ji, mut claimants) in claims {
+    let mut conflict: HashMap<usize, String> = HashMap::new(); // charge → review reason
+    let mut book: HashSet<usize> = HashSet::new(); // cluster losers that are genuinely new
+    for (ji, claimants) in claims {
         if claimants.len() == 1 {
             winner.insert(claimants[0].0, ji);
             continue;
         }
-        // Highest score wins only if it clears the runner-up by `score_epsilon`;
-        // otherwise the journal is too contested to assign → everyone reviews.
-        // Tie-break on charge index so the contest is fully deterministic (not
-        // reliant on sort stability + input order).
-        claimants.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
-        let clear = claimants[0].1 - claimants[1].1 >= p.score_epsilon;
-        if clear {
-            winner.insert(claimants[0].0, ji);
-            for &(ci, _) in &claimants[1..] {
-                conflict.insert(
-                    ci,
-                    format!("a better-matching charge claims journal {}; not booked", journals[ji].id),
-                );
-            }
-        } else {
-            for &(ci, _) in &claimants {
-                conflict.insert(
-                    ci,
-                    format!("multiple charges contend for journal {} (ambiguous); not booked", journals[ji].id),
-                );
-            }
-        }
+        // Multiple charges of the same merchant claim one journal (the journal is
+        // one charge; the others are separate purchases at the same merchant).
+        // Disambiguate by AMOUNT: the claimant whose amount is *clearly* nearest
+        // the journal's is the match; the rest are different charges.
+        resolve_cluster(ji, &claimants, charges, journals, p, aliases, &mut winner, &mut conflict, &mut book);
     }
 
     // --- 2c. apply -------------------------------------------------------
@@ -225,11 +205,13 @@ pub fn reconcile(
             amount_verdict(&charges[ci], &journals[ji], p.amount_tolerance)
         } else if let Some(reason) = conflict.remove(&ci) {
             ChargeOutcome::Review { reason }
+        } else if book.contains(&ci) {
+            ChargeOutcome::BookNew
         } else {
             match intent {
                 Intent::Book => ChargeOutcome::BookNew,
                 Intent::Review(reason) => ChargeOutcome::Review { reason },
-                Intent::Claim { .. } => unreachable!("every Claim is resolved into winner/conflict"),
+                Intent::Claim { .. } => unreachable!("every Claim is resolved into winner/conflict/book"),
             }
         };
         outcome[ci] = Some(decided);
@@ -298,6 +280,86 @@ fn intent_for(
         ));
     }
     Intent::Claim { journal: best_j, score: best_s }
+}
+
+/// Disambiguate several same-merchant charges that all claim one journal, by
+/// amount. The journal is exactly one charge; the claimant whose amount is
+/// *clearly* nearest the journal's is that charge (winner), and the rest are
+/// separate purchases at the same merchant — booked as new when they have no
+/// other plausible journal, else routed to review (the double-book guard). If no
+/// claimant is clearly nearest, the whole cluster routes to review.
+#[allow(clippy::too_many_arguments)]
+fn resolve_cluster(
+    journal: usize,
+    claimants: &[(usize, f64)],
+    charges: &[StatementTxn],
+    journals: &[ExistingJournal],
+    p: &ReconcileParams,
+    aliases: &[(String, String)],
+    winner: &mut HashMap<usize, usize>,
+    conflict: &mut HashMap<usize, String>,
+    book: &mut HashSet<usize>,
+) {
+    let jamt = journals[journal].amount.amount.value();
+    let mut by_dist: Vec<(usize, Decimal)> = claimants
+        .iter()
+        .map(|&(ci, _)| (ci, (charges[ci].money.amount.value() - jamt).abs()))
+        .collect();
+    by_dist.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+
+    let (near_ci, near_d) = by_dist[0];
+    let (_, second_d) = by_dist[1];
+    // Strictly within half the runner-up's distance, and a sane fraction of the
+    // journal amount (absorbs the ECB-estimate vs billed gap without confirming a
+    // far-off amount).
+    let clearly_nearest = near_d * Decimal::from(2) < second_d;
+    let within_sanity =
+        jamt > Decimal::ZERO && near_d * Decimal::from(100) <= jamt * Decimal::from(15);
+
+    if clearly_nearest && within_sanity {
+        winner.insert(near_ci, journal);
+        for &(ci, _) in claimants.iter().filter(|&&(c, _)| c != near_ci) {
+            if has_other_candidate(&charges[ci], journals, journal, p, aliases) {
+                conflict.insert(
+                    ci,
+                    format!(
+                        "same-merchant cluster loser with another plausible journal {}; not booked",
+                        journals[journal].id
+                    ),
+                );
+            } else {
+                book.insert(ci);
+            }
+        }
+    } else {
+        for &(ci, _) in claimants {
+            conflict.insert(
+                ci,
+                format!(
+                    "multiple charges contend for journal {} (amount-ambiguous); not booked",
+                    journals[journal].id
+                ),
+            );
+        }
+    }
+}
+
+/// Whether `charge` has *another* plausible journal besides `exclude` (same
+/// currency, within the date window, merchant similarity ≥ gray) — so a cluster
+/// loser is only booked-new when nothing else could be its duplicate.
+fn has_other_candidate(
+    charge: &StatementTxn,
+    journals: &[ExistingJournal],
+    exclude: usize,
+    p: &ReconcileParams,
+    aliases: &[(String, String)],
+) -> bool {
+    journals.iter().enumerate().any(|(i, j)| {
+        i != exclude
+            && same_currency(charge, j)
+            && within_window(charge.auth_date, j.date, p.date_window_days)
+            && merchant_similarity(&charge.merchant, &j.merchant, aliases) >= p.merchant_gray
+    })
 }
 
 /// Confirmed vs AmountMismatch, by the tolerance band (from [`ReconcileParams`]).
@@ -634,6 +696,44 @@ mod tests {
             r.charges[0].1
         );
         assert!(r.unmatched_journals.is_empty());
+    }
+
+    /// The real NAGANO case: 3 same-merchant statement rows claim 1 consumo
+    /// journal (an ECB estimate near the 33.33 billed). Amount disambiguates:
+    /// the 33.33 row matches the journal (amount differs → mismatch, to correct),
+    /// the other two are separate purchases → booked new. Previously all 3 → Review.
+    #[test]
+    fn cluster_disambiguates_by_amount() {
+        let journals = [journal("J964", "NAGANO DENTETSU", "32.27", 21)];
+        let charges = [
+            charge("0601000001", "NAGANO DENTETSU NAGANO", "33.33", 21),
+            charge("0601000002", "NAGANO DENTETSU NAGANO", "6.66", 23),
+            charge("0601000003", "NAGANO DENTETSU NAGANO", "28.45", 22),
+        ];
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
+        assert!(
+            matches!(r.charges[0].1, ChargeOutcome::AmountMismatch { .. }),
+            "nearest-amount row matches the journal: {:?}",
+            r.charges[0].1
+        );
+        assert_eq!(r.charges[1].1, ChargeOutcome::BookNew);
+        assert_eq!(r.charges[2].1, ChargeOutcome::BookNew);
+        assert!(r.unmatched_journals.is_empty(), "journal consumed by the amount match");
+    }
+
+    /// Cluster where two charges are equidistant from the journal — no clear
+    /// nearest → safe fallback to Review (never an arbitrary confirm/book).
+    #[test]
+    fn cluster_amount_ambiguous_all_review() {
+        let journals = [journal("J1", "CAFE MOCHA", "10.00", 21)];
+        let charges = [
+            charge("0601000001", "CAFE MOCHA TOKYO", "9.00", 21),
+            charge("0601000002", "CAFE MOCHA TOKYO", "11.00", 21),
+        ];
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
+        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
+        assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
+        assert!(!kinds(&r).contains(&"book"), "ambiguous cluster never books");
     }
 
     /// With an alias rule, even names that share *no* tokens canonicalize to the
