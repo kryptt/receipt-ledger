@@ -394,10 +394,17 @@ to Phase 2).
   cluster → Review, prior-`bpstmt:`-booking confirm (re-run idempotency), and unmatched-journal
   audit. 8 unit tests. Thresholds in `ReconcileParams` (default `merchant≥0.85`, `W=5d`) —
   documented as calibration-pending (Phase-0 couldn't tune them).
-- ⏭️ **Remaining**: JMAP attachment fetch (§3.3), `classify_message` + `run()` branch (§3.2),
-  config env (§4), `FireflyClient::list_transactions` (map API JSON → `ExistingJournal`) +
-  `ValidatedTransfer` transfer booking (§3.6/3.7), wiring the matcher into the pipeline + booking
-  the `BookNew` rows via `to_extracted`, closing-balance check (needs the XObject fix above).
+- ✅ **Firefly read** (`firefly.rs::list_transactions`): paginated `GET …/accounts/{id}/transactions`
+  → `ExistingJournal`s (receipt-ledger-tagged only), pure `parse_transactions_page` + tests.
+- ✅ **Transfer write path** (payments): `ValidatedTransfer` gate (`validate.rs`) +
+  `FireflyClient::submit_transfer` (currency-routed paying→card, no FX) + the two
+  `RECEIPT_BP_PAYING_{USD,DOP}_ACCOUNT` config vars (optional-with-Review). Charge booking already
+  works via `to_extracted`→`validate`→`submit`.
+- ⏭️ **Remaining (final wiring)**: JMAP attachment fetch (§3.3, per-part blob + `FetchedMessage`
+  attachment metadata), `classify_message` + the `run()` statement branch (§3.2) that drives
+  detect→decrypt→parse→reconcile→book charges (`BookNew`)+payments(transfers)→report→route, apply
+  `RECEIPT_MAX_AMOUNT` to the statement path, and the closing-balance check (needs the `Op::XObject`
+  footer fix for `balance_total`).
 
 ### Phase 2 — independent, separately-shippable items (review #15), each tagged by goal
 - **(a) Amount auto-correction** — *parity goal*: auto-correct foreign-charge amounts to the
