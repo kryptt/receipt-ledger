@@ -400,11 +400,19 @@ to Phase 2).
   `FireflyClient::submit_transfer` (currency-routed paying→card, no FX) + the two
   `RECEIPT_BP_PAYING_{USD,DOP}_ACCOUNT` config vars (optional-with-Review). Charge booking already
   works via `to_extracted`→`validate`→`submit`.
-- ⏭️ **Remaining (final wiring)**: JMAP attachment fetch (§3.3, per-part blob + `FetchedMessage`
-  attachment metadata), `classify_message` + the `run()` statement branch (§3.2) that drives
-  detect→decrypt→parse→reconcile→book charges (`BookNew`)+payments(transfers)→report→route, apply
-  `RECEIPT_MAX_AMOUNT` to the statement path, and the closing-balance check (needs the `Op::XObject`
-  footer fix for `balance_total`).
+- ✅ **JMAP attachment fetch** (`jmap.rs`): `FetchedMessage.attachments` (`Attachment`/`is_pdf`) via
+  `Property::Attachments`; `Mailbox::download` for the PDF blob.
+- ✅ **Pipeline wiring** (`statement/pipeline.rs` + `run()`): pure `classify_message`, `StatementReport`,
+  and `process_statement` (download→decrypt→parse→per-section reconcile→book charges via
+  `to_extracted`→`validate`→USD-ceiling→`submit`, payments via `validate_transfer`→`submit_transfer`).
+  Per-row failures → review (never abort); any flag → message to Review, else Processed. `run()`
+  branches per message and folds the report into `Summary`. Shared `usd_ceiling_review` helper
+  (de-dups the notification path's inline ceiling). Config: `RECEIPT_BP_STATEMENT_PASSWORD` +
+  `RECEIPT_BP_STATEMENT_SENDER`. 198 tests, clippy clean, reviewed 3×.
+- ⏭️ **Remaining for Phase 1**: (1) `Op::XObject` recursion in `pdf.rs` so `balance_total` parses,
+  then the **closing-balance check** in `process_statement`; (2) **deployment** — fleet manifest env
+  vars + sealed `RECEIPT_BP_STATEMENT_PASSWORD`, container version bump/build/tag, Renovate note;
+  (3) a **dry-run / careful first cycle** before it books real transactions unattended.
 
 ### Phase 2 — independent, separately-shippable items (review #15), each tagged by goal
 - **(a) Amount auto-correction** — *parity goal*: auto-correct foreign-charge amounts to the
