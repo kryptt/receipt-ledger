@@ -93,6 +93,20 @@ impl Currency {
         }
     }
 
+    /// Mint a currency from a statically-known-valid code, skipping the parse
+    /// path. For *compile-time* constants only (e.g. an account's fixed booking
+    /// currency) — never for untrusted input, which must go through
+    /// [`Currency::parse`]. Debug-asserts the invariant so a typo'd literal
+    /// fails fast in tests.
+    #[must_use]
+    pub(crate) fn from_static(code: &'static str) -> Self {
+        debug_assert!(
+            code.len() == 3 && code.bytes().all(|b| b.is_ascii_uppercase()),
+            "from_static given a non-canonical code: {code:?}"
+        );
+        Currency(code.to_string())
+    }
+
     /// The uppercase ISO code, e.g. `"EUR"`.
     #[must_use]
     pub fn as_str(&self) -> &str {

@@ -14,6 +14,7 @@ pub mod jmap;
 pub mod llm;
 pub mod model_selection;
 pub mod schema;
+pub mod statement;
 pub mod unwrap;
 pub mod usd_ceiling;
 pub mod validate;

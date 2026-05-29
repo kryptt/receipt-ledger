@@ -31,6 +31,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 jmap-client = { version = "0.4", default-features = false, features = ["async", "ring"] }
 mail-parser = "0.11"
 
+# Pure-Rust PDF decryption + content-stream parsing for Banco Popular monthly
+# statements (RC4/Standard-encrypted). Chosen over lopdf, which fails to load
+# these real-world statements (its xref parser populates only 1 object); `pdf`
+# opens + decrypts them cleanly. We track the CTM + text matrix across the page
+# operations to recover positioned text and reassemble the statement columns.
+pdf = "0.9"
+# Fuzzy merchant-name similarity for reconciling statement rows against charges
+# already booked from consumo notifications: foreign-charge amounts never match
+# exactly (ECB estimate vs billed), so merchant similarity is a key signal.
+strsim = "0.11"
+
 [dev-dependencies]
 # Property-based testing for the pure deterministic core (amount parsing, FX
 # rounding reconciliation, dedup invariants, balanced-span round-trip).
