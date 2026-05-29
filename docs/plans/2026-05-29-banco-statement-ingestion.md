@@ -409,10 +409,23 @@ to Phase 2).
   branches per message and folds the report into `Summary`. Shared `usd_ceiling_review` helper
   (de-dups the notification path's inline ceiling). Config: `RECEIPT_BP_STATEMENT_PASSWORD` +
   `RECEIPT_BP_STATEMENT_SENDER`. 198 tests, clippy clean, reviewed 3×.
-- ⏭️ **Remaining for Phase 1**: (1) `Op::XObject` recursion in `pdf.rs` so `balance_total` parses,
-  then the **closing-balance check** in `process_statement`; (2) **deployment** — fleet manifest env
-  vars + sealed `RECEIPT_BP_STATEMENT_PASSWORD`, container version bump/build/tag, Renovate note;
-  (3) a **dry-run / careful first cycle** before it books real transactions unattended.
+- ✅ **`Op::XObject` recursion + closing-balance check**: `pdf.rs` recurses into Form XObjects
+  (the footer summary lives in one) so `BALANCE TOTAL` parses; `BALANCE ANTERIOR` parsed from the
+  card row; `process_statement` runs the internal-consistency check `anterior + Σcharges − Σpayments
+  ?= total`, logs the breakdown, flags `balance_mismatch` beyond 0.01 (interest/fees not modeled →
+  a read-this signal).
+- ✅ **Dry-run** (`RECEIPT_DRY_RUN`): no Firefly writes / no mailbox moves / no JMAP state advance;
+  logs the full per-row plan at `info` (debug in prod). Threaded through both pipeline paths.
+- ⏭️ **Remaining for Phase 1 = deployment + observation** (code is complete; 198 tests, reviewed 4×):
+  1. Fleet manifest (`fleet/home/receipt-ledger.yaml`): add `RECEIPT_BP_STATEMENT_SENDER`,
+     `RECEIPT_BP_PAYING_{USD,DOP}_ACCOUNT` (need the two Firefly account ids), sealed
+     `RECEIPT_BP_STATEMENT_PASSWORD` (kubeseal into `sealed-receipt-ledger.yaml`), `RECEIPT_DRY_RUN`
+     toggle.
+  2. Push branch + cut a release tag → ghcr image build → bump `image:` tag.
+  3. **Dry-run observation sequence** (order matters — statement currently in **Review**, not INBOX):
+     enable `RECEIPT_DRY_RUN=1` + deploy → move the statement back to INBOX → trigger one run →
+     read the plan in Loki/`kubectl logs` → then disable dry-run for the real cycle. (Don't leave
+     dry-run on standing: it never advances JMAP state, so it would re-LLM the whole INBOX hourly.)
 
 ### Phase 2 — independent, separately-shippable items (review #15), each tagged by goal
 - **(a) Amount auto-correction** — *parity goal*: auto-correct foreign-charge amounts to the
