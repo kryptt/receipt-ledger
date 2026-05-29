@@ -132,6 +132,14 @@ pub struct Config {
     /// source of a DOP-card statement payment booked as a transfer. `None` when
     /// unconfigured; a DOP payment row then routes to Review.
     pub bp_paying_dop_account: Option<AccountId>,
+    /// Static password for the Banco Popular monthly-statement PDF (a SealedSecret
+    /// in deployment). `None` disables statement ingestion — a statement-looking
+    /// message then routes to Review rather than failing.
+    pub bp_statement_password: Option<String>,
+    /// Substring identifying who forwards the statement (e.g. the forwarding
+    /// address). Combined with a PDF attachment to classify a message as a
+    /// statement. `None` falls back to subject-based detection only.
+    pub bp_statement_sender: Option<String>,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -177,6 +185,8 @@ impl Config {
             // — absent means the matching payment rows route to Review.
             bp_paying_usd_account: account_optional("RECEIPT_BP_PAYING_USD_ACCOUNT")?,
             bp_paying_dop_account: account_optional("RECEIPT_BP_PAYING_DOP_ACCOUNT")?,
+            bp_statement_password: optional("RECEIPT_BP_STATEMENT_PASSWORD"),
+            bp_statement_sender: optional("RECEIPT_BP_STATEMENT_SENDER"),
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,

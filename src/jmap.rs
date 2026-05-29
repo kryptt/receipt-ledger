@@ -24,6 +24,31 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
+/// One attachment part of a message, reduced to what classification + the
+/// statement path need. The `blob_id` is downloaded on demand via
+/// [`Mailbox::download`].
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub blob_id: String,
+    pub content_type: Option<String>,
+    pub name: Option<String>,
+    pub size: usize,
+}
+
+impl Attachment {
+    /// Whether this part is a PDF (by content-type or `.pdf` name).
+    #[must_use]
+    pub fn is_pdf(&self) -> bool {
+        self.content_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("application/pdf"))
+            || self
+                .name
+                .as_deref()
+                .is_some_and(|n| n.to_ascii_lowercase().ends_with(".pdf"))
+    }
+}
+
 /// A message fetched from the INBOX, reduced to what the pipeline needs.
 #[derive(Debug, Clone)]
 pub struct FetchedMessage {
@@ -37,6 +62,8 @@ pub struct FetchedMessage {
     pub from: Option<String>,
     /// Decoded `text/plain` body — input to the forward-unwrap step.
     pub text: String,
+    /// Attachment metadata (e.g. a statement PDF). Bodies are fetched lazily.
+    pub attachments: Vec<Attachment>,
 }
 
 /// Connected JMAP session with the three mailbox ids we route between.
@@ -157,6 +184,7 @@ impl Mailbox {
             Property::From,
             Property::TextBody,
             Property::BodyValues,
+            Property::Attachments,
         ]);
         // Body-value fetching is a `GetArguments` concern, reached via
         // `arguments()`. Forwarded receipts are small; cap to bound responses.
@@ -192,12 +220,35 @@ impl Mailbox {
             }
         }
 
+        let attachments = email
+            .attachments()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|a| {
+                a.blob_id().map(|blob_id| Attachment {
+                    blob_id: blob_id.to_string(),
+                    content_type: a.content_type().map(str::to_string),
+                    name: a.name().map(str::to_string),
+                    size: a.size(),
+                })
+            })
+            .collect();
+
         Ok(Some(FetchedMessage {
             id: id.to_string(),
             subject: email.subject().map(str::to_string),
             from: render_from(&email),
             text,
+            attachments,
         }))
+    }
+
+    /// Download a blob (e.g. a statement PDF attachment) by its `blob_id`.
+    pub async fn download(&self, blob_id: &str) -> Result<Vec<u8>> {
+        self.client
+            .download(blob_id)
+            .await
+            .with_context(|| format!("downloading blob {blob_id}"))
     }
 
     /// Move a message to the Processed mailbox.

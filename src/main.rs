@@ -30,6 +30,7 @@ async fn main() -> ExitCode {
                 duplicates = summary.duplicates,
                 review = summary.review,
                 skipped = summary.skipped,
+                statements = summary.statements,
                 "run complete"
             );
             ExitCode::SUCCESS

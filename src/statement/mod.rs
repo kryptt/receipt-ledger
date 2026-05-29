@@ -24,6 +24,7 @@
 
 pub mod parse;
 pub mod pdf;
+pub mod pipeline;
 pub mod reconcile;
 
 use chrono::NaiveDate;

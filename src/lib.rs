@@ -29,6 +29,7 @@ use crate::firefly::{FireflyClient, SubmitOutcome};
 use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
 use crate::llm::LlmClient;
+use crate::statement::pipeline::{Ingest, classify_message, process_statement};
 use crate::usd_ceiling::CeilingVerdict;
 use crate::validate::{Verdict, validate};
 
@@ -41,6 +42,9 @@ pub struct Summary {
     pub review: usize,
     /// Mail that was not a transaction at all (clean skip → Processed).
     pub skipped: usize,
+    /// Statement PDFs processed (their per-row tallies fold into the fields
+    /// above; this is just how many statement messages were handled).
+    pub statements: usize,
 }
 
 /// Run the full one-shot pipeline. Returns the run summary on success; an
@@ -91,6 +95,33 @@ pub async fn run() -> Result<Summary> {
     let mut summary = Summary::default();
     for msg in &messages {
         summary.processed += 1;
+
+        // A statement PDF takes the reconcile path; everything else is a
+        // per-transaction notification (the adapter path).
+        if classify_message(msg, cfg.bp_statement_sender.as_deref()) == Ingest::Statement {
+            summary.statements += 1;
+            match process_statement(msg, &mailbox, &firefly, &fx, &cfg).await {
+                Ok(report) => {
+                    summary.booked += report.booked_new + report.payments_booked;
+                    summary.duplicates += report.reconciled;
+                    summary.review += report.review + report.amount_mismatch + report.unmatched_booked;
+                    let clean = report.is_clean();
+                    if clean {
+                        info!(id = %msg.id, ?report, "statement clean → processed");
+                    } else {
+                        warn!(id = %msg.id, ?report, "statement has flags → review");
+                    }
+                    route(&mailbox, &msg.id, clean).await;
+                }
+                Err(e) => {
+                    summary.review += 1;
+                    warn!(id = %msg.id, error = ?e, "statement processing error; routing to review");
+                    route(&mailbox, &msg.id, false).await;
+                }
+            }
+            continue;
+        }
+
         match process_message(msg, &llm, &firefly, &fx, &cfg.validation).await {
             Ok(Disposition::Booked) => {
                 summary.booked += 1;
@@ -213,32 +244,16 @@ async fn process_message(
         match validate(record) {
             Verdict::Booked(validated) => {
                 // 5b. USD-equivalent ceiling (`RECEIPT_MAX_AMOUNT`). FX-dependent,
-                //     so it lives here in the async pipeline rather than in the
-                //     pure `validate` gate: convert the charge to USD with a live
-                //     rate and route to Review if it exceeds the ceiling. An FX
-                //     failure here routes to Review (never books an unscreened
-                //     large amount). Skip the lookup entirely when no ceiling is
-                //     set — the common case — to avoid a needless FX call.
-                if let Some(ceiling) = policy.max_amount {
-                    let extracted = validated.as_extracted();
-                    let rate = fx
-                        .rate(extracted.currency().as_str(), "USD", extracted.date)
-                        .await
-                        .context("resolving FX rate for USD ceiling")?;
-                    match usd_ceiling::check(extracted.amount().value(), rate, Some(ceiling)) {
-                        CeilingVerdict::Within { .. } => {}
-                        CeilingVerdict::Over {
-                            usd_equivalent,
-                            ceiling,
-                        } => {
-                            review_reason.get_or_insert(format!(
-                                "amount ≈ ${} (>{} USD) — routed to review",
-                                usd_equivalent.round_dp(2).normalize(),
-                                ceiling.normalize()
-                            ));
-                            continue;
-                        }
-                    }
+                //     so it lives in the async pipeline, not the pure `validate`
+                //     gate. An FX failure propagates as `Err` (→ Review), never
+                //     books an unscreened large amount.
+                let ext = validated.as_extracted();
+                if let Some(reason) =
+                    usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date)
+                        .await?
+                {
+                    review_reason.get_or_insert(reason);
+                    continue;
                 }
 
                 // 6. Dedup key. 7. Submit to Firefly.
@@ -261,6 +276,35 @@ async fn process_message(
     } else {
         Disposition::Review(review_reason.unwrap_or_else(|| "no record booked".to_string()))
     })
+}
+
+/// Apply the USD-equivalent ceiling (`RECEIPT_MAX_AMOUNT`) to one record's
+/// money. Returns `Ok(None)` when within the ceiling (or no ceiling set), or
+/// `Ok(Some(reason))` when it exceeds and should route to Review. FX-dependent,
+/// hence async and out of the pure `validate` gate. Shared by the notification
+/// and statement paths so there is one ceiling implementation.
+pub(crate) async fn usd_ceiling_review(
+    fx: &FxClient<'_>,
+    policy: &ValidationPolicy,
+    currency: &str,
+    amount: rust_decimal::Decimal,
+    date: chrono::NaiveDate,
+) -> Result<Option<String>> {
+    let Some(ceiling) = policy.max_amount else {
+        return Ok(None);
+    };
+    let rate = fx
+        .rate(currency, "USD", date)
+        .await
+        .context("resolving FX rate for USD ceiling")?;
+    match usd_ceiling::check(amount, rate, Some(ceiling)) {
+        CeilingVerdict::Within { .. } => Ok(None),
+        CeilingVerdict::Over { usd_equivalent, ceiling } => Ok(Some(format!(
+            "amount ≈ ${} (>{} USD) — routed to review",
+            usd_equivalent.round_dp(2).normalize(),
+            ceiling.normalize()
+        ))),
+    }
 }
 
 /// Move a message, logging (but not failing the run) on error — the

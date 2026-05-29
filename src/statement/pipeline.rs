@@ -1,0 +1,342 @@
+//! Statement ingestion pipeline: detect → decrypt → parse → reconcile → book.
+//!
+//! This is the I/O glue that joins the pure pieces ([`super::pdf`],
+//! [`super::parse`], [`super::reconcile`]) to the live mailbox + Firefly. It is
+//! invoked from [`crate::run`] for messages [`classify_message`] tags as a
+//! statement (a PDF attachment from the configured forwarder / a `Cuenta:`
+//! subject), and returns a [`StatementReport`] the caller turns into a
+//! Processed/Review disposition.
+//!
+//! Money safety is unchanged from the notification path: charges book through
+//! `to_extracted` → [`crate::validate::validate`] → the USD ceiling →
+//! `firefly.submit`; payments through [`crate::validate::validate_transfer`] →
+//! `firefly.submit_transfer`. Anything not confidently bookable counts toward
+//! review, and any flag (mismatch, unmatched journal, review) sends the whole
+//! statement to the Review mailbox.
+
+use anyhow::{Result, anyhow};
+use chrono::Duration;
+use tracing::{info, warn};
+
+use super::reconcile::{ChargeOutcome, ReconcileParams, reconcile};
+use super::{SectionCurrency, StatementTxn, parse, pdf};
+use crate::config::Config;
+use crate::firefly::{FireflyClient, SubmitOutcome};
+use crate::fx::FxClient;
+use crate::jmap::{FetchedMessage, Mailbox};
+use crate::schema::Direction;
+use crate::validate::{TransferVerdict, Verdict, validate, validate_transfer};
+
+/// How a message should be ingested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ingest {
+    /// A per-transaction notification (the existing adapter path).
+    Notification,
+    /// A monthly statement PDF (this module).
+    Statement,
+}
+
+/// Classify a message by attachment + sender/subject. Pure. A statement is a
+/// message carrying a PDF attachment that also looks like a Banco Popular
+/// statement — either forwarded by the configured `sender_hint`, or with a
+/// `Cuenta:`/`Estado de Cuenta` subject. Everything else is a notification.
+#[must_use]
+pub fn classify_message(msg: &FetchedMessage, sender_hint: Option<&str>) -> Ingest {
+    let has_pdf = msg.attachments.iter().any(crate::jmap::Attachment::is_pdf);
+    if !has_pdf {
+        return Ingest::Notification;
+    }
+    let subject = msg.subject.as_deref().unwrap_or("").to_lowercase();
+    let subject_marks_statement = subject.contains("cuenta"); // "Cuenta:" / "Estado de Cuenta"
+    let from_matches = match (sender_hint, msg.from.as_deref()) {
+        (Some(hint), Some(from)) => from.to_lowercase().contains(&hint.to_lowercase()),
+        _ => false,
+    };
+    if subject_marks_statement || from_matches {
+        Ingest::Statement
+    } else {
+        Ingest::Notification
+    }
+}
+
+/// Tallies for one processed statement.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StatementReport {
+    /// Charges already booked from a consumo (or a prior statement run) and
+    /// confirmed — incl. Firefly duplicate responses on re-book.
+    pub reconciled: usize,
+    /// Matched but the statement amount differs from the booked estimate
+    /// (Phase 1 reports + reviews; Phase 2 auto-corrects).
+    pub amount_mismatch: usize,
+    /// Charges the notifications missed, newly booked from the statement.
+    pub booked_new: usize,
+    /// Payments booked as transfers (paying account → card).
+    pub payments_booked: usize,
+    /// Journals in the window with no matching statement charge (audit signal).
+    pub unmatched_booked: usize,
+    /// Rows that could not be confidently handled → human review.
+    pub review: usize,
+}
+
+impl StatementReport {
+    /// Whether the statement is fully clean (→ Processed). Any mismatch,
+    /// unmatched journal, or review item routes the message to Review.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.amount_mismatch == 0 && self.unmatched_booked == 0 && self.review == 0
+    }
+}
+
+/// Decrypt, parse, reconcile, and book one statement message. A fatal error
+/// (no password, no PDF, decrypt/parse failure) is returned as `Err` so the
+/// caller routes the whole message to Review; per-row problems are counted in
+/// the [`StatementReport`] and the run continues.
+pub async fn process_statement(
+    msg: &FetchedMessage,
+    mailbox: &Mailbox,
+    firefly: &FireflyClient<'_>,
+    fx: &FxClient<'_>,
+    cfg: &Config,
+) -> Result<StatementReport> {
+    let password = cfg
+        .bp_statement_password
+        .as_deref()
+        .ok_or_else(|| anyhow!("statement password (RECEIPT_BP_STATEMENT_PASSWORD) not configured"))?;
+    let pdf_att = msg
+        .attachments
+        .iter()
+        .find(|a| a.is_pdf())
+        .ok_or_else(|| anyhow!("message classified as statement but has no PDF attachment"))?;
+
+    let bytes = mailbox.download(&pdf_att.blob_id).await?;
+    let rows = pdf::extract_rows(bytes, password)?;
+    let parsed = parse::parse_statement(&rows)?;
+    info!(
+        sections = parsed.sections.len(),
+        txns = parsed.txns.len(),
+        "parsed statement"
+    );
+
+    let mut report = StatementReport::default();
+    let params = ReconcileParams::default();
+
+    for section in &parsed.sections {
+        let Some(account) = (match section.currency {
+            SectionCurrency::Usd => cfg.banco_popular_usd_account.as_ref(),
+            SectionCurrency::Dop => cfg.banco_popular_dop_account.as_ref(),
+        }) else {
+            let rows = parsed.txns.iter().filter(|t| t.section == section.currency).count();
+            warn!(currency = ?section.currency, rows, "no card account configured; section → review");
+            report.review += rows;
+            continue;
+        };
+
+        // Pull this account's prior bookings over the cycle window (auth dates
+        // precede the cut by up to ~a month; pad both ends).
+        let start = section.cut_date - Duration::days(45);
+        let end = section.cut_date + Duration::days(5);
+        let journals = firefly.list_transactions(account, start, end).await?;
+
+        let charges: Vec<StatementTxn> = parsed
+            .txns
+            .iter()
+            .filter(|t| t.section == section.currency && t.direction == Direction::Out)
+            .cloned()
+            .collect();
+        let payments: Vec<&StatementTxn> = parsed
+            .txns
+            .iter()
+            .filter(|t| t.section == section.currency && t.direction == Direction::In)
+            .collect();
+
+        let recon = reconcile(&charges, &journals, &params);
+        report.unmatched_booked += recon.unmatched_journals.len();
+
+        // recon.charges is positional with `charges`.
+        for ((_, outcome), charge) in recon.charges.iter().zip(&charges) {
+            match outcome {
+                ChargeOutcome::Confirmed { .. } => report.reconciled += 1,
+                ChargeOutcome::AmountMismatch { .. } => report.amount_mismatch += 1,
+                ChargeOutcome::Review { reason } => {
+                    info!(reference = charge.reference.as_str(), %reason, "charge → review");
+                    report.review += 1;
+                }
+                ChargeOutcome::BookNew => {
+                    book_charge(charge, section, firefly, fx, cfg, &mut report).await;
+                }
+            }
+        }
+
+        for payment in payments {
+            book_payment(payment, firefly, fx, cfg, &mut report).await;
+        }
+    }
+
+    info!(?report, "statement reconciliation complete");
+    Ok(report)
+}
+
+/// Book a not-yet-present charge via the canonical gate, tallying the outcome.
+/// A per-row failure is logged + counted as review, never aborts the statement.
+async fn book_charge(
+    charge: &StatementTxn,
+    section: &super::Section,
+    firefly: &FireflyClient<'_>,
+    fx: &FxClient<'_>,
+    cfg: &Config,
+    report: &mut StatementReport,
+) {
+    let extracted = charge.to_extracted(&section.primary_last4);
+    let validated = match validate(extracted) {
+        Verdict::Booked(v) => v,
+        Verdict::Review { reason } => {
+            info!(reference = charge.reference.as_str(), %reason, "BookNew failed validate → review");
+            report.review += 1;
+            return;
+        }
+    };
+    let ext = validated.as_extracted();
+    match crate::usd_ceiling_review(fx, &cfg.validation, ext.currency().as_str(), ext.amount().value(), ext.date).await {
+        Ok(Some(reason)) => {
+            info!(reference = charge.reference.as_str(), %reason, "BookNew over ceiling → review");
+            report.review += 1;
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(reference = charge.reference.as_str(), error = ?e, "ceiling FX failed → review");
+            report.review += 1;
+            return;
+        }
+    }
+    let external_id = crate::dedup::external_id(validated.as_extracted());
+    match firefly.submit(&validated, &external_id).await {
+        Ok(SubmitOutcome::Created) => report.booked_new += 1,
+        Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
+        Err(e) => {
+            warn!(reference = charge.reference.as_str(), error = ?e, "BookNew submit failed → review");
+            report.review += 1;
+        }
+    }
+}
+
+/// Book a statement payment as a transfer (paying account → card), tallying the
+/// outcome. Per-row failures are counted as review, never abort the statement.
+async fn book_payment(
+    payment: &StatementTxn,
+    firefly: &FireflyClient<'_>,
+    fx: &FxClient<'_>,
+    cfg: &Config,
+    report: &mut StatementReport,
+) {
+    let external_id = format!("bpstmt:{}", payment.reference.as_str());
+    // Plausibility ceiling applies to transfers too (a crafted huge payment must
+    // not silently move money out of the savings account).
+    match crate::usd_ceiling_review(
+        fx,
+        &cfg.validation,
+        payment.money.currency.as_str(),
+        payment.money.amount.value(),
+        payment.auth_date,
+    )
+    .await
+    {
+        Ok(Some(reason)) => {
+            info!(reference = payment.reference.as_str(), %reason, "payment over ceiling → review");
+            report.review += 1;
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!(reference = payment.reference.as_str(), error = ?e, "payment ceiling FX failed → review");
+            report.review += 1;
+            return;
+        }
+    }
+    let transfer = match validate_transfer(
+        payment.money.clone(),
+        payment.auth_date,
+        payment.merchant.clone(),
+        external_id,
+    ) {
+        TransferVerdict::Booked(t) => t,
+        TransferVerdict::Review { reason } => {
+            info!(reference = payment.reference.as_str(), %reason, "payment failed transfer gate → review");
+            report.review += 1;
+            return;
+        }
+    };
+    match firefly.submit_transfer(&transfer).await {
+        Ok(SubmitOutcome::Created) => report.payments_booked += 1,
+        Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
+        Err(e) => {
+            warn!(reference = payment.reference.as_str(), error = ?e, "payment submit failed → review");
+            report.review += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jmap::Attachment;
+
+    fn msg(subject: &str, from: &str, attachments: Vec<Attachment>) -> FetchedMessage {
+        FetchedMessage {
+            id: "m1".into(),
+            subject: Some(subject.into()),
+            from: Some(from.into()),
+            text: String::new(),
+            attachments,
+        }
+    }
+    fn pdf_att() -> Attachment {
+        Attachment {
+            blob_id: "b".into(),
+            content_type: Some("application/pdf".into()),
+            name: Some("4173-XXXX-XXXX-7524.pdf".into()),
+            size: 42715,
+        }
+    }
+    fn other_att() -> Attachment {
+        Attachment {
+            blob_id: "b".into(),
+            content_type: Some("image/png".into()),
+            name: Some("logo.png".into()),
+            size: 10,
+        }
+    }
+
+    #[test]
+    fn pdf_with_cuenta_subject_is_statement() {
+        let m = msg("Fwd: Cuenta: ****-****-****-7524 | Fecha: 22/05/2026", "rhansen@kitsd.com", vec![pdf_att()]);
+        assert_eq!(classify_message(&m, None), Ingest::Statement);
+    }
+
+    #[test]
+    fn pdf_from_configured_sender_is_statement() {
+        let m = msg("monthly", "rhansen@kitsd.com", vec![pdf_att()]);
+        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Statement);
+    }
+
+    #[test]
+    fn pdf_without_marker_is_notification() {
+        let m = msg("here is a receipt", "someone@example.com", vec![pdf_att()]);
+        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Notification);
+    }
+
+    #[test]
+    fn no_pdf_is_notification_even_with_cuenta_subject() {
+        let m = msg("Cuenta: 123", "rhansen@kitsd.com", vec![other_att()]);
+        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Notification);
+    }
+
+    #[test]
+    fn report_clean_only_without_flags() {
+        let clean = StatementReport { reconciled: 5, booked_new: 2, payments_booked: 1, ..Default::default() };
+        assert!(clean.is_clean());
+        assert!(!StatementReport { amount_mismatch: 1, ..Default::default() }.is_clean());
+        assert!(!StatementReport { unmatched_booked: 1, ..Default::default() }.is_clean());
+        assert!(!StatementReport { review: 1, ..Default::default() }.is_clean());
+    }
+}
