@@ -129,6 +129,16 @@ pub async fn process_statement(
     let mut report = StatementReport::default();
     let params = ReconcileParams::default();
 
+    // Merchant alias map from a Firefly rule-group (canonicalizes both sides
+    // before fuzzy matching). Missing/failed lookup degrades to no aliases.
+    let aliases = match &cfg.bp_alias_rule_group {
+        Some(group) => firefly.fetch_alias_map(group).await.unwrap_or_else(|e| {
+            warn!(error = ?e, "alias map fetch failed; proceeding without aliases");
+            Vec::new()
+        }),
+        None => Vec::new(),
+    };
+
     for section in &parsed.sections {
         let Some(account) = (match section.currency {
             SectionCurrency::Usd => cfg.banco_popular_usd_account.as_ref(),
@@ -158,7 +168,7 @@ pub async fn process_statement(
             .filter(|t| t.section == section.currency && t.direction == Direction::In)
             .collect();
 
-        let recon = reconcile(&charges, &journals, &params);
+        let recon = reconcile(&charges, &journals, &params, &aliases);
         report.unmatched_booked += recon.unmatched_journals.len();
         for j in &recon.unmatched_journals {
             info!(journal = j.id, merchant = j.merchant, "unmatched Firefly journal (audit) → review");

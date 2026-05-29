@@ -434,6 +434,50 @@ impl<'a> FireflyClient<'a> {
         }
         Ok(out)
     }
+
+    /// Read the merchant-alias map from a Firefly rule-group identified by
+    /// `group_title`: each rule's `description_*` trigger value paired with its
+    /// `set_destination_account` action value (the canonical payee). The
+    /// reconciler applies these to both sides before fuzzy matching. Returns an
+    /// empty map (not an error) when the group doesn't exist.
+    pub async fn fetch_alias_map(&self, group_title: &str) -> Result<Vec<(String, String)>> {
+        let base = self.base_url.trim_end_matches('/');
+        // 1. resolve the group id by title.
+        let groups_body = self
+            .get_json(&format!("{base}/api/v1/rule-groups?limit=200"))
+            .await
+            .context("listing Firefly rule-groups")?;
+        let Some(group_id) = find_rule_group_id(&groups_body, group_title) else {
+            warn!(group = group_title, "alias rule-group not found; no merchant aliases applied");
+            return Ok(Vec::new());
+        };
+        // 2. read its rules and extract (trigger → canonical) pairs.
+        let rules_body = self
+            .get_json(&format!("{base}/api/v1/rule-groups/{group_id}/rules?limit=500"))
+            .await
+            .with_context(|| format!("listing rules in group {group_id}"))?;
+        let map = parse_alias_rules(&rules_body)?;
+        info!(group = group_title, aliases = map.len(), "loaded merchant alias map");
+        Ok(map)
+    }
+
+    /// GET a URL with auth + Accept, returning the body on 2xx (else an error).
+    async fn get_json(&self, url: &str) -> Result<String> {
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .context("sending Firefly GET")?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Firefly returned {status} for {url}: {body}");
+        }
+        Ok(body)
+    }
 }
 
 /// Firefly's transaction-list envelope: `{"data":[...], "meta":{"pagination":{...}}}`.
@@ -486,6 +530,85 @@ struct TxMeta {
 struct Pagination {
     #[serde(default)]
     total_pages: u32,
+}
+
+// --- rule-group / rules (merchant alias map) -------------------------------
+
+#[derive(Deserialize)]
+struct RuleGroupList {
+    #[serde(default)]
+    data: Vec<RuleGroupItem>,
+}
+#[derive(Deserialize)]
+struct RuleGroupItem {
+    id: String,
+    attributes: RuleGroupAttrs,
+}
+#[derive(Deserialize)]
+struct RuleGroupAttrs {
+    #[serde(default)]
+    title: String,
+}
+#[derive(Deserialize)]
+struct RuleList {
+    #[serde(default)]
+    data: Vec<RuleItem>,
+}
+#[derive(Deserialize)]
+struct RuleItem {
+    attributes: RuleAttrs,
+}
+#[derive(Deserialize)]
+struct RuleAttrs {
+    #[serde(default)]
+    triggers: Vec<RuleClause>,
+    #[serde(default)]
+    actions: Vec<RuleClause>,
+}
+#[derive(Deserialize)]
+struct RuleClause {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    value: String,
+}
+
+/// Find a rule-group's id by (case-insensitive) title. Pure.
+fn find_rule_group_id(body: &str, title: &str) -> Option<String> {
+    let list: RuleGroupList = serde_json::from_str(body).ok()?;
+    list.data
+        .into_iter()
+        .find(|g| g.attributes.title.eq_ignore_ascii_case(title))
+        .map(|g| g.id)
+}
+
+/// Extract `(lowercased description trigger → canonical payee)` pairs from a
+/// rules-list body: each rule's first `description_*` trigger and its
+/// `set_destination_account` action. Pure — unit-testable.
+fn parse_alias_rules(body: &str) -> Result<Vec<(String, String)>> {
+    let list: RuleList = serde_json::from_str(body).context("decoding Firefly rules JSON")?;
+    let mut map = Vec::new();
+    for rule in list.data {
+        let trigger = rule
+            .attributes
+            .triggers
+            .iter()
+            .find(|t| t.kind.starts_with("description_"))
+            .map(|t| t.value.trim().to_lowercase());
+        let canonical = rule
+            .attributes
+            .actions
+            .iter()
+            .find(|a| a.kind == "set_destination_account")
+            .map(|a| a.value.trim().to_string());
+        if let (Some(t), Some(c)) = (trigger, canonical)
+            && !t.is_empty()
+            && !c.is_empty()
+        {
+            map.push((t, c));
+        }
+    }
+    Ok(map)
 }
 
 /// Parse one page of the transaction-list response into [`ExistingJournal`]s
@@ -1332,6 +1455,24 @@ mod tests {
         let (js, _, skipped) = parse_transactions_page(body).unwrap();
         assert!(js.is_empty(), "malformed splits are skipped, not fatal");
         assert_eq!(skipped, 3, "skips are counted, not silently dropped");
+    }
+
+    #[test]
+    fn parses_alias_rules_and_finds_group() {
+        let groups = r#"{"data":[{"id":"7","attributes":{"title":"receipt-ledger-aliases"}},{"id":"3","attributes":{"title":"Other"}}]}"#;
+        assert_eq!(find_rule_group_id(groups, "receipt-ledger-aliases").as_deref(), Some("7"));
+        assert_eq!(find_rule_group_id(groups, "RECEIPT-LEDGER-ALIASES").as_deref(), Some("7"));
+        assert_eq!(find_rule_group_id(groups, "nope"), None);
+
+        let rules = r#"{"data":[
+          {"attributes":{"triggers":[{"type":"description_contains","value":"JOMPEAME"}],"actions":[{"type":"set_destination_account","value":"Jompeame"}]}},
+          {"attributes":{"triggers":[{"type":"description_contains","value":"NAGANO DENTETSU"}],"actions":[{"type":"set_category","value":"x"},{"type":"set_destination_account","value":"Nagano Dentetsu"}]}},
+          {"attributes":{"triggers":[{"type":"amount_more","value":"5"}],"actions":[{"type":"set_destination_account","value":"Skip"}]}}
+        ]}"#;
+        let map = parse_alias_rules(rules).unwrap();
+        assert_eq!(map.len(), 2, "only rules with a description trigger + set-destination action");
+        assert_eq!(map[0], ("jompeame".to_string(), "Jompeame".to_string()));
+        assert_eq!(map[1], ("nagano dentetsu".to_string(), "Nagano Dentetsu".to_string()));
     }
 
     #[test]

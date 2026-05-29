@@ -144,6 +144,11 @@ pub struct Config {
     /// Firefly writes, **no** mailbox moves, and **no** JMAP state advance — so a
     /// run can be repeated and observed (via logs) before booking for real.
     pub dry_run: bool,
+    /// Title of a Firefly rule-group whose `description_contains → set destination
+    /// account` rules define merchant aliases. The reconciler reads it and
+    /// applies the same canonicalization to both the statement merchant and the
+    /// booked journal before fuzzy matching. `None` disables alias lookup.
+    pub bp_alias_rule_group: Option<String>,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -192,6 +197,7 @@ impl Config {
             bp_statement_password: optional("RECEIPT_BP_STATEMENT_PASSWORD"),
             bp_statement_sender: optional("RECEIPT_BP_STATEMENT_SENDER"),
             dry_run: env_bool("RECEIPT_DRY_RUN"),
+            bp_alias_rule_group: optional("RECEIPT_BP_ALIAS_RULE_GROUP"),
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,

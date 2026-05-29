@@ -140,6 +140,7 @@ pub fn reconcile(
     charges: &[StatementTxn],
     journals: &[ExistingJournal],
     p: &ReconcileParams,
+    aliases: &[(String, String)],
 ) -> Reconciliation {
     debug_assert!(
         p.merchant_gray <= p.merchant_threshold,
@@ -172,7 +173,7 @@ pub fn reconcile(
         if outcome[ci].is_some() {
             continue;
         }
-        intents.push((ci, intent_for(charge, journals, &taken, p)));
+        intents.push((ci, intent_for(charge, journals, &taken, p, aliases)));
     }
 
     // --- 2b. resolve Claims globally: group by journal, pick a winner -------
@@ -255,6 +256,7 @@ fn intent_for(
     journals: &[ExistingJournal],
     taken: &[bool],
     p: &ReconcileParams,
+    aliases: &[(String, String)],
 ) -> Intent {
     let mut cands: Vec<(usize, f64)> = journals
         .iter()
@@ -264,7 +266,7 @@ fn intent_for(
                 && same_currency(charge, j)
                 && within_window(charge.auth_date, j.date, p.date_window_days)
         })
-        .map(|(i, j)| (i, merchant_similarity(&charge.merchant, &j.merchant)))
+        .map(|(i, j)| (i, merchant_similarity(&charge.merchant, &j.merchant, aliases)))
         .filter(|&(_, s)| s >= p.merchant_gray)
         .collect();
     // Deterministic order: score desc, then journal id asc (so equal-score ties
@@ -320,11 +322,54 @@ fn same_currency(charge: &StatementTxn, journal: &ExistingJournal) -> bool {
     charge.money.currency == journal.amount.currency
 }
 
-/// Merchant similarity in `[0,1]`, on normalised strings (lowercased,
-/// whitespace-collapsed). Jaro–Winkler rewards a shared prefix, which fits
-/// "JR EAST" vs "JR EAST SIBUYAKU".
-fn merchant_similarity(a: &str, b: &str) -> f64 {
-    jaro_winkler(&normalize_merchant(a), &normalize_merchant(b))
+/// Merchant similarity in `[0,1]`. Both names are first **canonicalized** via the
+/// alias map (the same Firefly `description_contains → set destination account`
+/// rules, applied here to both sides before scoring), then scored as the **max**
+/// of Jaro–Winkler (good for shared prefixes / typos) and asymmetric
+/// token-containment (good when one name is contained in the other, e.g.
+/// "jompeame" inside "donacion jompeame jompeame.com" — which Jaro–Winkler alone
+/// scores too low).
+fn merchant_similarity(a: &str, b: &str, aliases: &[(String, String)]) -> f64 {
+    let na = normalize_merchant(&canonicalize(a, aliases));
+    let nb = normalize_merchant(&canonicalize(b, aliases));
+    jaro_winkler(&na, &nb).max(token_containment(&na, &nb))
+}
+
+/// Apply the merchant alias map: if `name` (case-insensitive) contains a known
+/// trigger substring, return its canonical form. The map mirrors a Firefly
+/// rule-group, so the canonicalization Firefly applies to bookings is applied
+/// here to *both* the statement merchant and the journal before matching.
+/// Triggers are expected pre-lowercased.
+fn canonicalize(name: &str, aliases: &[(String, String)]) -> String {
+    let lower = name.to_lowercase();
+    for (trigger, canonical) in aliases {
+        if !trigger.is_empty() && lower.contains(trigger.as_str()) {
+            return canonical.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Asymmetric token overlap: the fraction of the *shorter* name's tokens present
+/// in the other. 1.0 when one name's tokens are a subset of the other's.
+fn token_containment(a: &str, b: &str) -> f64 {
+    let ta = tokens(a);
+    let tb = tokens(b);
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let (small, big) = if ta.len() <= tb.len() { (&ta, &tb) } else { (&tb, &ta) };
+    let hits = small.iter().filter(|t| big.contains(*t)).count();
+    hits as f64 / small.len() as f64
+}
+
+/// Split into alphanumeric tokens (≥2 chars), lowercased — drops punctuation and
+/// single-char noise.
+fn tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() >= 2)
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Normalise a merchant string for comparison. Distinct from
@@ -390,7 +435,7 @@ mod tests {
     fn confirms_close_merchant_same_amount() {
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST", "50.93", 21)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }));
         assert!(r.unmatched_journals.is_empty());
     }
@@ -399,7 +444,7 @@ mod tests {
     fn amount_mismatch_when_estimate_differs() {
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         match &r.charges[0].1 {
             ChargeOutcome::AmountMismatch { journal_id, statement, booked } => {
                 assert_eq!(journal_id, "J1");
@@ -416,7 +461,7 @@ mod tests {
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
         let wide = ReconcileParams { amount_tolerance: Decimal::new(50, 2), ..Default::default() }; // 0.50
-        let r = reconcile(&charges, &journals, &wide);
+        let r = reconcile(&charges, &journals, &wide, &[]);
         assert!(
             matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
             "a 0.50 tolerance should absorb a 0.17 gap → Confirmed, got {:?}",
@@ -428,7 +473,7 @@ mod tests {
     fn unmatched_charge_books_new() {
         let charges = [charge("0601324353", "TOTALLY NEW MERCHANT", "9.99", 10)];
         let journals = [journal("J1", "SOMETHING ELSE", "1.00", 28)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert_eq!(r.charges[0].1, ChargeOutcome::BookNew);
         assert_eq!(r.unmatched_journals.len(), 1);
         assert_eq!(r.unmatched_journals[0].id, "J1");
@@ -439,7 +484,7 @@ mod tests {
         let charges = [charge("0601324353", "NAGANO DENTETSU", "6.66", 23)];
         let journals = [journal("J1", "NAGANO DENX", "6.66", 23)];
         let p = ReconcileParams { merchant_threshold: 0.99, ..Default::default() };
-        let r = reconcile(&charges, &journals, &p);
+        let r = reconcile(&charges, &journals, &p, &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert_eq!(r.unmatched_journals.len(), 1);
     }
@@ -448,7 +493,7 @@ mod tests {
     fn ambiguous_two_equal_candidates_reviewed() {
         let charges = [charge("0601324353", "7-ELEVEN", "7.28", 17)];
         let journals = [journal("J1", "7-ELEVEN", "7.28", 17), journal("J2", "7-ELEVEN", "7.28", 17)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert_eq!(r.unmatched_journals.len(), 2);
     }
@@ -463,7 +508,7 @@ mod tests {
             merchant: "7-Eleven B315 Kastrup".to_string(),
             external_id: Some("bpstmt:74987506133002256024229".to_string()),
         }];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert_eq!(r.charges[0].1, ChargeOutcome::Confirmed { journal_id: "J9".to_string() });
     }
 
@@ -471,7 +516,7 @@ mod tests {
     fn date_outside_window_does_not_match() {
         let charges = [charge("0601324353", "JR EAST", "50.93", 1)];
         let journals = [journal("J1", "JR EAST", "50.93", 28)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default());
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert_eq!(r.charges[0].1, ChargeOutcome::BookNew);
     }
 
@@ -485,7 +530,7 @@ mod tests {
             merchant: "JR EAST".into(),
             external_id: None,
         };
-        let r = reconcile(&charges, &[dop], &ReconcileParams::default());
+        let r = reconcile(&charges, &[dop], &ReconcileParams::default(), &[]);
         assert_eq!(r.charges[0].1, ChargeOutcome::BookNew, "USD charge must not match a DOP journal");
     }
 
@@ -499,7 +544,7 @@ mod tests {
         let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21);
 
         for order in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
-            let r = reconcile(&order, &journals, &ReconcileParams::default());
+            let r = reconcile(&order, &journals, &ReconcileParams::default(), &[]);
             let books = kinds(&r).iter().filter(|k| **k == "book").count();
             assert_eq!(books, 0, "no charge may BookNew against a contended journal: {:?}", kinds(&r));
             // Exactly one confirmed (the winner) or both reviewed; never a dup booking.
@@ -508,31 +553,24 @@ mod tests {
         }
     }
 
-    /// Contention with a fallback: A and B both claim J1 (their best); A wins.
-    /// B is *not* re-matched against the free J2 it could also have taken — it
-    /// routes to Review and J2 surfaces as unmatched. This is a deliberate
-    /// conservative under-match (single-shot resolution, never an optimal
-    /// assignment): erring toward Review for a money tool is the safe direction.
-    /// Pinned so the behavior can't silently drift in a future "optimization".
+    /// Contention safety: when several similar charges and journals all match
+    /// each other (token-containment saturates), the matcher cannot confidently
+    /// assign, so it routes to Review — the one invariant that matters for money
+    /// is that **no charge BookNews** (which would double-book) and no journal is
+    /// consumed twice. Pinned so it can't silently drift.
     #[test]
-    fn contested_loser_is_reviewed_not_matched_to_its_fallback() {
+    fn contended_charges_review_never_book() {
         let journals = [
             journal("J1", "JR EAST SIBUYAKU", "50.93", 21),
             journal("J2", "JR EAST", "50.93", 21),
         ];
-        let a = charge("0601000001", "JR EAST SIBUYAKU", "50.93", 21); // best = J1 (exact)
-        let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21); // best = J1 too
-        let r = reconcile(&[a, b], &journals, &ReconcileParams::default());
+        let a = charge("0601000001", "JR EAST SIBUYAKU", "50.93", 21);
+        let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21);
+        let r = reconcile(&[a, b], &journals, &ReconcileParams::default(), &[]);
 
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }), "A wins J1");
-        assert!(
-            matches!(r.charges[1].1, ChargeOutcome::Review { .. }),
-            "B loses the J1 contest and is reviewed (not matched to free J2): {:?}",
-            r.charges[1].1
-        );
-        // No double-book, and the fallback journal is surfaced for the human.
-        assert!(!kinds(&r).contains(&"book"));
-        assert!(r.unmatched_journals.iter().any(|j| j.id == "J2"));
+        assert!(!kinds(&r).contains(&"book"), "contended charges must not BookNew: {:?}", kinds(&r));
+        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
+        assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
     }
 
     /// Permutation invariance: the multiset of outcomes is independent of input
@@ -548,18 +586,71 @@ mod tests {
         let c3 = charge("0601000003", "BRAND NEW CAFE", "3.00", 19);
 
         let mut sorted_a = {
-            let r = reconcile(&[c1.clone(), c2.clone(), c3.clone()], &journals, &ReconcileParams::default());
+            let r = reconcile(&[c1.clone(), c2.clone(), c3.clone()], &journals, &ReconcileParams::default(), &[]);
             let mut k = kinds(&r);
             k.sort_unstable();
             k
         };
         let sorted_b = {
-            let r = reconcile(&[c3, c1, c2], &journals, &ReconcileParams::default());
+            let r = reconcile(&[c3, c1, c2], &journals, &ReconcileParams::default(), &[]);
             let mut k = kinds(&r);
             k.sort_unstable();
             k
         };
         sorted_a.sort_unstable();
         assert_eq!(sorted_a, sorted_b);
+    }
+
+    // --- merchant matching improvements (point 1) --------------------------
+
+    #[test]
+    fn token_containment_basics() {
+        assert_eq!(token_containment("jompeame", "donacion jompeame jompeame.com"), 1.0);
+        assert_eq!(token_containment("nagano dentetsu", "nagano dentetsu nagano"), 1.0);
+        assert_eq!(token_containment("starbuckskorea", "starbuckscoffee tokyo"), 0.0);
+        assert_eq!(token_containment("", "anything"), 0.0);
+    }
+
+    #[test]
+    fn canonicalize_via_alias_map() {
+        let aliases = vec![("jompeame".to_string(), "Jompeame".to_string())];
+        assert_eq!(canonicalize("DONACION JOMPEAME JOMPEAME.COM", &aliases), "Jompeame");
+        assert_eq!(canonicalize("JOMPEAME", &aliases), "Jompeame");
+        assert_eq!(canonicalize("Unrelated Cafe", &aliases), "Unrelated Cafe");
+    }
+
+    /// The dry-run's real false-negative: a consumo `JOMPEAME` journal vs the
+    /// statement's `DONACION JOMPEAME JOMPEAME.COM`. Jaro-Winkler alone scored it
+    /// too low → BookNew (a double-book). Token-containment now confirms it even
+    /// with NO alias rule configured.
+    #[test]
+    fn contained_merchant_confirms_without_alias() {
+        let charges = [charge("0601324353", "DONACION JOMPEAME JOMPEAME.COM", "1000.00", 24)];
+        let journals = [journal("J1", "JOMPEAME", "1000.00", 24)];
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
+        assert!(
+            matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
+            "containment should confirm, not BookNew: {:?}",
+            r.charges[0].1
+        );
+        assert!(r.unmatched_journals.is_empty());
+    }
+
+    /// With an alias rule, even names that share *no* tokens canonicalize to the
+    /// same payee and match exactly.
+    #[test]
+    fn alias_map_bridges_disjoint_names() {
+        let aliases = vec![
+            ("youtube".to_string(), "Google".to_string()),
+            ("goog".to_string(), "Google".to_string()),
+        ];
+        let charges = [charge("0601324353", "GOOG*YOUTUBEPREMIUM", "11.99", 21)];
+        let journals = [journal("J1", "YOUTUBE", "11.99", 21)];
+        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &aliases);
+        assert!(
+            matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
+            "alias canonicalization should confirm: {:?}",
+            r.charges[0].1
+        );
     }
 }
