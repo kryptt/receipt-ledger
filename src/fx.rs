@@ -28,8 +28,10 @@
 //! (e.g. `firefly`) get a deterministic rate with no live call.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
@@ -41,6 +43,50 @@ use serde::{Deserialize, Deserializer};
 /// host 301-redirects here; we pin the `.dev` base so no redirect-following is
 /// required. Mirrors [`crate::config`]'s `DEFAULT_FX_URL`.
 pub const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
+
+/// A rate-lookup failure, classified by whether retrying could help.
+///
+/// `Transient` (5xx / 408 / 429 / network / timeout) means the provider is
+/// momentarily unreachable — the caller should *defer* (leave the message in the
+/// INBOX and retry on the next run) rather than burning it to Review. `Permanent`
+/// (4xx auth/bad-request, a parse failure, or an unsupported currency) will not
+/// improve on retry, so it routes to Review as before.
+#[derive(Debug, Clone)]
+pub enum RateError {
+    Transient(String),
+    Permanent(String),
+}
+
+impl fmt::Display for RateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RateError::Transient(m) => write!(f, "transient rate failure: {m}"),
+            RateError::Permanent(m) => write!(f, "permanent rate failure: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for RateError {}
+
+/// Whether `err`'s chain carries a [`RateError::Transient`] — i.e. the failure is
+/// a momentary provider outage and the message should be deferred (kept in INBOX
+/// for the next run) rather than routed to Review. Walks the full `anyhow` chain
+/// so it survives `.context(...)` wrapping.
+#[must_use]
+pub fn is_transient(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|e| matches!(e.downcast_ref::<RateError>(), Some(RateError::Transient(_))))
+}
+
+/// Classify an HTTP status into a [`RateError`] variant: server errors plus the
+/// retryable 408/429 are transient; every other non-success is permanent.
+fn classify_status(status: reqwest::StatusCode, msg: String) -> RateError {
+    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+        RateError::Transient(msg)
+    } else {
+        RateError::Permanent(msg)
+    }
+}
 
 /// Cache key: the (from, to, date) triple a rate is requested for. `from`/`to`
 /// are stored upper-cased so lookups are case-insensitive.
@@ -120,6 +166,7 @@ impl<'a> FxClient<'a> {
             let venta = dop
                 .dop_per_unit(foreign)
                 .await
+                .map_err(anyhow::Error::new)
                 .with_context(|| format!("resolving DOP rate for {from}->{to} on {date}"))?;
             let rate = if from == "DOP" {
                 Decimal::ONE / venta
@@ -147,14 +194,17 @@ impl<'a> FxClient<'a> {
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .with_context(|| format!("requesting FX rate {from}->{to} on {date}"))?;
+            .map_err(|e| {
+                anyhow::Error::new(RateError::Transient(format!(
+                    "requesting FX rate {from}->{to} on {date}: {e}"
+                )))
+            })?;
 
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!(
-                "FX provider returned {status} for {from}->{to} on {date}: {body}"
-            ));
+            let msg = format!("FX provider returned {status} for {from}->{to} on {date}: {body}");
+            return Err(anyhow::Error::new(classify_status(status, msg)));
         }
 
         let rate = parse_rate(&body, &to)
@@ -252,14 +302,25 @@ pub struct DopRate<'a> {
     client_id: String,
     client_secret: String,
     scope: String,
-    /// Process-lifetime cache: currency (upper-case) → `venta` (DOP per unit).
-    /// `None` until the first successful fetch.
-    table: Mutex<Option<HashMap<String, Decimal>>>,
+    /// In-run retry budget: on a transient failure the token+rates fetch is
+    /// retried with exponential backoff until this elapses, then it gives up
+    /// (the caller defers — the hourly cron is the outer retry loop).
+    retry_budget: Duration,
+    /// Process-lifetime memo of the load outcome (success or a typed failure), so
+    /// the retry budget is spent at most once per run and every DOP item in the
+    /// same run sees the same verdict.
+    table: Mutex<Option<TableState>>,
+}
+
+/// Memoized outcome of loading the rate table once per run.
+enum TableState {
+    Loaded(HashMap<String, Decimal>),
+    Failed(RateError),
 }
 
 impl<'a> DopRate<'a> {
     /// Build a provider. URLs default in [`crate::config`]; the credentials are a
-    /// SealedSecret in deployment.
+    /// SealedSecret in deployment. `retry_budget` bounds the in-run backoff.
     pub fn new(
         http: &'a Client,
         rates_url: impl Into<String>,
@@ -267,6 +328,7 @@ impl<'a> DopRate<'a> {
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
         scope: impl Into<String>,
+        retry_budget: Duration,
     ) -> Self {
         Self {
             http,
@@ -275,84 +337,123 @@ impl<'a> DopRate<'a> {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             scope: scope.into(),
+            retry_budget,
             table: Mutex::new(None),
         }
     }
 
-    /// `venta` (DOP per 1 unit) for `currency`, fetching+caching the table on the
-    /// first call. Errors for a currency the bank does not publish (only USD/EUR)
-    /// so the caller routes to Review rather than booking at a missing rate.
-    async fn dop_per_unit(&self, currency: &str) -> Result<Decimal> {
+    /// `venta` (DOP per 1 unit) for `currency`. Loads + memoizes the table on the
+    /// first call (with bounded retry on transient outages). A
+    /// [`RateError::Transient`] tells the caller to defer; [`RateError::Permanent`]
+    /// (incl. an unsupported currency) routes to Review.
+    async fn dop_per_unit(&self, currency: &str) -> std::result::Result<Decimal, RateError> {
         let cur = currency.trim().to_ascii_uppercase();
 
-        // Cache hit — no network. Scoped lock, released before any await.
-        if let Some(table) = self
-            .table
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            return table
-                .get(&cur)
-                .copied()
-                .ok_or_else(|| anyhow!("Banco Popular publishes no '{cur}' rate (only USD/EUR)"));
+        // Memo hit — no network. Scoped lock, released before any await.
+        if let Some(state) = self.table.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return Self::resolve(state, &cur);
         }
 
+        let state = self.load_table_retrying().await;
+        let result = Self::resolve(&state, &cur);
+        *self.table.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+        result
+    }
+
+    /// Look one currency up in a memoized [`TableState`].
+    fn resolve(state: &TableState, cur: &str) -> std::result::Result<Decimal, RateError> {
+        match state {
+            TableState::Loaded(table) => table.get(cur).copied().ok_or_else(|| {
+                RateError::Permanent(format!("Banco Popular publishes no '{cur}' rate (only USD/EUR)"))
+            }),
+            TableState::Failed(e) => Err(e.clone()),
+        }
+    }
+
+    /// Load the rate table, retrying transient failures with exponential backoff
+    /// until [`retry_budget`](Self::retry_budget) elapses. A permanent failure
+    /// returns immediately. Never panics — always resolves to a [`TableState`].
+    async fn load_table_retrying(&self) -> TableState {
+        let start = Instant::now();
+        let mut backoff = Duration::from_secs(1);
+        let cap = Duration::from_secs(30);
+        loop {
+            match self.try_load_table().await {
+                Ok(table) => return TableState::Loaded(table),
+                Err(e @ RateError::Permanent(_)) => return TableState::Failed(e),
+                Err(e @ RateError::Transient(_)) => {
+                    if start.elapsed() + backoff >= self.retry_budget {
+                        return TableState::Failed(e);
+                    }
+                    tracing::warn!(error = %e, "DOP rate transient failure; retrying after backoff");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(cap);
+                }
+            }
+        }
+    }
+
+    /// One token + rates fetch + parse. 5xx/408/429/network → transient;
+    /// 4xx/parse → permanent.
+    async fn try_load_table(&self) -> std::result::Result<HashMap<String, Decimal>, RateError> {
         let token = self.fetch_token().await?;
         let body = self.fetch_rates(&token).await?;
-        let table = parse_rate_table(&body).context("parsing consultaTasa rates")?;
-        let resolved = table.get(&cur).copied();
-        *self.table.lock().unwrap_or_else(|e| e.into_inner()) = Some(table);
-        resolved.ok_or_else(|| anyhow!("Banco Popular publishes no '{cur}' rate (only USD/EUR)"))
+        parse_rate_table(&body).map_err(|e| RateError::Permanent(format!("parsing consultaTasa: {e}")))
     }
 
     /// Mint an OAuth2 access token via the client-credentials grant.
-    async fn fetch_token(&self) -> Result<String> {
+    async fn fetch_token(&self) -> std::result::Result<String, RateError> {
         let form = serde_urlencoded::to_string([
             ("grant_type", "client_credentials"),
             ("client_id", self.client_id.as_str()),
             ("client_secret", self.client_secret.as_str()),
             ("scope", self.scope.as_str()),
         ])
-        .context("encoding DOP token request body")?;
-        let resp = self
-            .http
-            .post(&self.token_url)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
+        .map_err(|e| RateError::Permanent(format!("encoding DOP token request body: {e}")))?;
+        let body = self
+            .send_classified(
+                self.http
+                    .post(&self.token_url)
+                    .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .body(form),
+                "DOP token endpoint",
             )
-            .header(reqwest::header::ACCEPT, "application/json")
-            .body(form)
-            .send()
-            .await
-            .context("requesting DOP OAuth token")?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("DOP token endpoint returned {status}: {body}"));
-        }
-        parse_token(&body).context("decoding DOP OAuth token response")
+            .await?;
+        parse_token(&body).map_err(|e| RateError::Permanent(format!("decoding DOP token response: {e}")))
     }
 
     /// Fetch the raw `consultaTasa` body with the bearer token + client-id header
     /// (IBM API Connect requires both).
-    async fn fetch_rates(&self, token: &str) -> Result<String> {
-        let resp = self
-            .http
-            .get(&self.rates_url)
-            .bearer_auth(token)
-            .header("X-IBM-Client-Id", self.client_id.as_str())
-            .header(reqwest::header::ACCEPT, "application/json")
+    async fn fetch_rates(&self, token: &str) -> std::result::Result<String, RateError> {
+        self.send_classified(
+            self.http
+                .get(&self.rates_url)
+                .bearer_auth(token)
+                .header("X-IBM-Client-Id", self.client_id.as_str())
+                .header(reqwest::header::ACCEPT, "application/json"),
+            "DOP rates endpoint",
+        )
+        .await
+    }
+
+    /// Send a request and return the body, mapping network/timeout errors and
+    /// non-success statuses to a classified [`RateError`].
+    async fn send_classified(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> std::result::Result<String, RateError> {
+        let resp = req
             .send()
             .await
-            .context("requesting DOP exchange rates")?;
+            .map_err(|e| RateError::Transient(format!("{what}: {e}")))?;
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("DOP rates endpoint returned {status}: {body}"));
+        if status.is_success() {
+            return Ok(body);
         }
-        Ok(body)
+        Err(classify_status(status, format!("{what} returned {status}: {}", body.trim())))
     }
 }
 
@@ -434,7 +535,8 @@ impl<'a> DopRate<'a> {
             client_id: String::new(),
             client_secret: String::new(),
             scope: String::new(),
-            table: Mutex::new(Some(table)),
+            retry_budget: Duration::ZERO,
+            table: Mutex::new(Some(TableState::Loaded(table))),
         }
     }
 }
@@ -551,6 +653,32 @@ mod tests {
         );
         // A currency the bank doesn't publish errors → caller routes to Review.
         assert!(rt.block_on(fx.rate("DOP", "JPY", date)).is_err());
+    }
+
+    #[test]
+    fn classify_status_transient_vs_permanent() {
+        use reqwest::StatusCode;
+        // 521 (Cloudflare origin down), 500, 429, 408 → transient (retry).
+        assert!(matches!(classify_status(StatusCode::from_u16(521).unwrap(), "x".into()), RateError::Transient(_)));
+        assert!(matches!(classify_status(StatusCode::INTERNAL_SERVER_ERROR, "x".into()), RateError::Transient(_)));
+        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()), RateError::Transient(_)));
+        assert!(matches!(classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()), RateError::Transient(_)));
+        // 401/403/400 → permanent (don't retry; route to Review).
+        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED, "x".into()), RateError::Permanent(_)));
+        assert!(matches!(classify_status(StatusCode::FORBIDDEN, "x".into()), RateError::Permanent(_)));
+        assert!(matches!(classify_status(StatusCode::BAD_REQUEST, "x".into()), RateError::Permanent(_)));
+    }
+
+    #[test]
+    fn is_transient_walks_the_context_chain() {
+        // Survives `.context(...)` wrapping (how the pipeline sees it).
+        let transient = anyhow::Error::new(RateError::Transient("521".into()))
+            .context("resolving DOP rate for DOP->USD on 2026-04-24");
+        assert!(is_transient(&transient));
+        let permanent =
+            anyhow::Error::new(RateError::Permanent("401".into())).context("resolving DOP rate");
+        assert!(!is_transient(&permanent));
+        assert!(!is_transient(&anyhow!("an unrelated error")));
     }
 
     #[test]

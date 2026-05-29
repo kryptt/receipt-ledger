@@ -47,6 +47,12 @@ const DEFAULT_DOP_TOKEN_URL: &str =
     "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/bpd/Authentication/oauth2/token";
 /// Default OAuth2 scope for the DOP rates API. Override with `RECEIPT_DOP_SCOPE`.
 const DEFAULT_DOP_SCOPE: &str = "scope_1";
+/// Default in-run retry budget (seconds) for transient DOP-rate failures: the
+/// token+rates fetch is retried with exponential backoff up to this long before
+/// the run defers (keeps the message in INBOX for the hourly cron to retry).
+/// Kept well inside the job's `activeDeadlineSeconds`. Override with
+/// `RECEIPT_DOP_RETRY_BUDGET_SECS`.
+const DEFAULT_DOP_RETRY_BUDGET_SECS: u64 = 120;
 const DEFAULT_PROCESSED_MAILBOX: &str = "Processed";
 const DEFAULT_REVIEW_MAILBOX: &str = "Review";
 
@@ -236,6 +242,8 @@ pub struct DopRateConfig {
     pub client_id: String,
     pub client_secret: String,
     pub scope: String,
+    /// In-run retry budget for transient (5xx/network) failures before deferring.
+    pub retry_budget: std::time::Duration,
 }
 
 /// Build [`DopRateConfig`] from the environment. Absent credentials → `None`
@@ -250,6 +258,10 @@ fn dop_rate_from_env() -> Result<Option<DopRateConfig>> {
             client_id,
             client_secret,
             scope: env_or("RECEIPT_DOP_SCOPE", DEFAULT_DOP_SCOPE),
+            retry_budget: std::time::Duration::from_secs(env_u64(
+                "RECEIPT_DOP_RETRY_BUDGET_SECS",
+                DEFAULT_DOP_RETRY_BUDGET_SECS,
+            )?),
         })),
         _ => anyhow::bail!(
             "RECEIPT_DOP_CLIENT_ID and RECEIPT_DOP_CLIENT_SECRET must be set together (or neither)"

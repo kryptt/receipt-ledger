@@ -81,18 +81,25 @@ pub struct StatementReport {
     pub balance_mismatch: usize,
     /// Rows that could not be confidently handled → human review.
     pub review: usize,
+    /// Rows skipped this run because the rate provider was transiently down (5xx
+    /// / network). The row is NOT booked and NOT a review; the caller leaves the
+    /// whole message in INBOX so the next run retries it (already-booked rows
+    /// dedup via their `bpstmt:` external_id).
+    pub deferred: usize,
 }
 
 impl StatementReport {
     /// Whether the statement is fully clean (→ Processed). Any mismatch,
-    /// unmatched journal, balance discrepancy, or review item routes the message
-    /// to Review.
+    /// unmatched journal, balance discrepancy, review, or deferral keeps it out of
+    /// Processed. (A deferral is handled before this is consulted — it holds the
+    /// message in INBOX — but is included here for safety.)
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.amount_mismatch == 0
             && self.unmatched_booked == 0
             && self.balance_mismatch == 0
             && self.review == 0
+            && self.deferred == 0
     }
 }
 
@@ -282,6 +289,13 @@ async fn book_charge(
             return;
         }
         Ok(None) => {}
+        Err(e) if crate::fx::is_transient(&e) => {
+            // Rate provider down — defer this row (keep the statement in INBOX,
+            // retry next run). Don't book, don't review.
+            info!(reference = charge.reference.as_str(), error = ?e, "ceiling rate unavailable → deferred (retry next run)");
+            report.deferred += 1;
+            return;
+        }
         Err(e) => {
             warn!(reference = charge.reference.as_str(), error = ?e, "ceiling FX failed → review");
             report.review += 1;
@@ -331,6 +345,11 @@ async fn book_payment(
             return;
         }
         Ok(None) => {}
+        Err(e) if crate::fx::is_transient(&e) => {
+            info!(reference = payment.reference.as_str(), error = ?e, "payment ceiling rate unavailable → deferred (retry next run)");
+            report.deferred += 1;
+            return;
+        }
         Err(e) => {
             warn!(reference = payment.reference.as_str(), error = ?e, "payment ceiling FX failed → review");
             report.review += 1;
@@ -428,5 +447,6 @@ mod tests {
         assert!(!StatementReport { unmatched_booked: 1, ..Default::default() }.is_clean());
         assert!(!StatementReport { balance_mismatch: 1, ..Default::default() }.is_clean());
         assert!(!StatementReport { review: 1, ..Default::default() }.is_clean());
+        assert!(!StatementReport { deferred: 1, ..Default::default() }.is_clean());
     }
 }

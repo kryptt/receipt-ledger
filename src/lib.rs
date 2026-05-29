@@ -93,6 +93,7 @@ pub async fn run() -> Result<Summary> {
             &d.client_id,
             &d.client_secret,
             &d.scope,
+            d.retry_budget,
         ));
     }
     let firefly = FireflyClient::new(
@@ -110,6 +111,11 @@ pub async fn run() -> Result<Summary> {
 
     // --- per-message pipeline --------------------------------------------
     let mut summary = Summary::default();
+    // Set when any message defers on a transient rate outage: the batch's JMAP
+    // state is then *not* advanced, so deferred messages (left in INBOX) are
+    // refetched next run. Already-booked rows dedup; moved messages are filtered
+    // out by the INBOX check in `fetch_new`.
+    let mut hold_state = false;
     for msg in &messages {
         summary.processed += 1;
 
@@ -122,13 +128,22 @@ pub async fn run() -> Result<Summary> {
                     summary.booked += report.booked_new + report.payments_booked;
                     summary.duplicates += report.reconciled;
                     summary.review += report.review + report.amount_mismatch + report.unmatched_booked;
-                    let clean = report.is_clean();
-                    if clean {
-                        info!(id = %msg.id, ?report, "statement clean → processed");
+                    if report.deferred > 0 {
+                        // Some rows need a rate the provider couldn't give right
+                        // now. Leave the whole message in INBOX; the rows that did
+                        // book dedup on retry (book USD now, retry DOP later).
+                        hold_state = true;
+                        warn!(id = %msg.id, ?report, deferred = report.deferred,
+                            "statement has deferred rows (rate provider down); kept in INBOX for retry");
                     } else {
-                        warn!(id = %msg.id, ?report, "statement has flags → review");
+                        let clean = report.is_clean();
+                        if clean {
+                            info!(id = %msg.id, ?report, "statement clean → processed");
+                        } else {
+                            warn!(id = %msg.id, ?report, "statement has flags → review");
+                        }
+                        route(&mailbox, &msg.id, clean, cfg.dry_run).await;
                     }
-                    route(&mailbox, &msg.id, clean, cfg.dry_run).await;
                 }
                 Err(e) => {
                     summary.review += 1;
@@ -160,6 +175,11 @@ pub async fn run() -> Result<Summary> {
                 warn!(id = %msg.id, %reason, "routing to review");
                 route(&mailbox, &msg.id, false, cfg.dry_run).await;
             }
+            Ok(Disposition::Defer(reason)) => {
+                // Transient rate outage — leave in INBOX, don't advance state.
+                hold_state = true;
+                warn!(id = %msg.id, %reason, "deferred (rate provider down); kept in INBOX for retry");
+            }
             Err(e) => {
                 // A per-message processing error is not fatal to the job.
                 summary.review += 1;
@@ -175,6 +195,8 @@ pub async fn run() -> Result<Summary> {
     // dry-run so the same messages can be re-observed.
     if cfg.dry_run {
         info!("DRY RUN: not advancing JMAP state");
+    } else if hold_state {
+        warn!("deferred messages kept in INBOX (rate provider down); not advancing JMAP state — will retry next run");
     } else {
         jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
     }
@@ -189,6 +211,10 @@ enum Disposition {
     /// Not a transaction notification at all — a clean skip (→ Processed).
     Skipped(String),
     Review(String),
+    /// A transient rate-provider outage prevented a confident decision. The
+    /// message is left in the INBOX (not moved) and JMAP state is not advanced,
+    /// so the next run retries it. Anything already booked dedups on retry.
+    Defer(String),
 }
 
 /// The deterministic-core + I/O pipeline for one message.
@@ -271,12 +297,18 @@ async fn process_message(
                 //     gate. An FX failure propagates as `Err` (→ Review), never
                 //     books an unscreened large amount.
                 let ext = validated.as_extracted();
-                if let Some(reason) =
-                    usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date)
-                        .await?
-                {
-                    review_reason.get_or_insert(reason);
-                    continue;
+                match usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date).await {
+                    Ok(Some(reason)) => {
+                        review_reason.get_or_insert(reason);
+                        continue;
+                    }
+                    Ok(None) => {}
+                    // Transient rate outage → defer the whole message (retry next
+                    // run); permanent → propagate (→ Review).
+                    Err(e) if crate::fx::is_transient(&e) => {
+                        return Ok(Disposition::Defer(format!("rate provider unavailable: {e}")));
+                    }
+                    Err(e) => return Err(e),
                 }
 
                 // 6. Dedup key. 7. Submit to Firefly (skipped in dry-run).
