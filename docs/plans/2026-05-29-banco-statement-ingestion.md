@@ -387,9 +387,17 @@ to Phase 2).
   XObject` handling (resolve the form's own content stream, process with the current CTM) is the
   fix, to be done with the reconcile module (which consumes `balance_total` for the closing-balance
   check). The transaction table is in the page content stream and extracts fully.
+- ✅ **Reconcile matcher** (`src/statement/reconcile.rs`, pure): fuzzy match of statement charges
+  against `ExistingJournal`s — Jaro-Winkler merchant similarity + date window + amount-tolerance,
+  greedy 1:1, and the four outcomes (Confirmed / AmountMismatch / BookNew / Review). Includes the
+  **cross-path double-book guard** (gray-zone near-match → Review, never book), ambiguity/identical-
+  cluster → Review, prior-`bpstmt:`-booking confirm (re-run idempotency), and unmatched-journal
+  audit. 8 unit tests. Thresholds in `ReconcileParams` (default `merchant≥0.85`, `W=5d`) —
+  documented as calibration-pending (Phase-0 couldn't tune them).
 - ⏭️ **Remaining**: JMAP attachment fetch (§3.3), `classify_message` + `run()` branch (§3.2),
-  config env (§4), `ValidatedTransfer` + transfer/`list_transactions` on `FireflyClient` (§3.6/3.7),
-  the reconciler + matcher (§3.6), closing-balance check (needs the XObject fix above).
+  config env (§4), `FireflyClient::list_transactions` (map API JSON → `ExistingJournal`) +
+  `ValidatedTransfer` transfer booking (§3.6/3.7), wiring the matcher into the pipeline + booking
+  the `BookNew` rows via `to_extracted`, closing-balance check (needs the XObject fix above).
 
 ### Phase 2 — independent, separately-shippable items (review #15), each tagged by goal
 - **(a) Amount auto-correction** — *parity goal*: auto-correct foreign-charge amounts to the
