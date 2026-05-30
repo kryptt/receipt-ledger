@@ -9,13 +9,39 @@
 pub mod banco_popular;
 pub mod parse;
 pub mod paypal;
+pub mod paypal_payment;
 
 use std::sync::OnceLock;
 
 use anyhow::Result;
+use chrono::NaiveDate;
 use serde_json::Value;
 
-use crate::schema::Extracted;
+use crate::schema::{Extracted, Money};
+
+/// A payment booked as a Firefly **transfer** (funding bank account → a card /
+/// credit liability), as extracted from a payment-receipt email.
+///
+/// Distinct from [`Extracted`] (a withdrawal/deposit candidate): a transfer
+/// moves money *between two own accounts*, so it carries no merchant and no
+/// direction — both legs are the same currency. The destination is deliberately
+/// absent: the pipeline supplies it from config (mirroring how withdrawal
+/// account routing lives outside the adapter), and the source is resolved from
+/// [`funding_last4`](TransferRecord::funding_last4) against a config map.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferRecord {
+    /// The transfer amount + currency (same currency on both legs).
+    pub money: Money,
+    /// The transaction date.
+    pub date: NaiveDate,
+    /// Human-readable description for the Firefly split.
+    pub description: String,
+    /// Dedup key (Firefly `external_id`), e.g. `pp-payment:<transaction id>`.
+    pub external_id: String,
+    /// Last-4 of the funding instrument (e.g. `0130`), resolved by the pipeline
+    /// against the configured `last4 → account id` map to pick the source.
+    pub funding_last4: String,
+}
 
 /// What an adapter made of an email.
 ///
@@ -28,6 +54,8 @@ use crate::schema::Extracted;
 pub enum Outcome {
     /// Zero or more transaction candidates were extracted.
     Transaction(Vec<Extracted>),
+    /// A payment to book as a transfer (funding account → credit liability).
+    Transfer(TransferRecord),
     /// This mail is not a transaction notification at all — skip it cleanly.
     NotATransaction { reason: String },
 }
@@ -53,6 +81,19 @@ pub trait Adapter: Send + Sync {
     /// and validation gates decide).
     fn is_transaction(&self, _body: &str) -> bool {
         true
+    }
+
+    /// A deterministic, pre-LLM extraction for fixed-format sources. When a
+    /// source's mail is a rigid, machine-generated receipt (no free text to
+    /// interpret), the adapter can parse it directly and bypass the LLM
+    /// entirely. Returns `Some(result)` to take over extraction (the pipeline
+    /// uses that [`Outcome`] instead of calling the model), or `None` (the
+    /// default) to fall through to the LLM path. An inner `Err` is reserved for
+    /// a body that *looks* like this source's receipt but fails to parse a
+    /// required field — never for a clean non-match (that is
+    /// `Some(Ok(Outcome::NotATransaction { .. }))`). Pure: no I/O.
+    fn deterministic_extract(&self, _body: &str) -> Option<Result<Outcome>> {
+        None
     }
 
     /// Build the extraction prompt for the LLM from the original email text.
@@ -92,6 +133,10 @@ fn registry() -> &'static [&'static (dyn Adapter + 'static)] {
     REGISTRY
         .get_or_init(|| {
             vec![
+                // The PayPal *payment* adapter (customercare@paypal.com) is
+                // tried before the *purchase* one (service@paypal.com); their
+                // `matches` senders are disjoint, so order is not load-bearing.
+                &paypal_payment::PaypalPaymentAdapter as &(dyn Adapter + 'static),
                 &paypal::PaypalAdapter as &(dyn Adapter + 'static),
                 &banco_popular::BancoPopularAdapter as &(dyn Adapter + 'static),
             ]

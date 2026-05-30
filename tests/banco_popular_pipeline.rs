@@ -34,6 +34,7 @@ fn one(outcome: Outcome) -> Extracted {
             assert_eq!(v.len(), 1);
             v.pop().unwrap()
         }
+        Outcome::Transfer(_) => panic!("expected transaction, got transfer"),
         Outcome::NotATransaction { reason } => panic!("expected transaction, got skip: {reason}"),
     }
 }

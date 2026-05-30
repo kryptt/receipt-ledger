@@ -40,6 +40,23 @@ pub enum SubmitOutcome {
     Duplicate,
 }
 
+/// Outcome of a *checked* transfer submission ([`FireflyClient::submit_transfer_between`]).
+///
+/// A transfer books both legs in the receipt's currency with no FX leg, which is
+/// only correct when that currency matches BOTH account currencies. Rather than
+/// risk a cross-currency mis-book (or a 422), the currency-agreement check runs
+/// before submission and surfaces a mismatch as a typed [`Self::CurrencyMismatch`]
+/// the caller routes to Review — distinct from a network/submit `Err`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a CurrencyMismatch must route the payment to Review, not be dropped"]
+pub enum TransferSubmit {
+    /// The transfer was submitted; carries the underlying create/duplicate result.
+    Submitted(SubmitOutcome),
+    /// The transfer currency did not match a leg's account currency — not
+    /// submitted. The `reason` is ready to hand to the review mailbox.
+    CurrencyMismatch { reason: String },
+}
+
 /// The authoritative booking target for an account, as Firefly reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
@@ -76,6 +93,11 @@ pub struct FireflyClient<'a> {
     /// Banco Popular DOP checking account — the source of a DOP-card statement
     /// payment booked as a transfer. `None` → such payments error out (→ Review).
     bp_paying_dop_account: Option<AccountId>,
+    /// Funding-account lookup for PayPal Credit *payment* receipts, keyed by the
+    /// funding instrument's last-4. The payment transfer's source leg is resolved
+    /// here; a last-4 absent from this map (or an empty map) routes the payment to
+    /// Review rather than guessing a source.
+    paying_account_by_last4: HashMap<String, AccountId>,
     /// Per-account-id target cache: numeric account id → its Firefly
     /// `currency_code` + `decimal_places`. Authoritative source of the
     /// conversion target so we book in the account's real currency at its real
@@ -165,6 +187,7 @@ impl<'a> FireflyClient<'a> {
         banco_popular_dop_account: Option<AccountId>,
         bp_paying_usd_account: Option<AccountId>,
         bp_paying_dop_account: Option<AccountId>,
+        paying_account_by_last4: HashMap<String, AccountId>,
     ) -> Self {
         Self {
             http,
@@ -177,6 +200,7 @@ impl<'a> FireflyClient<'a> {
             banco_popular_dop_account,
             bp_paying_usd_account,
             bp_paying_dop_account,
+            paying_account_by_last4,
             account_target: Mutex::new(HashMap::new()),
         }
     }
@@ -335,6 +359,60 @@ impl<'a> FireflyClient<'a> {
         let (source, dest) = self.route_transfer_accounts(transfer)?;
         let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
         self.post_group(&group, transfer.external_id(), "transfer").await
+    }
+
+    /// Submit a transfer between two **explicitly supplied** accounts: `source`
+    /// (the funding account) → `dest` (the credit/card liability). Used by the
+    /// PayPal-payment path, where the pipeline has already resolved both account
+    /// ids from config (dest = PayPal Credit; source = the funding last-4 map) —
+    /// so no currency-based routing is needed here. Shares the same
+    /// `build_transfer_group` + `post_group` plumbing as [`submit_transfer`], so
+    /// both transfer entry points stay in lockstep on idempotency + duplicate
+    /// handling.
+    ///
+    /// The transfer books both legs in `transfer.money().currency` with no FX
+    /// leg, so it is only correct when that currency matches BOTH account
+    /// currencies. This method reads both account [`Target`]s and verifies the
+    /// agreement BEFORE submitting; a mismatch returns
+    /// [`TransferSubmit::CurrencyMismatch`] (→ the caller routes to Review)
+    /// rather than booking a silent cross-currency transfer. The actual
+    /// `build_transfer_group`/`post_group` is reached only once agreement holds,
+    /// so no caller can submit a mismatched transfer.
+    pub async fn submit_transfer_between(
+        &self,
+        transfer: &ValidatedTransfer,
+        source: &AccountId,
+        dest: &AccountId,
+    ) -> Result<TransferSubmit> {
+        let source_target = self.account_target(source.as_str()).await?;
+        let dest_target = self.account_target(dest.as_str()).await?;
+        if let Some(reason) = transfer_currency_mismatch(
+            transfer.money().currency.as_str(),
+            &source_target.currency,
+            &dest_target.currency,
+        ) {
+            return Ok(TransferSubmit::CurrencyMismatch { reason });
+        }
+
+        let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
+        let outcome = self.post_group(&group, transfer.external_id(), "transfer").await?;
+        Ok(TransferSubmit::Submitted(outcome))
+    }
+
+    /// The configured PayPal Credit account, when present — the destination leg
+    /// of a PayPal-payment transfer. `None` routes the payment to Review.
+    #[must_use]
+    pub fn paypal_credit_account(&self) -> Option<&AccountId> {
+        self.paypal_credit_account.as_ref()
+    }
+
+    /// Resolve the funding (source) account for a PayPal-payment transfer from
+    /// the receipt's `funding_last4` against the configured map. `None` when the
+    /// last-4 is absent (or the map is empty) — the pipeline then routes the
+    /// payment to Review rather than guessing a source account.
+    #[must_use]
+    pub fn paying_account_for_last4(&self, last4: &str) -> Option<&AccountId> {
+        self.paying_account_by_last4.get(last4)
     }
 
     /// Resolve `(source paying account, destination card account)` for a transfer
@@ -768,6 +846,32 @@ fn build_group<'b>(
     })
 }
 
+/// Whether a transfer's currency disagrees with either leg's account currency.
+///
+/// A transfer books both legs in `transfer_currency` with no FX leg, so booking
+/// is only correct when that currency matches BOTH the source and destination
+/// account currencies. Returns `Some(reason)` describing the first mismatch
+/// (→ route to Review, never submit a silent cross-currency transfer) or `None`
+/// when all three agree. Case-insensitive on the ISO codes. Pure —
+/// unit-testable without a live Firefly.
+fn transfer_currency_mismatch(
+    transfer_currency: &str,
+    source_currency: &str,
+    dest_currency: &str,
+) -> Option<String> {
+    if !transfer_currency.eq_ignore_ascii_case(source_currency) {
+        return Some(format!(
+            "transfer currency {transfer_currency} does not match source account currency {source_currency}"
+        ));
+    }
+    if !transfer_currency.eq_ignore_ascii_case(dest_currency) {
+        return Some(format!(
+            "transfer currency {transfer_currency} does not match destination account currency {dest_currency}"
+        ));
+    }
+    None
+}
+
 /// Build a `transfer` group for a statement payment: paying bank account
 /// (`source`) → card liability (`dest`), same currency on both legs (no FX).
 /// Pure — unit-testable without a live Firefly.
@@ -948,6 +1052,7 @@ mod tests {
             Some(acct("107")), // Banco Popular DOP
             Some(acct("201")), // BP USD savings (paying)
             Some(acct("202")), // BP DOP checking (paying)
+            HashMap::from([("0130".to_string(), acct("1"))]), // PayPal-payment funding by last-4
         )
     }
 
@@ -1051,6 +1156,7 @@ mod tests {
             None,
             None,
             None,
+            HashMap::new(),
         );
         assert!(
             c.route_account(&paypal_record(Some("Pay in 4"), "USD"))
@@ -1110,6 +1216,81 @@ mod tests {
     }
 
     #[test]
+    fn submit_transfer_between_builds_explicit_account_group() {
+        // The PayPal-payment path supplies source + dest directly (no currency
+        // routing); the built group books a same-currency transfer between them.
+        let t = transfer("USD", "1300.00");
+        let json =
+            serde_json::to_value(build_transfer_group(&t, "1", "105")).unwrap();
+        let split = &json["transactions"][0];
+        assert_eq!(split["type"], "transfer");
+        assert_eq!(split["amount"], "1300");
+        assert_eq!(split["currency_code"], "USD");
+        assert_eq!(split["source_id"], "1", "funding account is the source");
+        assert_eq!(split["destination_id"], "105", "PayPal Credit is the destination");
+        assert!(split.get("foreign_amount").is_none(), "same-currency, no FX");
+    }
+
+    // --- Fix 4: transfer currency-agreement guard --------------------------
+
+    #[test]
+    fn transfer_currency_agreement_pure_check() {
+        // All three agree (case-insensitively) → no mismatch.
+        assert!(transfer_currency_mismatch("USD", "USD", "USD").is_none());
+        assert!(transfer_currency_mismatch("usd", "USD", "Usd").is_none());
+        // Source disagrees → mismatch naming the source.
+        let r = transfer_currency_mismatch("USD", "DOP", "USD").unwrap();
+        assert!(r.contains("source"), "{r}");
+        // Destination disagrees → mismatch naming the destination.
+        let r = transfer_currency_mismatch("USD", "USD", "DOP").unwrap();
+        assert!(r.contains("destination"), "{r}");
+    }
+
+    /// Seed the per-account target cache so `submit_transfer_between` can read
+    /// account currencies without any network I/O.
+    fn seed_target(c: &FireflyClient, account: &str, currency: &str) {
+        c.account_target
+            .lock()
+            .unwrap()
+            .insert(account.to_string(), Target { currency: currency.to_string(), decimals: 2 });
+    }
+
+    #[test]
+    fn submit_transfer_between_routes_currency_mismatch_to_review() {
+        // A USD transfer against a source account that books in DOP must NOT be
+        // submitted: the checked path returns CurrencyMismatch (→ Review),
+        // reaching no network call (both targets are seeded from the cache).
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        seed_target(&c, "1", "DOP"); // source funding account books in DOP
+        seed_target(&c, "105", "USD"); // dest (PayPal Credit) books in USD
+
+        let t = transfer("USD", "1300.00");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let outcome = rt
+            .block_on(c.submit_transfer_between(&t, &acct("1"), &acct("105")))
+            .expect("a currency mismatch is Ok(CurrencyMismatch), not Err");
+        match outcome {
+            TransferSubmit::CurrencyMismatch { reason } => {
+                assert!(reason.contains("source"), "names the disagreeing leg: {reason}");
+            }
+            TransferSubmit::Submitted(o) => panic!("expected mismatch, submitted {o:?}"),
+        }
+    }
+
+    #[test]
+    fn resolves_paypal_credit_and_paying_accounts() {
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        assert_eq!(c.paypal_credit_account().map(AccountId::as_str), Some("105"));
+        assert_eq!(c.paying_account_for_last4("0130").map(AccountId::as_str), Some("1"));
+        // An unmapped last-4 → None (the pipeline routes such a payment to Review).
+        assert!(c.paying_account_for_last4("9999").is_none());
+    }
+
+    #[test]
     fn transfer_with_unconfigured_paying_account_errors() {
         let http = Client::new();
         let fx = fx(&http);
@@ -1125,6 +1306,7 @@ mod tests {
             Some(acct("107")),
             None,
             None,
+            HashMap::new(),
         );
         assert!(c.route_transfer_accounts(&transfer("DOP", "1.00")).is_err());
         assert!(c.route_transfer_accounts(&transfer("USD", "1.00")).is_err());

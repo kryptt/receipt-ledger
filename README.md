@@ -153,7 +153,8 @@ and a missing required value fails loudly.
 | `FIREFLY_III_ACCESS_TOKEN` | — (required) | Firefly personal access token. |
 | `RECEIPT_FX_URL` | `https://api.frankfurter.dev/v1` | FX-rate provider (Frankfurter-compatible). |
 | `RECEIPT_PAYPAL_BALANCE_ACCOUNT` | — (required) | PayPal balance account — **numeric Firefly id**. |
-| `RECEIPT_PAYPAL_CREDIT_ACCOUNT` | — (optional) | PayPal Credit account id; absent → credit-funded mail → Review. |
+| `RECEIPT_PAYPAL_CREDIT_ACCOUNT` | — (optional) | PayPal Credit account id; absent → credit-funded mail → Review. Also the **destination** of a PayPal Credit payment booked as a transfer. |
+| `RECEIPT_PAYING_ACCOUNT_BY_LAST4` | — (optional) | `last4:accountid` pairs (e.g. `0130:1,5678:2`) mapping a payment's funding card/account last-4 to the **source** Firefly account for a PayPal Credit payment transfer. Unknown last-4 (or unset) → Review. Malformed → startup error. |
 | `RECEIPT_BANCO_POPULAR_USD_ACCOUNT` | — (optional) | Banco Popular non-DOP account id; absent → non-DOP mail → Review. |
 | `RECEIPT_BANCO_POPULAR_DOP_ACCOUNT` | — (optional) | Banco Popular DOP account id; absent → DOP mail → Review. |
 | `RECEIPT_MAX_AMOUNT` | — (optional) | Plausibility ceiling, **in US dollars**. A charge whose USD-equivalent (`fx_rate(currency→USD) × amount`) exceeds it routes to Review. Unset → no upper bound. So `100000` means ">$100,000 USD → Review"; a ₩100,000 (≈ $72) charge does **not** trip it. |

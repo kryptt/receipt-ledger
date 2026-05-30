@@ -10,6 +10,7 @@
 //! boundary, so a misconfigured non-numeric account name fails the CronJob here
 //! rather than producing an ambiguous routing path downstream.
 
+use std::collections::HashMap;
 use std::env;
 
 use anyhow::{Context, Result};
@@ -139,6 +140,12 @@ pub struct Config {
     /// PayPal Credit account in Firefly (liability, USD), by numeric id. `None`
     /// when unconfigured; a credit-funded PayPal record then routes to Review.
     pub paypal_credit_account: Option<AccountId>,
+    /// Funding-account lookup for PayPal Credit *payment* receipts, keyed by the
+    /// funding instrument's last-4 (e.g. `"0130" → account 1`). The payment
+    /// transfer's source leg is resolved here; a last-4 absent from this map (or
+    /// an empty map) routes the payment to Review rather than guessing a source.
+    /// Parsed from `RECEIPT_PAYING_ACCOUNT_BY_LAST4` (`last4:accountid` pairs).
+    pub paying_account_by_last4: HashMap<String, AccountId>,
     /// Banco Popular VISA USD account (liability, USD), by numeric id. `None`
     /// when unconfigured; a non-DOP Banco Popular record then routes to Review.
     pub banco_popular_usd_account: Option<AccountId>,
@@ -208,6 +215,9 @@ impl Config {
             paypal_balance_account: account_required("RECEIPT_PAYPAL_BALANCE_ACCOUNT")?,
             // Optional — absent means credit-funded PayPal mail routes to Review.
             paypal_credit_account: account_optional("RECEIPT_PAYPAL_CREDIT_ACCOUNT")?,
+            // Optional — absent/empty means PayPal-payment receipts route to
+            // Review (no source account can be resolved from the funding last-4).
+            paying_account_by_last4: account_map_by_last4("RECEIPT_PAYING_ACCOUNT_BY_LAST4")?,
             // Optional — absent means non-DOP Banco Popular mail routes to Review.
             banco_popular_usd_account: account_optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT")?,
             // Optional — absent means DOP Banco Popular mail routes to Review.
@@ -315,6 +325,38 @@ fn account_optional(key: &str) -> Result<Option<AccountId>> {
     }
 }
 
+/// Read and parse a `last4:accountid`-pair map env var (e.g. `"0130:1,5678:2"`).
+/// Absent/blank → an empty map (the PayPal-payment path then routes to Review).
+/// A malformed entry — missing the `:`, a blank last-4, or a non-numeric
+/// [`AccountId`] — is a hard startup error, like the other config parse
+/// failures, so a typo fails the CronJob loudly rather than silently dropping a
+/// funding-source route.
+fn account_map_by_last4(key: &str) -> Result<HashMap<String, AccountId>> {
+    match optional(key) {
+        None => Ok(HashMap::new()),
+        Some(raw) => parse_account_map_by_last4(&raw).with_context(|| format!("env var {key}")),
+    }
+}
+
+/// Parse a `last4:accountid`-pair map from a comma-separated string. Pure — the
+/// env read lives in [`account_map_by_last4`] — so the format is unit-testable
+/// without mutating the process environment.
+fn parse_account_map_by_last4(raw: &str) -> Result<HashMap<String, AccountId>> {
+    let mut map = HashMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (last4, id) = entry
+            .split_once(':')
+            .with_context(|| format!("entry {entry:?} is not `last4:accountid`"))?;
+        let last4 = last4.trim();
+        if last4.is_empty() {
+            anyhow::bail!("entry {entry:?} has an empty last-4 key");
+        }
+        let account = AccountId::parse(id).with_context(|| format!("entry {entry:?}"))?;
+        map.insert(last4.to_string(), account);
+    }
+    Ok(map)
+}
+
 /// Parse an optional [`Decimal`] env var. Absent → `None`; present but
 /// unparseable → hard error.
 fn decimal_optional(key: &str) -> Result<Option<Decimal>> {
@@ -353,5 +395,28 @@ mod tests {
         assert!(AccountId::parse("PayPal Balance").is_err());
         assert!(AccountId::parse("").is_err());
         assert!(AccountId::parse("10a").is_err());
+    }
+
+    #[test]
+    fn paying_account_map_parses_pairs() {
+        let map = parse_account_map_by_last4("0130:1,5678:2").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("0130").unwrap().as_str(), "1");
+        assert_eq!(map.get("5678").unwrap().as_str(), "2");
+        // Whitespace around entries and inside a pair is tolerated.
+        let spaced = parse_account_map_by_last4(" 0130 : 1 , 5678:2 ").unwrap();
+        assert_eq!(spaced.get("0130").unwrap().as_str(), "1");
+        // Blank → an empty map (routes payments to Review, not an error).
+        assert!(parse_account_map_by_last4("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn paying_account_map_rejects_malformed() {
+        // No colon separator.
+        assert!(parse_account_map_by_last4("0130").is_err());
+        // Non-numeric account id.
+        assert!(parse_account_map_by_last4("0130:abc").is_err());
+        // Empty last-4 key.
+        assert!(parse_account_map_by_last4(":1").is_err());
     }
 }

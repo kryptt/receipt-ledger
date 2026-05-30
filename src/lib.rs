@@ -23,15 +23,15 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{info, warn};
 
-use crate::adapters::Outcome;
+use crate::adapters::{Outcome, TransferRecord};
 use crate::config::{Config, ValidationPolicy};
-use crate::firefly::{FireflyClient, SubmitOutcome};
+use crate::firefly::{FireflyClient, SubmitOutcome, TransferSubmit};
 use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
 use crate::llm::LlmClient;
 use crate::statement::pipeline::{Ingest, classify_message, process_statement};
 use crate::usd_ceiling::CeilingVerdict;
-use crate::validate::{Verdict, validate};
+use crate::validate::{TransferVerdict, Verdict, validate, validate_transfer};
 
 /// Tallies for the end-of-run summary.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +107,7 @@ pub async fn run() -> Result<Summary> {
         cfg.banco_popular_dop_account.clone(),
         cfg.bp_paying_usd_account.clone(),
         cfg.bp_paying_dop_account.clone(),
+        cfg.paying_account_by_last4.clone(),
     );
 
     // --- per-message pipeline --------------------------------------------
@@ -259,18 +260,30 @@ async fn process_message(
         )));
     }
 
-    // 4. LLM extraction via ollama-router.
-    let prompt = adapter.prompt(&unwrapped.body);
-    let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
-    // `postprocess_with_body` applies any deterministic body-derived override
-    // (PayPal P1: a cross-currency receipt's authoritative USD total) on top of
-    // the model's extraction.
-    let records = match adapter
-        .postprocess_with_body(&json, &unwrapped.body)
-        .context("adapter postprocess")?
-    {
+    // 4. Extraction. A fixed-format source (PayPal Credit payment receipt) parses
+    //    its body deterministically and bypasses the LLM entirely; everything
+    //    else builds a prompt and asks the model. Both paths land on one
+    //    `Outcome`, so the routing below is shared.
+    let outcome = match adapter.deterministic_extract(&unwrapped.body) {
+        Some(result) => result.context("adapter deterministic_extract")?,
+        None => {
+            let prompt = adapter.prompt(&unwrapped.body);
+            let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
+            // `postprocess_with_body` applies any deterministic body-derived
+            // override (PayPal P1: a cross-currency receipt's authoritative USD
+            // total) on top of the model's extraction.
+            adapter
+                .postprocess_with_body(&json, &unwrapped.body)
+                .context("adapter postprocess")?
+        }
+    };
+
+    let records = match outcome {
         Outcome::Transaction(records) => records,
-        // The model classified the mail as a non-transaction → clean skip.
+        // A payment receipt → book as a transfer (funding account → credit), a
+        // distinct path from the withdrawal loop below.
+        Outcome::Transfer(tr) => return book_transfer(tr, firefly, fx, policy, dry_run).await,
+        // The mail was classified as a non-transaction → clean skip.
         Outcome::NotATransaction { reason } => return Ok(Disposition::Skipped(reason)),
     };
 
@@ -336,6 +349,76 @@ async fn process_message(
     } else {
         Disposition::Review(review_reason.unwrap_or_else(|| "no record booked".to_string()))
     })
+}
+
+/// Book a PayPal Credit payment receipt as a Firefly transfer: funding account
+/// (source, resolved from the receipt's funding last-4) → PayPal Credit account
+/// (destination, from config). Mirrors the withdrawal path's gates — the same
+/// USD-equivalent ceiling, then the transfer validation gate — but routes both
+/// account legs from config rather than from the record. A missing destination
+/// or an unresolved source is a clear Review (never guess an account); a
+/// transient rate outage defers (kept in INBOX for retry).
+async fn book_transfer(
+    tr: TransferRecord,
+    firefly: &FireflyClient<'_>,
+    fx: &FxClient<'_>,
+    policy: &ValidationPolicy,
+    dry_run: bool,
+) -> Result<Disposition> {
+    // Destination = the configured PayPal Credit account. Absent → Review.
+    let Some(dest) = firefly.paypal_credit_account() else {
+        return Ok(Disposition::Review(
+            "no Firefly account configured for PayPal Credit (RECEIPT_PAYPAL_CREDIT_ACCOUNT)"
+                .to_string(),
+        ));
+    };
+    // Source = the funding account resolved from the receipt's last-4. Absent
+    // (or empty map) → Review; we never guess which account funded the payment.
+    let Some(source) = firefly.paying_account_for_last4(&tr.funding_last4) else {
+        return Ok(Disposition::Review(format!(
+            "no paying account configured for funding last-4 {} (RECEIPT_PAYING_ACCOUNT_BY_LAST4)",
+            tr.funding_last4
+        )));
+    };
+
+    // USD-equivalent ceiling — same gate as withdrawals (a crafted huge payment
+    // must not silently move money). A transient rate outage defers the message.
+    match usd_ceiling_review(
+        fx,
+        policy,
+        tr.money.currency.as_str(),
+        tr.money.amount.value(),
+        tr.date,
+    )
+    .await
+    {
+        Ok(Some(reason)) => return Ok(Disposition::Review(reason)),
+        Ok(None) => {}
+        Err(e) if crate::fx::is_transient(&e) => {
+            return Ok(Disposition::Defer(format!("rate provider unavailable: {e}")));
+        }
+        Err(e) => return Err(e),
+    }
+
+    // The transfer gate mints a `ValidatedTransfer`; `submit_transfer_between`
+    // cannot be called without one, so the gate is impossible to skip.
+    let transfer = match validate_transfer(tr.money, tr.date, tr.description, tr.external_id) {
+        TransferVerdict::Booked(t) => t,
+        TransferVerdict::Review { reason } => return Ok(Disposition::Review(reason)),
+    };
+
+    if dry_run {
+        info!(external_id = transfer.external_id(), "DRY RUN: would book payment transfer");
+        return Ok(Disposition::Booked);
+    }
+    // `submit_transfer_between` verifies the transfer currency agrees with BOTH
+    // account currencies before booking; a mismatch is surfaced as a typed
+    // result we route to Review (never a silent cross-currency transfer).
+    match firefly.submit_transfer_between(&transfer, source, dest).await? {
+        TransferSubmit::Submitted(SubmitOutcome::Created) => Ok(Disposition::Booked),
+        TransferSubmit::Submitted(SubmitOutcome::Duplicate) => Ok(Disposition::Duplicate),
+        TransferSubmit::CurrencyMismatch { reason } => Ok(Disposition::Review(reason)),
+    }
 }
 
 /// Apply the USD-equivalent ceiling (`RECEIPT_MAX_AMOUNT`) to one record's

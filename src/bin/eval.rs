@@ -143,6 +143,11 @@ async fn run_one(llm: &LlmClient<'_>, ex: &Example) -> Result<Produced> {
         .context("adapter postprocess")?
     {
         Outcome::Transaction(records) => records,
+        // A transfer (PayPal-payment receipt) has no merchant/direction the eval
+        // scores, and is never produced via this LLM path anyway (it is
+        // deterministically extracted in the pipeline); project it like a
+        // non-transaction for this purchase-extraction harness.
+        Outcome::Transfer(_) => return Ok(Produced::not_a_transaction()),
         Outcome::NotATransaction { .. } => return Ok(Produced::not_a_transaction()),
     };
     let Some(record) = records.into_iter().next() else {

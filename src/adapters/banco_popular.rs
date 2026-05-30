@@ -195,6 +195,7 @@ mod tests {
                 assert_eq!(v.len(), 1);
                 v.pop().unwrap()
             }
+            Outcome::Transfer(_) => panic!("expected transaction, got transfer"),
             Outcome::NotATransaction { reason } => {
                 panic!("expected transaction, got skip: {reason}")
             }
@@ -273,6 +274,7 @@ mod tests {
         let v = json!({ "transactions": [approved_json()] });
         match BancoPopularAdapter.postprocess(&v).unwrap() {
             Outcome::Transaction(v) => assert_eq!(v.len(), 1),
+            Outcome::Transfer(_) => panic!("unexpected transfer"),
             Outcome::NotATransaction { reason } => panic!("unexpected skip: {reason}"),
         }
     }
