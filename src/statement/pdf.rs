@@ -195,10 +195,12 @@ fn collect_runs<R: Resolve>(
                 }
                 push_run(runs, &ctm, &tm, &s);
             }
-            Op::XObject { name } => {
-                if depth < MAX_FORM_DEPTH {
-                    recurse_xobject(name, ctm, resolve, resources, runs, depth);
-                }
+            // Recurse into Form XObjects (the footer summary box lives in one),
+            // bounded by MAX_FORM_DEPTH. Beyond the limit the guard fails and the
+            // op falls through to the ignored-ops wildcard below (a no-op) — the
+            // same effect as the previous inner depth check.
+            Op::XObject { name } if depth < MAX_FORM_DEPTH => {
+                recurse_xobject(name, ctm, resolve, resources, runs, depth);
             }
             // Deliberately ignored: graphics/path/color operators (no text) and
             // text-state operators that do not move the glyph origin we track —
