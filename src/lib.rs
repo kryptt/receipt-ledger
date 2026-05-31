@@ -82,7 +82,11 @@ pub async fn run() -> Result<Summary> {
     // FX over the shared client; converts foreign charges into the target
     // account's currency before booking. An FX error propagates from `submit`
     // and routes the message to Review (never books at a wrong amount).
-    let mut fx = FxClient::new(&http, &cfg.fx_url);
+    // Persistent FX cache on the `/state` volume: a date's rate is fetched once
+    // and reused across the hourly one-shot runs instead of re-hitting Frankfurter
+    // / the rate-limited Banco Popular consultaTasa every run a message lingers in
+    // the INBOX. Past-date rates never expire; the current-day rate has a 15-min TTL.
+    let mut fx = FxClient::new(&http, &cfg.fx_url).with_cache_file(&cfg.fx_cache_path);
     // Frankfurter has no Dominican Peso; attach Banco Popular's consultaTasa as a
     // DOP override when its credentials are configured.
     if let Some(d) = &cfg.dop_rate {
@@ -148,6 +152,14 @@ pub async fn run() -> Result<Summary> {
                         route(&mailbox, &msg.id, clean, cfg.dry_run).await;
                     }
                 }
+                Err(e) if is_transient_outage(&e) => {
+                    // A provider (FX/LLM) outage mid-statement — defer the whole
+                    // message (kept in INBOX, state not advanced); booked rows
+                    // dedup on retry. Never burn a statement to Review for a
+                    // transient network failure.
+                    hold_state = true;
+                    warn!(id = %msg.id, error = %e, "statement deferred (provider outage); kept in INBOX for retry");
+                }
                 Err(e) => {
                     summary.review += 1;
                     warn!(id = %msg.id, error = ?e, "statement processing error; routing to review");
@@ -178,18 +190,32 @@ pub async fn run() -> Result<Summary> {
                 warn!(id = %msg.id, %reason, "routing to review");
                 route(&mailbox, &msg.id, false, cfg.dry_run).await;
             }
-            Ok(Disposition::Defer(reason)) => {
-                // Transient rate outage — leave in INBOX, don't advance state.
+            // CENTRAL DEFER CHOKEPOINT: any transient FX/LLM provider outage,
+            // wherever it originated in processing this message, arrives here as a
+            // typed `Err` and defers (kept in INBOX, JMAP state not advanced) so
+            // the hourly cron retries — it is NEVER routed to Review. Making this
+            // the single classification site means a new provider call site cannot
+            // forget to defer. Booked rows dedup on retry.
+            Err(e) if is_transient_outage(&e) => {
                 hold_state = true;
-                warn!(id = %msg.id, %reason, "deferred (rate provider down); kept in INBOX for retry");
+                warn!(id = %msg.id, error = %e, "deferred (provider outage); kept in INBOX for retry");
             }
             Err(e) => {
-                // A per-message processing error is not fatal to the job.
+                // A genuine (non-transient) per-message processing error is not
+                // fatal to the job → Review.
                 summary.review += 1;
                 warn!(id = %msg.id, error = ?e, "processing error; routing to review");
                 route(&mailbox, &msg.id, false, cfg.dry_run).await;
             }
         }
+    }
+
+    // Persist the FX cache regardless of dry-run: it is rate data, not
+    // transaction/JMAP state, so writing it never books anything or advances the
+    // cursor — and persisting during dry-run observation is exactly when it most
+    // avoids re-fetching the same rates hourly. A write failure is non-fatal.
+    if let Err(e) = fx.persist() {
+        warn!(error = %e, "failed to persist FX cache (non-fatal)");
     }
 
     // --- 7. Persist state cursor -----------------------------------------
@@ -199,7 +225,7 @@ pub async fn run() -> Result<Summary> {
     if cfg.dry_run {
         info!("DRY RUN: not advancing JMAP state");
     } else if hold_state {
-        warn!("deferred messages kept in INBOX (rate provider down); not advancing JMAP state — will retry next run");
+        warn!("deferred messages kept in INBOX (provider outage); not advancing JMAP state — will retry next run");
     } else {
         jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
     }
@@ -208,6 +234,12 @@ pub async fn run() -> Result<Summary> {
 }
 
 /// What happened to a single message.
+///
+/// Note there is no `Defer` variant: a transient provider outage is expressed as
+/// a typed `Err` (`fx::RateError::Transient` / `llm::LlmError::Transient`) that
+/// propagates to [`run`]'s central classifier ([`is_transient_outage`]), which
+/// holds the message in the INBOX for retry. Keeping defer out of `Disposition`
+/// is what makes "transient never reaches Review" impossible to bypass per-site.
 #[derive(Debug)]
 enum Disposition {
     Booked,
@@ -215,10 +247,14 @@ enum Disposition {
     /// Not a transaction notification at all — a clean skip (→ Processed).
     Skipped(String),
     Review(String),
-    /// A transient rate-provider outage prevented a confident decision. The
-    /// message is left in the INBOX (not moved) and JMAP state is not advanced,
-    /// so the next run retries it. Anything already booked dedups on retry.
-    Defer(String),
+}
+
+/// Whether an error is a transient FX or LLM provider outage — the single
+/// predicate [`run`] uses to defer (keep in INBOX, retry next run) rather than
+/// route to Review. Walks the `anyhow` chain via each module's classifier, so it
+/// survives `.context(...)` wrapping and catches the outage wherever it arose.
+fn is_transient_outage(e: &anyhow::Error) -> bool {
+    crate::fx::is_transient(e) || crate::llm::is_transient(e)
 }
 
 /// The deterministic-core + I/O pipeline for one message.
@@ -271,6 +307,11 @@ async fn process_message(
         Some(result) => result.context("adapter deterministic_extract")?,
         None => {
             let prompt = adapter.prompt(&unwrapped.body);
+            // A transient LLM/FX outage is NOT caught here: it propagates as an
+            // `Err` carrying a typed `LlmError::Transient` / `RateError::Transient`,
+            // and `run()` classifies every such error to Defer (kept in INBOX,
+            // retried next run) at one chokepoint — so no call site can forget to
+            // defer and accidentally burn a real receipt to Review.
             let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
             // `postprocess_with_body` applies any deterministic body-derived
             // override (PayPal P1: a cross-currency receipt's authoritative USD
@@ -313,18 +354,14 @@ async fn process_message(
                 //     gate. An FX failure propagates as `Err` (→ Review), never
                 //     books an unscreened large amount.
                 let ext = validated.as_extracted();
-                match usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date).await {
-                    Ok(Some(reason)) => {
-                        review_reason.get_or_insert(reason);
-                        continue;
-                    }
-                    Ok(None) => {}
-                    // Transient rate outage → defer the whole message (retry next
-                    // run); permanent → propagate (→ Review).
-                    Err(e) if crate::fx::is_transient(&e) => {
-                        return Ok(Disposition::Defer(format!("rate provider unavailable: {e}")));
-                    }
-                    Err(e) => return Err(e),
+                // A transient rate outage propagates as `Err` and is deferred by
+                // `run()`'s central classifier; a permanent FX error also
+                // propagates (→ Review). An over-ceiling verdict is `Ok(Some)`.
+                if let Some(reason) =
+                    usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date).await?
+                {
+                    review_reason.get_or_insert(reason);
+                    continue;
                 }
 
                 // 6. Dedup key. 7. Submit to Firefly (skipped in dry-run).
@@ -404,12 +441,12 @@ async fn book_transfer(
     // shared between the two cannot mis-route. Absent (or empty map) → Review; we
     // never guess the source account.
     //
-    // Known limitation (NOT a bug): a cross-currency wire to a foreign own-account
-    // whose currency differs from the wire's settlement currency (e.g. a USD wire
-    // into a EUR ABN AMRO account) is caught downstream by the transfer
-    // currency-agreement guard in `submit_transfer_between` (a same-currency
-    // transfer books no FX leg) and routed to Review for manual entry. Such wires
-    // never auto-book — intentional, to avoid a silent cross-currency mis-book.
+    // Cross-currency wires (e.g. a USD wire into a EUR ABN AMRO account) ARE
+    // booked: `submit_transfer_between` books the exact settled amount on the
+    // source leg and an FX-estimated `foreign_amount` on the destination leg.
+    // The one case it still routes to Review is when the settlement currency
+    // disagrees with the SOURCE account's own currency (the source-leg debit
+    // would be unknown) — never a silent mis-book of the figure that left BPD.
     let source = match &tr.source {
         SourceHint::PayPalFundingLast4(last4) => match firefly.paying_account_for_last4(last4) {
             Some(source) => source,
@@ -430,22 +467,19 @@ async fn book_transfer(
     };
 
     // USD-equivalent ceiling — same gate as withdrawals (a crafted huge payment
-    // must not silently move money). A transient rate outage defers the message.
-    match usd_ceiling_review(
+    // must not silently move money). A transient rate outage propagates as `Err`
+    // and is deferred by `run()`'s central classifier (kept in INBOX); a
+    // permanent FX error also propagates (→ Review).
+    if let Some(reason) = usd_ceiling_review(
         fx,
         policy,
         tr.money.currency.as_str(),
         tr.money.amount.value(),
         tr.date,
     )
-    .await
+    .await?
     {
-        Ok(Some(reason)) => return Ok(Disposition::Review(reason)),
-        Ok(None) => {}
-        Err(e) if crate::fx::is_transient(&e) => {
-            return Ok(Disposition::Defer(format!("rate provider unavailable: {e}")));
-        }
-        Err(e) => return Err(e),
+        return Ok(Disposition::Review(reason));
     }
 
     // The transfer gate mints a `ValidatedTransfer`; `submit_transfer_between`
@@ -459,9 +493,11 @@ async fn book_transfer(
         info!(external_id = transfer.external_id(), "DRY RUN: would book payment transfer");
         return Ok(Disposition::Booked);
     }
-    // `submit_transfer_between` verifies the transfer currency agrees with BOTH
-    // account currencies before booking; a mismatch is surfaced as a typed
-    // result we route to Review (never a silent cross-currency transfer).
+    // `submit_transfer_between` books cross-currency (USD→EUR) by FX-converting
+    // the destination leg, but still requires the transfer currency to match the
+    // SOURCE account currency; if it doesn't, the source-leg debit is unknown and
+    // it returns a typed CurrencyMismatch we route to Review (never a guessed
+    // debit). A transient FX outage propagates as `Err` → deferred by `run()`.
     match firefly.submit_transfer_between(&transfer, source, dest).await? {
         TransferSubmit::Submitted(SubmitOutcome::Created) => Ok(Disposition::Booked),
         TransferSubmit::Submitted(SubmitOutcome::Duplicate) => Ok(Disposition::Duplicate),
