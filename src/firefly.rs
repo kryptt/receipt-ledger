@@ -545,14 +545,22 @@ impl<'a> FireflyClient<'a> {
             });
         }
         let split = splits.remove(0);
-        let current = Decimal::from_str_exact(split.amount.trim())
-            .map(|d| d.abs().normalize())
-            .map_err(|_| {
-                anyhow!(
-                    "journal {group_id} has an unparseable amount {:?}",
-                    split.amount
-                )
-            })?;
+        // Fail closed: without the inner journal id a PUT can't target this split
+        // (Firefly would treat an id-less split as a new one and drop the
+        // original). Never overwrite blind — route to Review.
+        if split.transaction_journal_id.trim().is_empty() {
+            return Ok(CorrectionOutcome::Review {
+                reason: format!(
+                    "journal {group_id} split has no transaction_journal_id; not auto-correcting"
+                ),
+            });
+        }
+        let current = split_magnitude(&split.amount).ok_or_else(|| {
+            anyhow!(
+                "journal {group_id} has an unparseable amount {:?}",
+                split.amount
+            )
+        })?;
 
         // 2. Gate.
         match correction_decision(current, expected, billed, max_pct) {
@@ -998,12 +1006,20 @@ fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Paginati
 /// cleanly against a statement charge's non-negative [`Amount`], regardless of
 /// the sign convention Firefly returns. `None` here is counted as a skip by the
 /// caller (never silently dropped).
+/// Parse a Firefly split's `amount` string to a positive magnitude (abs, trailing
+/// zeros trimmed). Firefly's sign convention varies by transaction type, so the
+/// magnitude is what both reconciliation and amount-correction compare on. `None`
+/// when the string is not a decimal. Shared by [`existing_journal`] and
+/// [`FireflyClient::correct_amount`] so the normalization rule lives once.
+fn split_magnitude(amount: &str) -> Option<Decimal> {
+    Decimal::from_str_exact(amount.trim())
+        .ok()
+        .map(|d| d.abs().normalize())
+}
+
 fn existing_journal(group_id: &str, split: &TxSplit) -> Option<ExistingJournal> {
     let date = parse_firefly_date(&split.date)?;
-    let magnitude = Decimal::from_str_exact(split.amount.trim())
-        .ok()?
-        .abs()
-        .normalize();
+    let magnitude = split_magnitude(&split.amount)?;
     let amount = Amount::parse(&magnitude.to_string()).ok()?;
     let currency = Currency::parse(split.currency_code.trim()).ok()?;
     Some(ExistingJournal {

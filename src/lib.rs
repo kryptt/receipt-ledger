@@ -45,6 +45,11 @@ pub struct Summary {
     /// Statement PDFs processed (their per-row tallies fold into the fields
     /// above; this is just how many statement messages were handled).
     pub statements: usize,
+    /// Phase-2 amount auto-corrections applied (statement charges whose booked
+    /// estimate was rewritten in place to the statement's billed figure). Tracked
+    /// separately because a correction is an in-place mutation, not a booking — it
+    /// would otherwise be invisible in the run summary.
+    pub corrected: usize,
 }
 
 /// Run the full one-shot pipeline. Returns the run summary on success; an
@@ -118,6 +123,21 @@ pub async fn run() -> Result<Summary> {
         cfg.swift_dest_by_bic.clone(),
     );
 
+    // Alias map for the consumo double-book probe (Phase 2), fetched once so the
+    // probe canonicalizes merchants the same way the statement reconciler does
+    // (otherwise an alias-only rename would slip past it and double-book). Empty
+    // unless the probe is enabled and a rule group is configured.
+    let consumo_aliases = if cfg.bp_double_book_probe
+        && let Some(group) = &cfg.bp_alias_rule_group
+    {
+        firefly.fetch_alias_map(group).await.unwrap_or_else(|e| {
+            warn!(error = ?e, "consumo-probe alias map fetch failed; proceeding without aliases");
+            Vec::new()
+        })
+    } else {
+        Vec::new()
+    };
+
     // --- per-message pipeline --------------------------------------------
     let mut summary = Summary::default();
     // Set when any message defers on a transient rate outage: the batch's JMAP
@@ -136,6 +156,7 @@ pub async fn run() -> Result<Summary> {
                 Ok(report) => {
                     summary.booked += report.booked_new + report.payments_booked;
                     summary.duplicates += report.reconciled;
+                    summary.corrected += report.corrected;
                     summary.review +=
                         report.review + report.amount_mismatch + report.unmatched_booked;
                     if report.deferred > 0 {
@@ -180,6 +201,7 @@ pub async fn run() -> Result<Summary> {
             &cfg.validation,
             cfg.dry_run,
             cfg.bp_double_book_probe,
+            &consumo_aliases,
         )
         .await
         {
@@ -273,6 +295,7 @@ fn is_transient_outage(e: &anyhow::Error) -> bool {
 }
 
 /// The deterministic-core + I/O pipeline for one message.
+#[allow(clippy::too_many_arguments)]
 async fn process_message(
     msg: &FetchedMessage,
     llm: &LlmClient<'_>,
@@ -281,6 +304,7 @@ async fn process_message(
     policy: &ValidationPolicy,
     dry_run: bool,
     double_book_probe: bool,
+    aliases: &[(String, String)],
 ) -> Result<Disposition> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
     //    original sender.
@@ -399,7 +423,7 @@ async fn process_message(
                         .statement_duplicate_probe(
                             ext,
                             &crate::statement::reconcile::ReconcileParams::default(),
-                            &[],
+                            aliases,
                         )
                         .await?
                 {

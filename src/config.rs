@@ -436,17 +436,34 @@ fn parse_account_map(
     key_label: &str,
     normalize_key: impl Fn(&str) -> String,
 ) -> Result<HashMap<String, AccountId>> {
+    parse_kv_map(raw, &format!("{key_label}:accountid"), normalize_key, |v| {
+        AccountId::parse(v)
+    })
+}
+
+/// Parse a comma-separated `key:value`-pair map. `normalize_key` is applied to
+/// each key; `parse_value` parses (and validates) each value. Only the FIRST `:`
+/// of an entry splits key from value, so a value may itself contain `:`-free
+/// spaces (e.g. a category name). A missing `:`, an empty key, or a `parse_value`
+/// failure is a hard error. Shared by the account-id maps (last-4 / BIC) and the
+/// MCC→category map so the entry grammar and error behaviour stay identical.
+fn parse_kv_map<V>(
+    raw: &str,
+    label: &str,
+    normalize_key: impl Fn(&str) -> String,
+    parse_value: impl Fn(&str) -> Result<V>,
+) -> Result<HashMap<String, V>> {
     let mut map = HashMap::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (key, id) = entry
+        let (key, value) = entry
             .split_once(':')
-            .with_context(|| format!("entry {entry:?} is not `{key_label}:accountid`"))?;
+            .with_context(|| format!("entry {entry:?} is not `{label}`"))?;
         let key = key.trim();
         if key.is_empty() {
-            anyhow::bail!("entry {entry:?} has an empty {key_label} key");
+            anyhow::bail!("entry {entry:?} has an empty key");
         }
-        let account = AccountId::parse(id).with_context(|| format!("entry {entry:?}"))?;
-        map.insert(normalize_key(key), account);
+        let value = parse_value(value).with_context(|| format!("entry {entry:?}"))?;
+        map.insert(normalize_key(key), value);
     }
     Ok(map)
 }
@@ -468,18 +485,18 @@ fn mcc_category_map(key: &str) -> Result<HashMap<String, String>> {
 /// (only the FIRST `:` splits key from value, so a category may itself contain no
 /// `:` but may contain spaces). Empty mcc or category is a hard error. Pure.
 fn parse_mcc_category_map(raw: &str) -> Result<HashMap<String, String>> {
-    let mut map = HashMap::new();
-    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (mcc, category) = entry
-            .split_once(':')
-            .with_context(|| format!("entry {entry:?} is not `mcc:category`"))?;
-        let (mcc, category) = (mcc.trim(), category.trim());
-        if mcc.is_empty() || category.is_empty() {
-            anyhow::bail!("entry {entry:?} has an empty mcc or category");
-        }
-        map.insert(mcc.to_string(), category.to_string());
-    }
-    Ok(map)
+    parse_kv_map(
+        raw,
+        "mcc:category",
+        |k| k.to_string(),
+        |v| {
+            let v = v.trim();
+            if v.is_empty() {
+                anyhow::bail!("empty category");
+            }
+            Ok(v.to_string())
+        },
+    )
 }
 
 /// Parse an optional [`Decimal`] env var. Absent → `None`; present but
