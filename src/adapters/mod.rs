@@ -10,6 +10,7 @@ pub mod banco_popular;
 pub mod parse;
 pub mod paypal;
 pub mod paypal_payment;
+pub mod swift;
 
 use std::sync::OnceLock;
 
@@ -20,14 +21,17 @@ use serde_json::Value;
 use crate::schema::{Extracted, Money};
 
 /// A payment booked as a Firefly **transfer** (funding bank account → a card /
-/// credit liability), as extracted from a payment-receipt email.
+/// credit liability, or → the user's own foreign account), as extracted from a
+/// payment-receipt or wire-confirmation email.
 ///
 /// Distinct from [`Extracted`] (a withdrawal/deposit candidate): a transfer
 /// moves money *between two own accounts*, so it carries no merchant and no
-/// direction — both legs are the same currency. The destination is deliberately
-/// absent: the pipeline supplies it from config (mirroring how withdrawal
-/// account routing lives outside the adapter), and the source is resolved from
-/// [`funding_last4`](TransferRecord::funding_last4) against a config map.
+/// direction — both legs are the same currency. The *account ids* are
+/// deliberately absent from the record: the pipeline supplies them from config
+/// (mirroring how withdrawal account routing lives outside the adapter). The
+/// source is resolved from [`source`](TransferRecord::source) (which names BOTH
+/// the last-4 *and* the config map it resolves against); the destination is
+/// chosen by [`dest`](TransferRecord::dest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRecord {
     /// The transfer amount + currency (same currency on both legs).
@@ -36,11 +40,54 @@ pub struct TransferRecord {
     pub date: NaiveDate,
     /// Human-readable description for the Firefly split.
     pub description: String,
-    /// Dedup key (Firefly `external_id`), e.g. `pp-payment:<transaction id>`.
+    /// Dedup key (Firefly `external_id`), e.g. `pp-payment:<transaction id>` or
+    /// `swift:<uetr>`.
     pub external_id: String,
-    /// Last-4 of the funding instrument (e.g. `0130`), resolved by the pipeline
-    /// against the configured `last4 → account id` map to pick the source.
-    pub funding_last4: String,
+    /// How the pipeline should resolve the *source* (funding/debtor) leg's
+    /// account id. A closed set that names BOTH the instrument's last-4 and the
+    /// config map it resolves against, so a PayPal funding card and a SWIFT
+    /// debtor IBAN with a colliding last-4 cannot resolve against the same map.
+    pub source: SourceHint,
+    /// How the pipeline should resolve the *destination* leg's account id. A
+    /// closed set so a new transfer source forces a routing decision rather than
+    /// silently defaulting.
+    pub dest: DestHint,
+}
+
+/// How the pipeline resolves a [`TransferRecord`]'s *source* (funding/debtor)
+/// account id.
+///
+/// A sum type rather than a bare last-4 string, so the last-4 always carries the
+/// *map* it should resolve against. This makes a last-4 collision between two
+/// unrelated instruments (a PayPal funding card vs. a BPD IBAN) unrepresentable:
+/// the PayPal path resolves against `RECEIPT_PAYING_ACCOUNT_BY_LAST4` and the
+/// SWIFT path against the dedicated `RECEIPT_SWIFT_DEBTOR_BY_LAST4`, never the
+/// same map. [`crate::book_transfer`] must `match` exhaustively.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceHint {
+    /// A PayPal-payment funding card, resolved from its last-4 against
+    /// `RECEIPT_PAYING_ACCOUNT_BY_LAST4`.
+    PayPalFundingLast4(String),
+    /// A SWIFT outbound wire's debtor IBAN, resolved from its last-4 against the
+    /// dedicated `RECEIPT_SWIFT_DEBTOR_BY_LAST4` map (kept separate from the
+    /// PayPal funding map so a colliding last-4 cannot mis-route).
+    SwiftDebtorLast4(String),
+}
+
+/// How the pipeline resolves a [`TransferRecord`]'s destination account id.
+///
+/// A sum type rather than a stringly-typed field, so [`crate::book_transfer`]
+/// must `match` exhaustively — adding a new transfer source forces a destination
+/// routing decision instead of silently mis-booking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestHint {
+    /// The configured PayPal Credit account (`RECEIPT_PAYPAL_CREDIT_ACCOUNT`).
+    /// Used by the PayPal-payment receipt path, which carries no BIC.
+    PayPalCredit,
+    /// A SWIFT outbound wire: the destination is the user's own foreign account,
+    /// resolved from the creditor institution's normalized 8-char BIC against
+    /// the configured `BIC → account id` map (`RECEIPT_SWIFT_DEST_BY_BIC`).
+    CreditorBic(String),
 }
 
 /// What an adapter made of an email.

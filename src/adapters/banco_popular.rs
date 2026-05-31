@@ -15,6 +15,18 @@
 //!   sanitizing gate so the gate sees a clean decimal (`5130.00`), and
 //! - dates are `DD/MM/YYYY`, NOT US `m/d` — `27/05/2026` is 27 May, not an
 //!   invalid month. The date format list reflects this.
+//!
+//! ## Two body shapes, one sender
+//!
+//! The same sender (`notificaciones@popularenlinea.com`) also delivers a
+//! "Confirmación Mensaje Swift Operado" — an outbound international-wire
+//! confirmation carrying a SWIFT pacs.008 message. Because adapter selection is
+//! sender-only, this adapter must handle BOTH shapes. It disambiguates from the
+//! *body* in [`deterministic_extract`](BancoPopularAdapter::deterministic_extract):
+//! a SWIFT confirmation ([`swift::try_parse_swift`] matches) is parsed
+//! deterministically into an [`Outcome::Transfer`] (BPD debtor account → the
+//! user's own foreign account); a normal consumo returns `None` there and falls
+//! through UNCHANGED to the LLM `prompt`/`postprocess` path below.
 
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
@@ -24,6 +36,7 @@ use super::parse::{
     collect_objects, currency_field, parse_amount_with, parse_date_with, string_field,
     strip_thousands_commas,
 };
+use super::swift;
 use super::{Adapter, Outcome};
 use crate::schema::{Direction, Extracted, Money, Source};
 
@@ -39,6 +52,27 @@ impl Adapter for BancoPopularAdapter {
 
     fn matches(&self, original_sender: &str) -> bool {
         original_sender.contains(BANCO_SENDER)
+    }
+
+    /// Both a consumo notification and a SWIFT confirmation are real
+    /// transactions, so neither is a clean skip. A consumo carries no rigid
+    /// pre-LLM marker, so we keep the permissive default (`true`) for it and let
+    /// the LLM + validation gates decide; a SWIFT body is likewise a transaction
+    /// (handled deterministically in [`deterministic_extract`](Self::deterministic_extract)).
+    /// Returning `true` for both ensures the SWIFT body is not skipped before the
+    /// deterministic seam runs.
+    fn is_transaction(&self, _body: &str) -> bool {
+        true
+    }
+
+    /// Disambiguate the two body shapes this single sender delivers. A SWIFT
+    /// pacs.008 confirmation is parsed deterministically into an
+    /// [`Outcome::Transfer`] (`Some(Ok(..))`), or `Some(Err(..))` when it looks
+    /// like SWIFT but a required field is missing (→ Review). A normal consumo
+    /// returns `None`, falling through UNCHANGED to the LLM `prompt`/`postprocess`
+    /// path. Pure: no I/O.
+    fn deterministic_extract(&self, body: &str) -> Option<Result<Outcome>> {
+        swift::try_parse_swift_outcome(body)
     }
 
     fn prompt(&self, email_text: &str) -> String {
@@ -207,6 +241,54 @@ mod tests {
         assert!(BancoPopularAdapter.matches("notificaciones@popularenlinea.com"));
         assert!(BancoPopularAdapter.matches("<notificaciones@popularenlinea.com>"));
         assert!(!BancoPopularAdapter.matches("service@paypal.com"));
+    }
+
+    /// A SWIFT confirmation body shares the consumo sender, so it must be
+    /// disambiguated in `deterministic_extract` and yield a Transfer.
+    fn swift_body() -> &'static str {
+        "Confirmacion Mensaje Swift Operado\n\
+       MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
+             <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
+             <IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
+             <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
+             <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
+             <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
+             <Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n"
+    }
+
+    /// A plain-text consumo body (NOT the LLM JSON) — the input the pipeline
+    /// hands `deterministic_extract`. It must NOT be classified as SWIFT.
+    fn consumo_body() -> &'static str {
+        "Notificación de Consumo\n\
+         EUR$1.50  Euro  27/05/2026  Example Cafe Amsterdam  Aprobada\n\
+         Tarjeta terminada en 1234"
+    }
+
+    #[test]
+    fn deterministic_extract_takes_over_swift_body() {
+        // A SWIFT confirmation → Some(Ok(Transfer)); the consumo's LLM path is
+        // bypassed for it.
+        let outcome = BancoPopularAdapter
+            .deterministic_extract(swift_body())
+            .expect("SWIFT body → Some")
+            .expect("the sample parses");
+        match outcome {
+            Outcome::Transfer(t) => {
+                assert_eq!(
+                    t.source,
+                    crate::adapters::SourceHint::SwiftDebtorLast4("4189".to_string())
+                );
+                assert_eq!(t.external_id, "swift:5dd60267-659f-446e-92c4-c1540b8f8253");
+            }
+            other => panic!("expected transfer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deterministic_extract_passes_through_consumo_to_llm() {
+        // A normal consumo body → None, so the pipeline uses the LLM prompt path
+        // (UNCHANGED). SWIFT handling never touches the consumo route.
+        assert!(BancoPopularAdapter.deterministic_extract(consumo_body()).is_none());
     }
 
     #[test]

@@ -94,10 +94,23 @@ pub struct FireflyClient<'a> {
     /// payment booked as a transfer. `None` → such payments error out (→ Review).
     bp_paying_dop_account: Option<AccountId>,
     /// Funding-account lookup for PayPal Credit *payment* receipts, keyed by the
-    /// funding instrument's last-4. The payment transfer's source leg is resolved
-    /// here; a last-4 absent from this map (or an empty map) routes the payment to
-    /// Review rather than guessing a source.
+    /// funding card's last-4. The payment transfer's source leg is resolved here;
+    /// a last-4 absent from this map (or an empty map) routes the payment to
+    /// Review rather than guessing a source. SWIFT wires use the dedicated
+    /// [`swift_debtor_by_last4`](Self::swift_debtor_by_last4) map instead, so a
+    /// colliding last-4 cannot mis-route across the two sources.
     paying_account_by_last4: HashMap<String, AccountId>,
+    /// Source-account lookup for outbound SWIFT wires, keyed by the debtor IBAN's
+    /// last-4. Dedicated to SWIFT (kept separate from
+    /// [`paying_account_by_last4`](Self::paying_account_by_last4)); a last-4
+    /// absent from this map (or an empty map) routes the wire to Review.
+    swift_debtor_by_last4: HashMap<String, AccountId>,
+    /// Destination-account lookup for outbound SWIFT wires, keyed by the
+    /// creditor institution's normalized 8-char BIC. The wire transfer's
+    /// destination leg (the user's own foreign account) is resolved here; a BIC
+    /// absent from this map (or an empty map) routes the wire to Review rather
+    /// than auto-booking a wire to an unmapped/third-party account.
+    swift_dest_by_bic: HashMap<String, AccountId>,
     /// Per-account-id target cache: numeric account id → its Firefly
     /// `currency_code` + `decimal_places`. Authoritative source of the
     /// conversion target so we book in the account's real currency at its real
@@ -188,6 +201,8 @@ impl<'a> FireflyClient<'a> {
         bp_paying_usd_account: Option<AccountId>,
         bp_paying_dop_account: Option<AccountId>,
         paying_account_by_last4: HashMap<String, AccountId>,
+        swift_debtor_by_last4: HashMap<String, AccountId>,
+        swift_dest_by_bic: HashMap<String, AccountId>,
     ) -> Self {
         Self {
             http,
@@ -201,6 +216,8 @@ impl<'a> FireflyClient<'a> {
             bp_paying_usd_account,
             bp_paying_dop_account,
             paying_account_by_last4,
+            swift_debtor_by_last4,
+            swift_dest_by_bic,
             account_target: Mutex::new(HashMap::new()),
         }
     }
@@ -413,6 +430,28 @@ impl<'a> FireflyClient<'a> {
     #[must_use]
     pub fn paying_account_for_last4(&self, last4: &str) -> Option<&AccountId> {
         self.paying_account_by_last4.get(last4)
+    }
+
+    /// Resolve the source (debtor) account for an outbound SWIFT wire from the
+    /// debtor IBAN's last-4 against the DEDICATED SWIFT debtor map. `None` when
+    /// the last-4 is absent (or the map is empty) — the pipeline then routes the
+    /// wire to Review rather than guessing a source account. Kept separate from
+    /// [`paying_account_for_last4`](Self::paying_account_for_last4) so a PayPal
+    /// funding last-4 and a BPD IBAN last-4 cannot collide.
+    #[must_use]
+    pub fn swift_debtor_for_last4(&self, last4: &str) -> Option<&AccountId> {
+        self.swift_debtor_by_last4.get(last4)
+    }
+
+    /// Resolve the destination (foreign own-account) for an outbound SWIFT wire
+    /// from the creditor institution's normalized 8-char BIC against the
+    /// configured map. The lookup uppercases the BIC so it matches the
+    /// uppercased map keys regardless of case. `None` when the BIC is absent (or
+    /// the map is empty) — the pipeline then routes the wire to Review rather
+    /// than auto-booking a wire to an unmapped/third-party account.
+    #[must_use]
+    pub fn swift_dest_for_bic(&self, bic: &str) -> Option<&AccountId> {
+        self.swift_dest_by_bic.get(&bic.to_ascii_uppercase())
     }
 
     /// Resolve `(source paying account, destination card account)` for a transfer
@@ -1052,7 +1091,16 @@ mod tests {
             Some(acct("107")), // Banco Popular DOP
             Some(acct("201")), // BP USD savings (paying)
             Some(acct("202")), // BP DOP checking (paying)
-            HashMap::from([("0130".to_string(), acct("1"))]), // PayPal-payment funding by last-4
+            HashMap::from([
+                ("0130".to_string(), acct("1")), // PayPal-payment funding by last-4
+            ]),
+            HashMap::from([
+                ("4189".to_string(), acct("127")), // SWIFT debtor IBAN last-4 (BPD)
+            ]),
+            HashMap::from([
+                ("CHASUS33".to_string(), acct("1")), // SWIFT creditor BIC → own foreign account
+                ("ABNANL2A".to_string(), acct("8")),
+            ]),
         )
     }
 
@@ -1156,6 +1204,8 @@ mod tests {
             None,
             None,
             None,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
         );
         assert!(
@@ -1291,6 +1341,63 @@ mod tests {
     }
 
     #[test]
+    fn swift_debtor_map_is_independent_of_paying_map() {
+        // Fix 5: the SWIFT debtor and PayPal funding maps are SEPARATE. The
+        // SWIFT debtor last-4 4189 resolves only via `swift_debtor_for_last4`
+        // (→ 127), and the PayPal funding last-4 0130 only via
+        // `paying_account_for_last4` (→ 1); neither leaks into the other.
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        assert_eq!(c.swift_debtor_for_last4("4189").map(AccountId::as_str), Some("127"));
+        // The SWIFT debtor last-4 is NOT in the PayPal funding map.
+        assert!(c.paying_account_for_last4("4189").is_none());
+        // The PayPal funding last-4 is NOT in the SWIFT debtor map.
+        assert!(c.swift_debtor_for_last4("0130").is_none());
+        // An unmapped SWIFT debtor last-4 → None (→ Review).
+        assert!(c.swift_debtor_for_last4("9999").is_none());
+    }
+
+    #[test]
+    fn swift_wire_routes_debtor_last4_to_creditor_bic_accounts() {
+        // The SWIFT path resolves source from the debtor IBAN last-4 (4189 → 127)
+        // via the DEDICATED SWIFT debtor map and dest from the normalized creditor
+        // BIC (CHASUS33 → 1), then builds a same-currency transfer between exactly
+        // those account ids.
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        let source = c.swift_debtor_for_last4("4189").expect("debtor last-4 mapped");
+        let dest = c.swift_dest_for_bic("CHASUS33").expect("creditor BIC mapped");
+        assert_eq!(source.as_str(), "127");
+        assert_eq!(dest.as_str(), "1");
+
+        let t = transfer("USD", "2100.00");
+        let json =
+            serde_json::to_value(build_transfer_group(&t, source.as_str(), dest.as_str())).unwrap();
+        let split = &json["transactions"][0];
+        assert_eq!(split["type"], "transfer");
+        assert_eq!(split["amount"], "2100");
+        assert_eq!(split["currency_code"], "USD");
+        assert_eq!(split["source_id"], "127", "BPD debtor is the source");
+        assert_eq!(split["destination_id"], "1", "own foreign account is the destination");
+        assert!(split.get("foreign_amount").is_none(), "same-currency, no FX");
+    }
+
+    #[test]
+    fn resolves_swift_dest_by_bic() {
+        let http = Client::new();
+        let fx = fx(&http);
+        let c = client(&http, &fx);
+        assert_eq!(c.swift_dest_for_bic("CHASUS33").map(AccountId::as_str), Some("1"));
+        assert_eq!(c.swift_dest_for_bic("ABNANL2A").map(AccountId::as_str), Some("8"));
+        // Lookup is case-insensitive (keys are uppercased at parse + lookup).
+        assert_eq!(c.swift_dest_for_bic("chasus33").map(AccountId::as_str), Some("1"));
+        // An unmapped BIC → None (the pipeline routes such a wire to Review).
+        assert!(c.swift_dest_for_bic("DEUTDEFF").is_none());
+    }
+
+    #[test]
     fn transfer_with_unconfigured_paying_account_errors() {
         let http = Client::new();
         let fx = fx(&http);
@@ -1306,6 +1413,8 @@ mod tests {
             Some(acct("107")),
             None,
             None,
+            HashMap::new(),
+            HashMap::new(),
             HashMap::new(),
         );
         assert!(c.route_transfer_accounts(&transfer("DOP", "1.00")).is_err());

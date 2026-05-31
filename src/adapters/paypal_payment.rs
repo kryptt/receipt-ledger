@@ -21,7 +21,7 @@ use chrono::NaiveDate;
 use serde_json::Value;
 
 use super::parse::strip_thousands_commas;
-use super::{Adapter, Outcome, TransferRecord};
+use super::{Adapter, DestHint, Outcome, SourceHint, TransferRecord};
 use crate::schema::{Amount, Currency, Money};
 
 /// Sender substring that identifies a PayPal Credit payment receipt. Note this
@@ -121,7 +121,12 @@ fn parse_payment(body: &str) -> Result<TransferRecord> {
         date,
         description: PAYMENT_DESCRIPTION.to_string(),
         external_id: format!("pp-payment:{transaction_id}"),
-        funding_last4,
+        // The funding card's last-4 resolves against the PayPal funding map
+        // (RECEIPT_PAYING_ACCOUNT_BY_LAST4), never the SWIFT debtor map.
+        source: SourceHint::PayPalFundingLast4(funding_last4),
+        // A PayPal Credit payment's destination is the configured PayPal Credit
+        // account; the pipeline resolves it (this path carries no BIC).
+        dest: DestHint::PayPalCredit,
     })
 }
 
@@ -346,7 +351,7 @@ mod tests {
         assert_eq!(t.money.currency.as_str(), "USD");
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
         assert_eq!(t.external_id, "pp-payment:49R50555FK9130709");
-        assert_eq!(t.funding_last4, "0130");
+        assert_eq!(t.source, SourceHint::PayPalFundingLast4("0130".to_string()));
         assert_eq!(t.description, "Payment to PayPal Credit");
     }
 

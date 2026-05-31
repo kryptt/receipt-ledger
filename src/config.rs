@@ -146,6 +146,22 @@ pub struct Config {
     /// an empty map) routes the payment to Review rather than guessing a source.
     /// Parsed from `RECEIPT_PAYING_ACCOUNT_BY_LAST4` (`last4:accountid` pairs).
     pub paying_account_by_last4: HashMap<String, AccountId>,
+    /// Source-account lookup for outbound SWIFT wires, keyed by the debtor IBAN's
+    /// last-4 (e.g. `"4189" → account 127`). DEDICATED to SWIFT — kept separate
+    /// from [`paying_account_by_last4`](Config::paying_account_by_last4) so a
+    /// PayPal funding card and a BPD IBAN that share a last-4 cannot collide. The
+    /// wire transfer's source leg (the BPD debtor account) is resolved here; a
+    /// last-4 absent from this map (or an empty map) routes the wire to Review.
+    /// Parsed from `RECEIPT_SWIFT_DEBTOR_BY_LAST4` (`last4:accountid` pairs).
+    pub swift_debtor_by_last4: HashMap<String, AccountId>,
+    /// Destination-account lookup for outbound SWIFT wires, keyed by the
+    /// creditor institution's normalized 8-char BIC (e.g. `"CHASUS33" → account
+    /// 1`, `"ABNANL2A" → account 8`). The wire transfer's destination leg (the
+    /// user's own foreign account) is resolved here; a BIC absent from this map
+    /// (or an empty map) routes the wire to Review rather than guessing a — or
+    /// auto-booking a wire to a third-party — account. Parsed from
+    /// `RECEIPT_SWIFT_DEST_BY_BIC` (`BIC:accountid` pairs); keys are uppercased.
+    pub swift_dest_by_bic: HashMap<String, AccountId>,
     /// Banco Popular VISA USD account (liability, USD), by numeric id. `None`
     /// when unconfigured; a non-DOP Banco Popular record then routes to Review.
     pub banco_popular_usd_account: Option<AccountId>,
@@ -218,6 +234,13 @@ impl Config {
             // Optional — absent/empty means PayPal-payment receipts route to
             // Review (no source account can be resolved from the funding last-4).
             paying_account_by_last4: account_map_by_last4("RECEIPT_PAYING_ACCOUNT_BY_LAST4")?,
+            // Optional — absent/empty means SWIFT wires route to Review (no
+            // source account can be resolved from the debtor IBAN last-4).
+            // Dedicated to SWIFT so a PayPal funding last-4 cannot collide.
+            swift_debtor_by_last4: account_map_by_last4("RECEIPT_SWIFT_DEBTOR_BY_LAST4")?,
+            // Optional — absent/empty means SWIFT wires route to Review (no
+            // destination account can be resolved from the creditor BIC).
+            swift_dest_by_bic: account_map_by_bic("RECEIPT_SWIFT_DEST_BY_BIC")?,
             // Optional — absent means non-DOP Banco Popular mail routes to Review.
             banco_popular_usd_account: account_optional("RECEIPT_BANCO_POPULAR_USD_ACCOUNT")?,
             // Optional — absent means DOP Banco Popular mail routes to Review.
@@ -338,21 +361,51 @@ fn account_map_by_last4(key: &str) -> Result<HashMap<String, AccountId>> {
     }
 }
 
+/// Read and parse a `BIC:accountid`-pair map env var (e.g.
+/// `"CHASUS33:1,ABNANL2A:8"`). Absent/blank → an empty map (the SWIFT path then
+/// routes to Review). Parses exactly like [`account_map_by_last4`] but uppercases
+/// each BIC key so lookups against the normalized creditor BIC are
+/// case-insensitive. A malformed entry is a hard startup error.
+fn account_map_by_bic(key: &str) -> Result<HashMap<String, AccountId>> {
+    match optional(key) {
+        None => Ok(HashMap::new()),
+        Some(raw) => parse_account_map_by_bic(&raw).with_context(|| format!("env var {key}")),
+    }
+}
+
 /// Parse a `last4:accountid`-pair map from a comma-separated string. Pure — the
 /// env read lives in [`account_map_by_last4`] — so the format is unit-testable
 /// without mutating the process environment.
 fn parse_account_map_by_last4(raw: &str) -> Result<HashMap<String, AccountId>> {
+    parse_account_map(raw, "last-4", |k| k.to_string())
+}
+
+/// Parse a `BIC:accountid`-pair map (keys uppercased). Pure — see
+/// [`account_map_by_bic`].
+fn parse_account_map_by_bic(raw: &str) -> Result<HashMap<String, AccountId>> {
+    parse_account_map(raw, "BIC", |k| k.to_ascii_uppercase())
+}
+
+/// Parse a comma-separated `key:accountid`-pair map, applying `normalize_key` to
+/// each key. Shared by the last-4 and BIC maps so the `key:id` grammar,
+/// whitespace tolerance, and hard-error-on-malformed behaviour stay identical.
+/// `key_label` only sharpens the error message. Pure.
+fn parse_account_map(
+    raw: &str,
+    key_label: &str,
+    normalize_key: impl Fn(&str) -> String,
+) -> Result<HashMap<String, AccountId>> {
     let mut map = HashMap::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (last4, id) = entry
+        let (key, id) = entry
             .split_once(':')
-            .with_context(|| format!("entry {entry:?} is not `last4:accountid`"))?;
-        let last4 = last4.trim();
-        if last4.is_empty() {
-            anyhow::bail!("entry {entry:?} has an empty last-4 key");
+            .with_context(|| format!("entry {entry:?} is not `{key_label}:accountid`"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            anyhow::bail!("entry {entry:?} has an empty {key_label} key");
         }
         let account = AccountId::parse(id).with_context(|| format!("entry {entry:?}"))?;
-        map.insert(last4.to_string(), account);
+        map.insert(normalize_key(key), account);
     }
     Ok(map)
 }
@@ -418,5 +471,51 @@ mod tests {
         assert!(parse_account_map_by_last4("0130:abc").is_err());
         // Empty last-4 key.
         assert!(parse_account_map_by_last4(":1").is_err());
+    }
+
+    #[test]
+    fn swift_dest_by_bic_parses_pairs() {
+        let map = parse_account_map_by_bic("CHASUS33:1,ABNANL2A:8").unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("CHASUS33").unwrap().as_str(), "1");
+        assert_eq!(map.get("ABNANL2A").unwrap().as_str(), "8");
+        // Keys are uppercased so a lower-case env value still matches the
+        // normalized (uppercase) creditor BIC.
+        let lower = parse_account_map_by_bic("chasus33:1").unwrap();
+        assert_eq!(lower.get("CHASUS33").unwrap().as_str(), "1");
+        // Blank → an empty map (routes wires to Review, not an error).
+        assert!(parse_account_map_by_bic("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn swift_dest_by_bic_rejects_malformed() {
+        // No colon separator.
+        assert!(parse_account_map_by_bic("CHASUS33").is_err());
+        // Non-numeric account id.
+        assert!(parse_account_map_by_bic("CHASUS33:abc").is_err());
+        // Empty BIC key.
+        assert!(parse_account_map_by_bic(":1").is_err());
+    }
+
+    #[test]
+    fn swift_debtor_by_last4_parses_independently_of_paying_map() {
+        // Fix 5: the dedicated SWIFT debtor map parses with the same `last4:id`
+        // grammar as the PayPal funding map, but is a SEPARATE map — so a last-4
+        // shared between a PayPal card and a BPD IBAN resolves to different
+        // accounts without colliding.
+        let swift = parse_account_map_by_last4("4189:127").unwrap();
+        assert_eq!(swift.get("4189").unwrap().as_str(), "127");
+        let paypal = parse_account_map_by_last4("4189:1").unwrap();
+        assert_eq!(paypal.get("4189").unwrap().as_str(), "1");
+        // Same key, different maps → no collision.
+        assert_ne!(
+            swift.get("4189").unwrap().as_str(),
+            paypal.get("4189").unwrap().as_str()
+        );
+        // Blank → an empty map (routes wires to Review, not an error).
+        assert!(parse_account_map_by_last4("").unwrap().is_empty());
+        // Malformed entries are a hard error, like the other maps.
+        assert!(parse_account_map_by_last4("4189").is_err());
+        assert!(parse_account_map_by_last4("4189:abc").is_err());
     }
 }

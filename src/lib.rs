@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{info, warn};
 
-use crate::adapters::{Outcome, TransferRecord};
+use crate::adapters::{DestHint, Outcome, SourceHint, TransferRecord};
 use crate::config::{Config, ValidationPolicy};
 use crate::firefly::{FireflyClient, SubmitOutcome, TransferSubmit};
 use crate::fx::FxClient;
@@ -108,6 +108,8 @@ pub async fn run() -> Result<Summary> {
         cfg.bp_paying_usd_account.clone(),
         cfg.bp_paying_dop_account.clone(),
         cfg.paying_account_by_last4.clone(),
+        cfg.swift_debtor_by_last4.clone(),
+        cfg.swift_dest_by_bic.clone(),
     );
 
     // --- per-message pipeline --------------------------------------------
@@ -206,6 +208,7 @@ pub async fn run() -> Result<Summary> {
 }
 
 /// What happened to a single message.
+#[derive(Debug)]
 enum Disposition {
     Booked,
     Duplicate,
@@ -351,13 +354,16 @@ async fn process_message(
     })
 }
 
-/// Book a PayPal Credit payment receipt as a Firefly transfer: funding account
-/// (source, resolved from the receipt's funding last-4) → PayPal Credit account
-/// (destination, from config). Mirrors the withdrawal path's gates — the same
+/// Book a payment as a Firefly transfer: funding account (source, resolved from
+/// the record's funding/debtor last-4) → a destination account chosen by the
+/// record's [`DestHint`] — the configured PayPal Credit account (PayPal payment
+/// receipt) or the user's own foreign account resolved from the creditor BIC
+/// (outbound SWIFT wire). Mirrors the withdrawal path's gates — the same
 /// USD-equivalent ceiling, then the transfer validation gate — but routes both
 /// account legs from config rather than from the record. A missing destination
-/// or an unresolved source is a clear Review (never guess an account); a
-/// transient rate outage defers (kept in INBOX for retry).
+/// or an unresolved source is a clear Review (never guess — and never auto-book
+/// a wire to an unmapped/third-party account); a transient rate outage defers
+/// (kept in INBOX for retry).
 async fn book_transfer(
     tr: TransferRecord,
     firefly: &FireflyClient<'_>,
@@ -365,20 +371,62 @@ async fn book_transfer(
     policy: &ValidationPolicy,
     dry_run: bool,
 ) -> Result<Disposition> {
-    // Destination = the configured PayPal Credit account. Absent → Review.
-    let Some(dest) = firefly.paypal_credit_account() else {
-        return Ok(Disposition::Review(
-            "no Firefly account configured for PayPal Credit (RECEIPT_PAYPAL_CREDIT_ACCOUNT)"
-                .to_string(),
-        ));
+    // Destination depends on the transfer source. Exhaustive over `DestHint` so a
+    // new transfer kind forces a destination-routing decision here.
+    let dest = match &tr.dest {
+        // PayPal payment → the configured PayPal Credit account. Absent → Review.
+        DestHint::PayPalCredit => match firefly.paypal_credit_account() {
+            Some(dest) => dest,
+            None => {
+                return Ok(Disposition::Review(
+                    "no Firefly account configured for PayPal Credit (RECEIPT_PAYPAL_CREDIT_ACCOUNT)"
+                        .to_string(),
+                ));
+            }
+        },
+        // SWIFT wire → the own foreign account mapped from the creditor BIC.
+        // Unmapped → Review; a wire to an unmapped/third-party BIC must never
+        // auto-book.
+        DestHint::CreditorBic(bic) => match firefly.swift_dest_for_bic(bic) {
+            Some(dest) => dest,
+            None => {
+                return Ok(Disposition::Review(format!(
+                    "no Firefly account configured for SWIFT creditor BIC {bic} (RECEIPT_SWIFT_DEST_BY_BIC)"
+                )));
+            }
+        },
     };
-    // Source = the funding account resolved from the receipt's last-4. Absent
-    // (or empty map) → Review; we never guess which account funded the payment.
-    let Some(source) = firefly.paying_account_for_last4(&tr.funding_last4) else {
-        return Ok(Disposition::Review(format!(
-            "no paying account configured for funding last-4 {} (RECEIPT_PAYING_ACCOUNT_BY_LAST4)",
-            tr.funding_last4
-        )));
+    // Source = the funding/debtor account resolved from the record's last-4
+    // against the map its `SourceHint` names. Exhaustive over `SourceHint` so a
+    // new transfer source forces a source-map decision here. A PayPal funding
+    // card resolves against RECEIPT_PAYING_ACCOUNT_BY_LAST4; a SWIFT debtor IBAN
+    // resolves against the DEDICATED RECEIPT_SWIFT_DEBTOR_BY_LAST4 — so a last-4
+    // shared between the two cannot mis-route. Absent (or empty map) → Review; we
+    // never guess the source account.
+    //
+    // Known limitation (NOT a bug): a cross-currency wire to a foreign own-account
+    // whose currency differs from the wire's settlement currency (e.g. a USD wire
+    // into a EUR ABN AMRO account) is caught downstream by the transfer
+    // currency-agreement guard in `submit_transfer_between` (a same-currency
+    // transfer books no FX leg) and routed to Review for manual entry. Such wires
+    // never auto-book — intentional, to avoid a silent cross-currency mis-book.
+    let source = match &tr.source {
+        SourceHint::PayPalFundingLast4(last4) => match firefly.paying_account_for_last4(last4) {
+            Some(source) => source,
+            None => {
+                return Ok(Disposition::Review(format!(
+                    "no paying account configured for PayPal funding last-4 {last4} (RECEIPT_PAYING_ACCOUNT_BY_LAST4)"
+                )));
+            }
+        },
+        SourceHint::SwiftDebtorLast4(last4) => match firefly.swift_debtor_for_last4(last4) {
+            Some(source) => source,
+            None => {
+                return Ok(Disposition::Review(format!(
+                    "no debtor account configured for SWIFT debtor last-4 {last4} (RECEIPT_SWIFT_DEBTOR_BY_LAST4)"
+                )));
+            }
+        },
     };
 
     // USD-equivalent ceiling — same gate as withdrawals (a crafted huge payment
@@ -478,4 +526,114 @@ fn build_http_client() -> Result<Client> {
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .context("building HTTP client")
+}
+
+#[cfg(test)]
+mod book_transfer_tests {
+    //! Routing tests for the SWIFT wire path through [`book_transfer`]. With no
+    //! USD ceiling configured, `usd_ceiling_review` short-circuits before any FX
+    //! call, and the unresolved-account paths return Review before any Firefly
+    //! call — so these tests reach no network.
+
+    use std::collections::HashMap;
+
+    use chrono::NaiveDate;
+    use reqwest::Client;
+
+    use crate::adapters::{DestHint, SourceHint, TransferRecord};
+    use crate::config::{AccountId, ValidationPolicy};
+    use crate::firefly::FireflyClient;
+    use crate::fx::FxClient;
+    use crate::schema::{Amount, Currency, Money};
+
+    use super::{Disposition, book_transfer};
+
+    fn acct(id: &str) -> AccountId {
+        AccountId::parse(id).unwrap()
+    }
+
+    /// A no-ceiling policy, so the FX-dependent USD ceiling is never consulted.
+    fn no_ceiling() -> ValidationPolicy {
+        ValidationPolicy { max_amount: None }
+    }
+
+    /// A SWIFT transfer record for the given creditor BIC and debtor last-4.
+    fn swift_record(bic: &str, debtor_last4: &str) -> TransferRecord {
+        TransferRecord {
+            money: Money::new(Amount::parse("2100.00").unwrap(), Currency::parse("USD").unwrap()),
+            date: NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
+            description: "SWIFT wire to RODOLFO HANSEN".to_string(),
+            external_id: "swift:5dd60267-659f-446e-92c4-c1540b8f8253".to_string(),
+            source: SourceHint::SwiftDebtorLast4(debtor_last4.to_string()),
+            dest: DestHint::CreditorBic(bic.to_string()),
+        }
+    }
+
+    /// A client wired with the SWIFT debtor last-4 and creditor BIC maps. The
+    /// account-target cache is empty, so any path that reaches a submit would hit
+    /// the network — the tests below all return Review before that point.
+    fn client<'a>(http: &'a Client, fx: &'a FxClient<'a>) -> FireflyClient<'a> {
+        FireflyClient::new(
+            http,
+            "http://firefly.invalid",
+            "tok",
+            fx,
+            acct("103"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            HashMap::new(), // PayPal funding map — empty for these SWIFT tests
+            HashMap::from([("4189".to_string(), acct("127"))]), // SWIFT debtor map
+            HashMap::from([("CHASUS33".to_string(), acct("1"))]),
+        )
+    }
+
+    fn run(record: TransferRecord) -> Disposition {
+        let http = Client::new();
+        let fx = FxClient::new(&http, "http://fx.invalid");
+        let c = client(&http, &fx);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(book_transfer(record, &c, &fx, &no_ceiling(), false))
+            .expect("book_transfer should not error on these review paths")
+    }
+
+    #[test]
+    fn unmapped_creditor_bic_routes_to_review() {
+        // A wire to a BIC absent from RECEIPT_SWIFT_DEST_BY_BIC must NOT auto-book.
+        match run(swift_record("DEUTDEFF", "4189")) {
+            Disposition::Review(reason) => {
+                assert!(reason.contains("DEUTDEFF"), "names the unmapped BIC: {reason}");
+                assert!(reason.contains("RECEIPT_SWIFT_DEST_BY_BIC"), "{reason}");
+            }
+            other => panic!("expected Review for unmapped BIC, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unmapped_debtor_last4_routes_to_review() {
+        // BIC maps, but the debtor last-4 does not → Review (no source guess).
+        match run(swift_record("CHASUS33", "0000")) {
+            Disposition::Review(reason) => {
+                assert!(reason.contains("0000"), "names the unmapped last-4: {reason}");
+                assert!(reason.contains("RECEIPT_SWIFT_DEBTOR_BY_LAST4"), "{reason}");
+            }
+            other => panic!("expected Review for unmapped last-4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dry_run_books_when_both_legs_resolve() {
+        // Both legs resolve (4189 → 127, CHASUS33 → 1). In dry-run the transfer
+        // gate passes and book_transfer reports Booked without any Firefly call.
+        let http = Client::new();
+        let fx = FxClient::new(&http, "http://fx.invalid");
+        let c = client(&http, &fx);
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let d = rt
+            .block_on(book_transfer(swift_record("CHASUS33", "4189"), &c, &fx, &no_ceiling(), true))
+            .expect("dry-run books without network");
+        assert!(matches!(d, Disposition::Booked), "both legs resolve → Booked (dry-run)");
+    }
 }
