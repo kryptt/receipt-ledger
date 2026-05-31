@@ -34,10 +34,17 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use reqwest::Client;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// How long a cached rate for *today* (or a future date) stays usable before it
+/// is re-fetched. Past-date rates are immutable and never expire (see
+/// [`cache_entry_fresh`]); this TTL only bounds staleness of the still-moving
+/// current-day rate. 15 minutes balances freshness against not hammering the
+/// provider when the same date is touched repeatedly across runs.
+const FX_CACHE_TTL_SECS: i64 = 15 * 60;
 
 /// Default Frankfurter base URL. Key-free, ECB rates. The historical `.app`
 /// host 301-redirects here; we pin the `.dev` base so no redirect-following is
@@ -92,13 +99,68 @@ fn classify_status(status: reqwest::StatusCode, msg: String) -> RateError {
 /// are stored upper-cased so lookups are case-insensitive.
 type CacheKey = (String, String, NaiveDate);
 
+/// A cached rate plus when it was fetched (unix seconds), so the TTL on
+/// current-day rates can be enforced. Past-date rates ignore `fetched_at`
+/// (immutable). See [`cache_entry_fresh`].
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    rate: Decimal,
+    fetched_at: i64,
+}
+
+/// On-disk form of one cache entry. The in-memory cache keys on a non-string
+/// tuple (which JSON can't use as an object key), so the file is a flat list of
+/// these records. `from`/`to`/`date` reconstruct the [`CacheKey`].
+#[derive(Serialize, Deserialize)]
+struct PersistedRate {
+    from: String,
+    to: String,
+    date: NaiveDate,
+    rate: Decimal,
+    fetched_at: i64,
+}
+
+/// Whether a cached rate is still usable. A past-date rate is immutable (an ECB
+/// daily close or a historical bank rate never changes) → cached indefinitely; a
+/// rate for today or a future date can still move, so it expires after
+/// [`FX_CACHE_TTL_SECS`]. Pure — `today`/`now` are injected so the TTL boundary
+/// is unit-testable without a clock.
+fn cache_entry_fresh(entry_date: NaiveDate, fetched_at: i64, today: NaiveDate, now: i64) -> bool {
+    entry_date < today || now.saturating_sub(fetched_at) < FX_CACHE_TTL_SECS
+}
+
+/// Load a persisted FX cache from `path`. A missing/unreadable/corrupt file is
+/// not an error — the cache is an optimization, so any failure yields an empty
+/// map and the run proceeds (re-fetching as needed).
+fn load_cache(path: &str) -> HashMap<CacheKey, CacheEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<PersistedRate>>(&text) else {
+        return HashMap::new();
+    };
+    entries
+        .into_iter()
+        .map(|p| {
+            (
+                (p.from.to_ascii_uppercase(), p.to.to_ascii_uppercase(), p.date),
+                CacheEntry { rate: p.rate, fetched_at: p.fetched_at },
+            )
+        })
+        .collect()
+}
+
 /// Async FX-rate client over the shared reqwest client, with an in-process
 /// per-`(from,to,date)` cache so a batch with repeated currency pairs hits the
 /// network at most once per distinct triple.
 pub struct FxClient<'a> {
     http: &'a Client,
     fx_url: String,
-    cache: Mutex<HashMap<CacheKey, Decimal>>,
+    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    /// Path of the persistent cache file, when one is attached via
+    /// [`with_cache_file`](Self::with_cache_file). `None` → in-memory only (the
+    /// default, used by tests and any deployment without a `/state` volume).
+    cache_path: Option<String>,
     /// Optional DOP-rate override. Frankfurter has no Dominican Peso, so when
     /// either side of a conversion is `DOP` this provider (Banco Popular's
     /// `consultaTasa`) is consulted instead. `None` → DOP conversions fall
@@ -113,8 +175,66 @@ impl<'a> FxClient<'a> {
             http,
             fx_url: fx_url.into(),
             cache: Mutex::new(HashMap::new()),
+            cache_path: None,
             dop: None,
         }
+    }
+
+    /// Attach a persistent on-disk cache at `path`, pre-loading any rates it
+    /// already holds. Builder so the common in-memory path stays a plain
+    /// [`new`](Self::new). Survives across the hourly one-shot runs, so a date's
+    /// rate is fetched once and then reused instead of re-hitting the provider
+    /// every run a statement sits in the INBOX.
+    #[must_use]
+    pub fn with_cache_file(mut self, path: impl Into<String>) -> Self {
+        let path = path.into();
+        let loaded = load_cache(&path);
+        if !loaded.is_empty() {
+            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = loaded;
+        }
+        self.cache_path = Some(path);
+        self
+    }
+
+    /// Write the current cache to its file, if one is configured (else a no-op).
+    /// Called once at end-of-run. The cache is a pure optimization — never a
+    /// correctness dependency — so the caller logs a write failure rather than
+    /// failing the run.
+    pub fn persist(&self) -> Result<()> {
+        let Some(path) = &self.cache_path else {
+            return Ok(());
+        };
+        let entries: Vec<PersistedRate> = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            cache
+                .iter()
+                .map(|((from, to, date), e)| PersistedRate {
+                    from: from.clone(),
+                    to: to.clone(),
+                    date: *date,
+                    rate: e.rate,
+                    fetched_at: e.fetched_at,
+                })
+                .collect()
+        };
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating FX cache dir {}", parent.display()))?;
+        }
+        let json = serde_json::to_string(&entries).context("serializing FX cache")?;
+        std::fs::write(path, json).with_context(|| format!("writing FX cache {path}"))?;
+        Ok(())
+    }
+
+    /// Insert a freshly-resolved rate into the cache, stamped with the current
+    /// time so the per-day TTL can later expire a today/future rate.
+    fn cache_put(&self, key: CacheKey, rate: Decimal) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, CacheEntry { rate, fetched_at: Utc::now().timestamp() });
     }
 
     /// Attach a Banco Popular DOP-rate provider, used for any conversion where
@@ -141,17 +261,23 @@ impl<'a> FxClient<'a> {
         let to = to.trim().to_ascii_uppercase();
         let key: CacheKey = (from.clone(), to.clone(), date);
 
-        // Cache hit — no network. Scoped lock: released before any await. A
-        // poisoned lock is recovered (a panic in another batch item must not
-        // sink the whole run); the cached data is plain values, never a
-        // half-written invariant.
-        if let Some(rate) = self
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+        // Cache hit — no network, when the entry is still fresh (past-date rates
+        // never expire; a today/future rate expires after the TTL). Scoped lock:
+        // released before any await. A poisoned lock is recovered (a panic in
+        // another batch item must not sink the whole run); the cached data is
+        // plain values, never a half-written invariant.
         {
-            return Ok(*rate);
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get(&key)
+                && cache_entry_fresh(
+                    key.2,
+                    entry.fetched_at,
+                    Utc::now().date_naive(),
+                    Utc::now().timestamp(),
+                )
+            {
+                return Ok(entry.rate);
+            }
         }
 
         // DOP override: Frankfurter has no Dominican Peso. When one side is DOP
@@ -173,10 +299,7 @@ impl<'a> FxClient<'a> {
             } else {
                 venta
             };
-            self.cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, rate);
+            self.cache_put(key, rate);
             return Ok(rate);
         }
 
@@ -210,10 +333,7 @@ impl<'a> FxClient<'a> {
         let rate = parse_rate(&body, &to)
             .with_context(|| format!("parsing FX rate {from}->{to} on {date}"))?;
 
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, rate);
+        self.cache_put(key, rate);
         Ok(rate)
     }
 
@@ -235,12 +355,16 @@ impl<'a> FxClient<'a> {
                 to.trim().to_ascii_uppercase(),
                 date,
             ),
-            rate,
+            // `fetched_at: i64::MAX` makes the seeded entry never expire under the
+            // TTL, so a fixture seeded on today's date still returns without a
+            // network call regardless of the wall clock.
+            CacheEntry { rate, fetched_at: i64::MAX },
         );
         Self {
             http,
             fx_url: DEFAULT_FX_URL.to_string(),
             cache: Mutex::new(cache),
+            cache_path: None,
             dop: None,
         }
     }
@@ -697,5 +821,64 @@ mod tests {
             .unwrap();
         let r = rt.block_on(fx.rate("jpy", "USD", date)).unwrap();
         assert_eq!(r, Decimal::from_str("0.0064").unwrap());
+    }
+
+    // --- persistent cache + TTL ------------------------------------------
+
+    #[test]
+    fn cache_entry_fresh_past_date_never_expires() {
+        let today = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let past = NaiveDate::from_ymd_opt(2026, 5, 12).unwrap();
+        // A past-date rate is immutable → fresh even with an ancient fetched_at
+        // far beyond the TTL.
+        assert!(cache_entry_fresh(past, 0, today, 10_000_000_000));
+    }
+
+    #[test]
+    fn cache_entry_fresh_today_and_future_respect_ttl() {
+        let today = NaiveDate::from_ymd_opt(2026, 5, 31).unwrap();
+        let now = 1_000_000i64;
+        // Today, fetched 5 min ago (< 15-min TTL) → fresh.
+        assert!(cache_entry_fresh(today, now - 5 * 60, today, now));
+        // Today, fetched 20 min ago (> TTL) → stale (re-fetch).
+        assert!(!cache_entry_fresh(today, now - 20 * 60, today, now));
+        // A future date is bound by the TTL just like today.
+        let future = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        assert!(!cache_entry_fresh(future, now - 20 * 60, today, now));
+    }
+
+    #[test]
+    fn fx_cache_persists_and_reloads_round_trip() {
+        // persist() then load_cache() must round-trip an entry by (from,to,date).
+        let path = std::env::temp_dir()
+            .join("receipt-ledger-fxcache-roundtrip.json")
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_file(&path);
+
+        let http = Client::new();
+        let key = (
+            "USD".to_string(),
+            "EUR".to_string(),
+            NaiveDate::from_ymd_opt(2026, 5, 12).unwrap(),
+        );
+        let fx = FxClient::new(&http, DEFAULT_FX_URL).with_cache_file(&path);
+        fx.cache_put(key.clone(), Decimal::from_str("0.92").unwrap());
+        fx.persist().expect("persist writes the cache file");
+
+        let loaded = load_cache(&path);
+        assert_eq!(
+            loaded.get(&key).map(|e| e.rate),
+            Some(Decimal::from_str("0.92").unwrap()),
+            "persisted rate reloads under the same key"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_cache_missing_file_is_empty_not_error() {
+        // The cache is an optimization: a missing/unreadable file yields an empty
+        // map and the run proceeds (no panic, no error).
+        assert!(load_cache("/nonexistent/receipt-ledger/fx-cache.json").is_empty());
     }
 }

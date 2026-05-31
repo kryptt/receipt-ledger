@@ -22,6 +22,11 @@ use std::str::FromStr;
 const DEFAULT_JMAP_URL: &str = "http://stalwart.system.svc.cluster.local:8080";
 const DEFAULT_JMAP_USER: &str = "ledger@example.test";
 const DEFAULT_STATE_PATH: &str = "/state/jmap.state";
+/// Persistent FX-rate cache, on the same `/state` volume as the JMAP cursor so
+/// it survives between the hourly one-shot runs. Lets a statement that sits in
+/// the INBOX for many cycles reuse already-fetched rates instead of re-hitting
+/// Frankfurter / the rate-limited Banco Popular `consultaTasa` every run.
+const DEFAULT_FX_CACHE_PATH: &str = "/state/fx-cache.json";
 const DEFAULT_OLLAMA_URL: &str = "http://ollama-router.ai:11434/v1";
 const DEFAULT_MODEL_ALLOWLIST: &str = "gemma4:e2b";
 /// LLM chat-completions request timeout, in seconds. Generous because a cold
@@ -115,6 +120,8 @@ pub struct Config {
     pub jmap_user: String,
     pub jmap_password: String,
     pub state_path: String,
+    /// Path to the persistent FX-rate cache file (see [`DEFAULT_FX_CACHE_PATH`]).
+    pub fx_cache_path: String,
 
     pub ollama_url: String,
     /// Allowlisted extraction models, highest priority first.
@@ -214,6 +221,7 @@ impl Config {
             jmap_user: env_or("RECEIPT_JMAP_USER", DEFAULT_JMAP_USER),
             jmap_password: required("RECEIPT_JMAP_PASSWORD")?,
             state_path: env_or("RECEIPT_STATE_PATH", DEFAULT_STATE_PATH),
+            fx_cache_path: env_or("RECEIPT_FX_CACHE_PATH", DEFAULT_FX_CACHE_PATH),
 
             ollama_url: env_or("RECEIPT_OLLAMA_URL", DEFAULT_OLLAMA_URL),
             model_allowlist,
