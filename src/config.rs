@@ -198,6 +198,18 @@ pub struct Config {
     /// applies the same canonicalization to both the statement merchant and the
     /// booked journal before fuzzy matching. `None` disables alias lookup.
     pub bp_alias_rule_group: Option<String>,
+    /// Phase 2: auto-correct a matched foreign charge's booked amount to the
+    /// statement's billed figure (`RECEIPT_BP_AUTOCORRECT_AMOUNTS`, default off).
+    /// Off → an amount mismatch reports + routes to Review (Phase-1 behavior). On
+    /// → the reconciler PUTs the billed amount, guarded by a TOCTOU check and
+    /// [`bp_max_correction_pct`](Self::bp_max_correction_pct), tagging the old
+    /// estimate for audit.
+    pub bp_autocorrect_amounts: bool,
+    /// Phase 2: the maximum `|billed − estimate| / estimate` (as a percent) an
+    /// auto-correction may apply; beyond it the charge routes to Review instead
+    /// (`RECEIPT_BP_MAX_CORRECTION_PCT`, default 20). A guard against a crafted or
+    /// mis-parsed statement amount silently overwriting a journal with a wild value.
+    pub bp_max_correction_pct: Decimal,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -259,6 +271,9 @@ impl Config {
             bp_statement_sender: optional("RECEIPT_BP_STATEMENT_SENDER"),
             dry_run: env_bool("RECEIPT_DRY_RUN"),
             bp_alias_rule_group: optional("RECEIPT_BP_ALIAS_RULE_GROUP"),
+            bp_autocorrect_amounts: env_bool("RECEIPT_BP_AUTOCORRECT_AMOUNTS"),
+            bp_max_correction_pct: decimal_optional("RECEIPT_BP_MAX_CORRECTION_PCT")?
+                .unwrap_or_else(|| Decimal::from(20)),
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,

@@ -58,6 +58,23 @@ pub enum TransferSubmit {
     CurrencyMismatch { reason: String },
 }
 
+/// Outcome of an [`FireflyClient::correct_amount`] attempt (Phase-2 amount
+/// auto-correction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "a Review outcome must route the statement to Review, not be dropped"]
+pub enum CorrectionOutcome {
+    /// The journal's amount was updated (PUT) to the statement's billed figure,
+    /// with the old estimate recorded as a `bp-estimate:<old>` tag.
+    Corrected,
+    /// The journal already held the billed amount — nothing to do. Makes a re-run
+    /// idempotent (after a prior correction, reconcile sees a match, not a
+    /// mismatch — but this guards the racy case too).
+    NoOp,
+    /// Not corrected: a TOCTOU mismatch (the journal changed since reconcile read
+    /// it) or the correction exceeded the bounded-delta guard. → Review.
+    Review { reason: String },
+}
+
 /// The authoritative booking target for an account, as Firefly reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
@@ -454,6 +471,106 @@ impl<'a> FireflyClient<'a> {
         Ok(TransferSubmit::Submitted(outcome))
     }
 
+    /// Phase-2 amount auto-correction: rewrite the matched journal `group_id`'s
+    /// account-currency amount to the statement's `billed` figure (the bank's
+    /// actual VISA-billed amount, vs our ECB `expected` estimate), recording the
+    /// old estimate as a `bp-estimate:<old>` tag for audit.
+    ///
+    /// Reads the journal fresh (TOCTOU), then [`correction_decision`] gates the
+    /// write: a journal that changed since reconcile read it, or a correction
+    /// beyond `max_pct`, returns [`CorrectionOutcome::Review`] without touching
+    /// it; one already at `billed` is a [`CorrectionOutcome::NoOp`]. Only a clean
+    /// `Corrected` decision issues the PUT. The foreign leg (original charge
+    /// currency/amount) is resent verbatim so it is preserved. A multi-split group
+    /// is refused (→ Review) — our bookings are single-split, so a multi-split
+    /// match is unexpected and must not be blindly rewritten.
+    pub async fn correct_amount(
+        &self,
+        group_id: &str,
+        expected: Decimal,
+        billed: Decimal,
+        max_pct: Decimal,
+    ) -> Result<CorrectionOutcome> {
+        let url = format!(
+            "{}/api/v1/transactions/{}",
+            self.base_url.trim_end_matches('/'),
+            group_id
+        );
+        // 1. Fresh read (TOCTOU).
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .with_context(|| format!("reading Firefly journal {group_id}"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("Firefly returned {status} reading journal {group_id}: {body}");
+        }
+        let env: TxSingleEnvelope = serde_json::from_str(&body)
+            .with_context(|| format!("decoding Firefly journal {group_id}"))?;
+        let mut splits = env.data.attributes.transactions;
+        if splits.len() != 1 {
+            return Ok(CorrectionOutcome::Review {
+                reason: format!(
+                    "journal {group_id} has {} splits (expected 1); not auto-correcting",
+                    splits.len()
+                ),
+            });
+        }
+        let split = splits.remove(0);
+        let current = Decimal::from_str_exact(split.amount.trim())
+            .map(|d| d.abs().normalize())
+            .map_err(|_| {
+                anyhow!(
+                    "journal {group_id} has an unparseable amount {:?}",
+                    split.amount
+                )
+            })?;
+
+        // 2. Gate.
+        match correction_decision(current, expected, billed, max_pct) {
+            CorrectionOutcome::Corrected => {}
+            other => return Ok(other),
+        }
+
+        // 3. PUT the corrected amount + audit tag (existing tags preserved; the
+        //    foreign leg resent verbatim).
+        let audit = format!("bp-estimate:{}", expected.normalize());
+        let mut tags = split.tags;
+        if !tags.iter().any(|t| t == &audit) {
+            tags.push(audit);
+        }
+        let payload = CorrectionPut {
+            transactions: vec![CorrectionSplit {
+                transaction_journal_id: split.transaction_journal_id,
+                amount: billed.normalize().to_string(),
+                tags,
+                foreign_amount: split.foreign_amount,
+                foreign_currency_code: split.foreign_currency_code,
+            }],
+        };
+        let resp = self
+            .http
+            .put(&url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .with_context(|| format!("correcting Firefly journal {group_id}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Firefly returned {status} correcting journal {group_id}: {body}");
+        }
+        info!(journal = group_id, from = %expected.normalize(), to = %billed.normalize(), "auto-corrected amount to statement billed figure");
+        Ok(CorrectionOutcome::Corrected)
+    }
+
     /// The configured PayPal Credit account, when present — the destination leg
     /// of a PayPal-payment transfer. `None` routes the payment to Review.
     #[must_use]
@@ -679,6 +796,10 @@ struct TxAttributes {
 
 #[derive(Deserialize)]
 struct TxSplit {
+    /// The inner journal id (distinct from the group id) — the handle a
+    /// `PUT /transactions/{group}` uses to target this split for an update.
+    #[serde(default)]
+    transaction_journal_id: String,
     #[serde(default)]
     date: String,
     #[serde(default)]
@@ -691,6 +812,13 @@ struct TxSplit {
     external_id: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    /// Foreign-leg fields, preserved verbatim across an amount correction (only
+    /// the account-currency `amount` changes; the original charge currency/amount
+    /// do not).
+    #[serde(default)]
+    foreign_amount: Option<String>,
+    #[serde(default)]
+    foreign_currency_code: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1005,6 +1133,85 @@ fn build_transfer_group<'b>(
         foreign_amount,
         foreign_currency_code,
     })
+}
+
+/// Decide whether a matched charge's booked amount should be auto-corrected to
+/// the statement's billed figure. Pure — the I/O (read-then-PUT) lives in
+/// [`FireflyClient::correct_amount`], so the guards are unit-testable.
+///
+/// - `current`  — the journal's freshly-read amount (account currency).
+/// - `expected` — the estimate reconcile matched against (`AmountMismatch.booked`).
+/// - `billed`   — the statement's authoritative amount (`AmountMismatch.statement`).
+/// - `max_pct`  — max `|billed − expected| / expected` (percent) before Review.
+///
+/// (`rust_decimal` equality is by value, so trailing-zero differences don't
+/// matter.)
+pub(crate) fn correction_decision(
+    current: Decimal,
+    expected: Decimal,
+    billed: Decimal,
+    max_pct: Decimal,
+) -> CorrectionOutcome {
+    if current == billed {
+        // Already at the billed figure (a prior correction, or a race) → no-op.
+        return CorrectionOutcome::NoOp;
+    }
+    if current != expected {
+        // TOCTOU: a human or another process changed the journal between
+        // reconcile's read and now. Never overwrite that value.
+        return CorrectionOutcome::Review {
+            reason: format!(
+                "journal amount {} changed since reconcile (expected estimate {}); not auto-correcting",
+                current.normalize(),
+                expected.normalize()
+            ),
+        };
+    }
+    if expected.is_zero() {
+        return CorrectionOutcome::Review {
+            reason: "booked estimate is zero; cannot bound the correction".to_string(),
+        };
+    }
+    let delta_pct = ((billed - expected) / expected).abs() * Decimal::from(100);
+    if delta_pct > max_pct {
+        return CorrectionOutcome::Review {
+            reason: format!(
+                "correction {} → {} is {}% (exceeds max {}%)",
+                expected.normalize(),
+                billed.normalize(),
+                delta_pct.round_dp(1).normalize(),
+                max_pct.normalize()
+            ),
+        };
+    }
+    CorrectionOutcome::Corrected
+}
+
+/// Single-transaction GET envelope: `GET /transactions/{id}` returns one group
+/// under `data` (vs the list endpoint's `data: [...]`).
+#[derive(Deserialize)]
+struct TxSingleEnvelope {
+    data: TxGroup,
+}
+
+/// `PUT /transactions/{id}` body for an amount correction: a partial split update
+/// keyed by `transaction_journal_id`. Only the fields we resend are touched;
+/// `tags` replaces the set (so we resend the existing tags plus the audit tag),
+/// and the foreign leg is resent verbatim so it is never dropped.
+#[derive(Serialize)]
+struct CorrectionPut {
+    transactions: Vec<CorrectionSplit>,
+}
+
+#[derive(Serialize)]
+struct CorrectionSplit {
+    transaction_journal_id: String,
+    amount: String,
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreign_amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    foreign_currency_code: Option<String>,
 }
 
 /// Funding hints that mark a PayPal record as funded by a credit product (→ the
@@ -1455,6 +1662,72 @@ mod tests {
             convert_amount(Decimal::from_str("1.005").unwrap(), Decimal::ONE, 2),
             Decimal::from_str("1.00").unwrap()
         );
+    }
+
+    // --- Phase-2 amount auto-correction decision (pure) --------------------
+
+    fn dec(s: &str) -> Decimal {
+        Decimal::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn correction_within_bound_corrects() {
+        // ECB estimate 32.27, billed 33.33 → 3.3% (< 20%) → correct.
+        assert_eq!(
+            correction_decision(dec("32.27"), dec("32.27"), dec("33.33"), dec("20")),
+            CorrectionOutcome::Corrected
+        );
+    }
+
+    #[test]
+    fn correction_already_at_billed_is_noop() {
+        // current already == billed (prior run / race) → no-op, idempotent.
+        assert_eq!(
+            correction_decision(dec("33.33"), dec("32.27"), dec("33.33"), dec("20")),
+            CorrectionOutcome::NoOp
+        );
+        // Trailing-zero difference must not defeat value-equality.
+        assert_eq!(
+            correction_decision(dec("33.30"), dec("32.27"), dec("33.3"), dec("20")),
+            CorrectionOutcome::NoOp
+        );
+    }
+
+    #[test]
+    fn correction_toctou_changed_journal_reviews() {
+        // The journal's current amount is neither the estimate we matched nor the
+        // billed figure → a human/process changed it → Review, never overwrite.
+        match correction_decision(dec("99.99"), dec("32.27"), dec("33.33"), dec("20")) {
+            CorrectionOutcome::Review { reason } => {
+                assert!(reason.contains("changed since reconcile"), "{reason}")
+            }
+            other => panic!("expected TOCTOU Review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn correction_beyond_bound_reviews() {
+        // estimate 100, billed 130 → 30% (> 20%) → Review (a crafted/mis-parsed
+        // amount must not silently overwrite the journal).
+        match correction_decision(dec("100"), dec("100"), dec("130"), dec("20")) {
+            CorrectionOutcome::Review { reason } => {
+                assert!(reason.contains("exceeds max"), "{reason}")
+            }
+            other => panic!("expected bounded-delta Review, got {other:?}"),
+        }
+        // Exactly at the bound (20%) is allowed.
+        assert_eq!(
+            correction_decision(dec("100"), dec("100"), dec("120"), dec("20")),
+            CorrectionOutcome::Corrected
+        );
+    }
+
+    #[test]
+    fn correction_zero_estimate_reviews() {
+        match correction_decision(dec("0"), dec("0"), dec("5.00"), dec("20")) {
+            CorrectionOutcome::Review { reason } => assert!(reason.contains("zero"), "{reason}"),
+            other => panic!("expected zero-estimate Review, got {other:?}"),
+        }
     }
 
     /// Seed the per-account target cache so `submit_transfer_between` can read

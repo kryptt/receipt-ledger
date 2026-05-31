@@ -176,6 +176,8 @@ and a missing required value fails loudly.
 | `RECEIPT_BANCO_POPULAR_USD_ACCOUNT` | — (optional) | Banco Popular non-DOP account id; absent → non-DOP mail → Review. |
 | `RECEIPT_BANCO_POPULAR_DOP_ACCOUNT` | — (optional) | Banco Popular DOP account id; absent → DOP mail → Review. |
 | `RECEIPT_MAX_AMOUNT` | — (optional) | Plausibility ceiling, **in US dollars**. A charge whose USD-equivalent (`fx_rate(currency→USD) × amount`) exceeds it routes to Review. Unset → no upper bound. So `100000` means ">$100,000 USD → Review"; a ₩100,000 (≈ $72) charge does **not** trip it. |
+| `RECEIPT_BP_AUTOCORRECT_AMOUNTS` | `false` | Statement reconcile, Phase 2. When `true`, a matched foreign charge whose statement (billed) amount differs from the booked ECB estimate is **auto-corrected** in place: the journal's amount is PUT to the billed figure and the old estimate is recorded as a `bp-estimate:<old>` tag. Guarded by a TOCTOU re-read (a journal changed since reconcile → Review, not overwritten) and `RECEIPT_BP_MAX_CORRECTION_PCT`. Off (default) → the mismatch is reported and routed to Review. |
+| `RECEIPT_BP_MAX_CORRECTION_PCT` | `20` | Max `|billed − estimate| / estimate` (percent) an auto-correction may apply; beyond it the charge routes to Review instead of being rewritten (guards against a crafted / mis-parsed statement amount). |
 | `RECEIPT_PROCESSED_MAILBOX` | `Processed` | Destination for booked / duplicate / skipped mail. |
 | `RECEIPT_REVIEW_MAILBOX` | `Review` | Destination for un-bookable mail. |
 | `RUST_LOG` | `info` | `tracing` env filter. |

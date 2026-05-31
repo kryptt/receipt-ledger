@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 use super::reconcile::{ChargeOutcome, ReconcileParams, reconcile};
 use super::{SectionCurrency, StatementTxn, parse, pdf};
 use crate::config::Config;
-use crate::firefly::{FireflyClient, SubmitOutcome};
+use crate::firefly::{CorrectionOutcome, FireflyClient, SubmitOutcome, correction_decision};
 use crate::fx::FxClient;
 use crate::jmap::{FetchedMessage, Mailbox};
 use crate::schema::Direction;
@@ -66,9 +66,14 @@ pub struct StatementReport {
     /// Charges already booked from a consumo (or a prior statement run) and
     /// confirmed — incl. Firefly duplicate responses on re-book.
     pub reconciled: usize,
-    /// Matched but the statement amount differs from the booked estimate
-    /// (Phase 1 reports + reviews; Phase 2 auto-corrects).
+    /// Matched but the statement amount differs from the booked estimate, and it
+    /// was NOT auto-corrected — reported + routed to Review (Phase-1 behavior, or
+    /// a Phase-2 correction blocked by the TOCTOU / bounded-delta guard).
     pub amount_mismatch: usize,
+    /// Phase-2 amount auto-corrections applied (or already-correct no-ops) — the
+    /// journal's booked estimate was rewritten to the statement's billed figure.
+    /// A clean outcome (does not keep the statement out of Processed).
+    pub corrected: usize,
     /// Charges the notifications missed, newly booked from the statement.
     pub booked_new: usize,
     /// Payments booked as transfers (paying account → card).
@@ -207,7 +212,21 @@ pub async fn process_statement(
 
             match outcome {
                 ChargeOutcome::Confirmed { .. } => report.reconciled += 1,
-                ChargeOutcome::AmountMismatch { .. } => report.amount_mismatch += 1,
+                ChargeOutcome::AmountMismatch {
+                    journal_id,
+                    statement,
+                    booked,
+                } => {
+                    correct_amount_mismatch(
+                        journal_id,
+                        *booked,
+                        *statement,
+                        firefly,
+                        cfg,
+                        &mut report,
+                    )
+                    .await;
+                }
                 ChargeOutcome::Review { .. } => report.review += 1,
                 ChargeOutcome::BookNew => {
                     book_charge(charge, section, firefly, fx, cfg, &mut report).await;
@@ -266,6 +285,55 @@ fn check_balance(
             delta = %delta,
             "closing balance does not reconcile (missed rows, or unmodeled fees/interest) → review"
         );
+    }
+}
+
+/// Handle a matched charge whose statement (billed) amount differs from the
+/// booked (ECB-estimate) amount. Phase-1 (autocorrect off) → report + Review.
+/// Phase-2 (autocorrect on) → auto-correct the journal to the billed figure,
+/// guarded by the TOCTOU + bounded-delta checks in
+/// [`FireflyClient::correct_amount`]; a blocked correction or a Firefly write
+/// failure falls back to Review (`amount_mismatch`), never aborting the statement.
+async fn correct_amount_mismatch(
+    journal_id: &str,
+    booked: Decimal,
+    billed: Decimal,
+    firefly: &FireflyClient<'_>,
+    cfg: &Config,
+    report: &mut StatementReport,
+) {
+    if !cfg.bp_autocorrect_amounts {
+        report.amount_mismatch += 1;
+        return;
+    }
+    if cfg.dry_run {
+        // Preview without the live GET/PUT: model `current == booked` (no drift
+        // to show in a plan), so this exercises the bounded-delta guard only.
+        match correction_decision(booked, booked, billed, cfg.bp_max_correction_pct) {
+            CorrectionOutcome::Review { reason } => {
+                report.amount_mismatch += 1;
+                info!(journal = journal_id, %reason, "DRY RUN: would NOT auto-correct → review");
+            }
+            _ => {
+                report.corrected += 1;
+                info!(journal = journal_id, from = %booked.normalize(), to = %billed.normalize(), "DRY RUN: would auto-correct amount");
+            }
+        }
+        return;
+    }
+    match firefly
+        .correct_amount(journal_id, booked, billed, cfg.bp_max_correction_pct)
+        .await
+    {
+        Ok(CorrectionOutcome::Corrected | CorrectionOutcome::NoOp) => report.corrected += 1,
+        Ok(CorrectionOutcome::Review { reason }) => {
+            report.amount_mismatch += 1;
+            warn!(journal = journal_id, %reason, "amount auto-correct blocked → review");
+        }
+        Err(e) => {
+            report.amount_mismatch += 1;
+            warn!(journal = journal_id, error = ?e, "amount auto-correct failed → review");
+        }
     }
 }
 
