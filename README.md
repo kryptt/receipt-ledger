@@ -36,11 +36,26 @@ your ledger stays current hourly, hands-free.
 
 | Source | What it handles |
 |---|---|
-| **PayPal** | Purchase receipts; Pay in 4 / Pay Later / PayPal Credit (→ a liability account); cross-currency receipts (books the exact USD charged); refunds. Shipping updates, plan-created notices, and installment payments are recognized and skipped — they aren't new spending. |
-| **Banco Popular Dominicano** | Spanish *"Notificación de Consumo"* card alerts; dual-balance routing (DOP charges → a DOP account, everything else → a foreign/USD account). |
+| **PayPal** | Purchase receipts; Pay in 4 / Pay Later / PayPal Credit (→ a liability account); cross-currency receipts (books the exact USD charged); refunds. PayPal Credit **payment** receipts are booked as a transfer (funding card → the credit account). Shipping updates, plan-created notices, and installment payments are recognized and skipped — they aren't new spending. |
+| **Banco Popular Dominicano** | Spanish *"Notificación de Consumo"* card alerts; dual-balance routing (DOP charges → a DOP account, everything else → a foreign/USD account). DOP↔foreign conversions use the bank's own `consultaTasa` rate (Frankfurter has no DOP). |
+| **Banco Popular — monthly statement** | The password-protected *"estado de cuenta"* PDF: decrypted and parsed in pure Rust, reconciled against already-booked notifications (fuzzy date+merchant+amount match), missing charges booked, payments booked as transfers, and a closing-balance check — anything ambiguous goes to Review. |
+| **Banco Popular — SWIFT wire** | Outbound *"Confirmación Mensaje Swift"* pacs.008 wires, booked as a transfer (debtor account → your own foreign account by creditor BIC). Cross-currency wires book an FX-estimated destination leg. |
 
 Adding a source is one `Adapter` implementation — a sender match, an extraction
 prompt, and a JSON→typed parser. See [`src/adapters/`](src/adapters/).
+
+### Resilience: transient outages defer, they don't Review
+
+A booking decision depends on two network services — the LLM endpoint and the FX
+rate provider. A *transient* failure of either (the endpoint unreachable, a 5xx /
+429 / timeout, a connection reset mid-response — e.g. an Ollama router restarting
+mid-batch) does **not** burn the message to `Review`. It **defers**: the message
+is left in the INBOX, the JMAP cursor is *not* advanced, and the next scheduled
+run retries it (anything already booked dedups). Only a *permanent* failure (a
+model that answered but produced no usable JSON, an unsupported currency, a 4xx)
+routes to Review. FX rates are cached on the `/state` volume
+(`RECEIPT_FX_CACHE_PATH`) so a deferred-then-retried run — or a statement that
+lingers in the INBOX — doesn't re-hit the provider for the same rate.
 
 ## How it works
 
@@ -112,7 +127,7 @@ This handles real money, so the design is deliberately conservative:
    on a schedule. The published image is multi-arch (amd64 + arm64):
 
    ```
-   ghcr.io/kryptt/receipt-ledger:0.7.0
+   ghcr.io/kryptt/receipt-ledger:0.13.0
    ```
 
 A minimal one-shot run:
@@ -128,7 +143,7 @@ docker run --rm \
   -e FIREFLY_III_ACCESS_TOKEN=… \
   -e RECEIPT_PAYPAL_BALANCE_ACCOUNT=12 \
   -v receipt-state:/state \
-  ghcr.io/kryptt/receipt-ledger:0.7.0
+  ghcr.io/kryptt/receipt-ledger:0.13.0
 ```
 
 For hands-free operation, wrap that in a Kubernetes `CronJob` (hourly) or a
@@ -157,7 +172,7 @@ and a missing required value fails loudly.
 | `RECEIPT_PAYPAL_CREDIT_ACCOUNT` | — (optional) | PayPal Credit account id; absent → credit-funded mail → Review. Also the **destination** of a PayPal Credit payment booked as a transfer. |
 | `RECEIPT_PAYING_ACCOUNT_BY_LAST4` | — (optional) | `last4:accountid` pairs (e.g. `0130:1,5678:2`) mapping a PayPal Credit payment's funding card last-4 to the **source** Firefly account for the payment transfer. Unknown last-4 (or unset) → Review. Malformed → startup error. |
 | `RECEIPT_SWIFT_DEBTOR_BY_LAST4` | — (optional) | `last4:accountid` pairs mapping a SWIFT wire's **debtor** (BPD) IBAN last-4 to the **source** Firefly account (e.g. `4189:127`). Separate from the PayPal map to avoid last-4 collisions. Unknown → Review. |
-| `RECEIPT_SWIFT_DEST_BY_BIC` | — (optional) | `BIC:accountid` pairs mapping a SWIFT wire's **creditor** bank BIC to the **destination** Firefly account (e.g. `CHASUS33:1,ABNANL2A:8`). Unknown BIC (or unset) → Review. Cross-currency wires (e.g. USD wire → EUR account) also route to Review. |
+| `RECEIPT_SWIFT_DEST_BY_BIC` | — (optional) | `BIC:accountid` pairs mapping a SWIFT wire's **creditor** bank BIC to the **destination** Firefly account (e.g. `CHASUS33:1,ABNANL2A:8`). Unknown BIC (or unset) → Review. A **cross-currency** wire (e.g. a USD wire into a EUR account) books the exact settled amount on the source leg and an FX-estimated `foreign_amount` on the destination leg; only a settlement currency that disagrees with the *source* account's own currency routes to Review. |
 | `RECEIPT_BANCO_POPULAR_USD_ACCOUNT` | — (optional) | Banco Popular non-DOP account id; absent → non-DOP mail → Review. |
 | `RECEIPT_BANCO_POPULAR_DOP_ACCOUNT` | — (optional) | Banco Popular DOP account id; absent → DOP mail → Review. |
 | `RECEIPT_MAX_AMOUNT` | — (optional) | Plausibility ceiling, **in US dollars**. A charge whose USD-equivalent (`fx_rate(currency→USD) × amount`) exceeds it routes to Review. Unset → no upper bound. So `100000` means ">$100,000 USD → Review"; a ₩100,000 (≈ $72) charge does **not** trip it. |
@@ -219,13 +234,46 @@ of `./test.sh`.
 ## Build & test
 
 ```bash
-./test.sh    # docker buildx build --target test (runs cargo test in musl)
-./build.sh   # builds + pushes <registry>/receipt-ledger:<Cargo.toml version>
+cargo test          # the full suite (host toolchain)
+cargo clippy --all-targets
+cargo fmt --check    # CI gate (ci.yml runs fmt + clippy + test on push/PR to main)
+./test.sh            # docker buildx build --target test (runs cargo test in musl)
 ```
 
-Tagged releases (`X.Y.Z`) publish a multi-arch image to
-`ghcr.io/kryptt/receipt-ledger`. `build.sh` refuses to push a tag that already
-exists — bump `version` in `Cargo.toml` first.
+## Releasing & deploying
+
+A release publishes a multi-arch image to `ghcr.io/kryptt/receipt-ledger`; the
+deploy rolls that image onto the cluster. They are separate steps.
+
+**Release (build + publish the image).** Driven by a semver git tag — the
+`release.yml` workflow builds amd64 + arm64 natively and pushes the tagged
+manifest (with SBOM + provenance). The workflow verifies the tag equals the
+`Cargo.toml` version, so they must match.
+
+```bash
+# 1. quality gate
+cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+# 2. bump the version (its own commit), then tag the bump commit
+#    edit Cargo.toml: version = "X.Y.Z"   (cargo test rewrites Cargo.lock)
+git commit -am "chore: bump to X.Y.Z"
+git tag X.Y.Z                      # bare semver, no 'v' prefix
+git push origin <branch> X.Y.Z     # the tag push triggers release.yml
+```
+
+**Deploy (roll the image onto the cluster).** The service runs as the hourly
+`receipt-ledger` CronJob in the `home` namespace, managed by Fleet from the
+`hr-fleet` repo. Bump the image tag in `fleet/home/receipt-ledger.yaml`, validate,
+and push — Fleet reconciles it onto the cluster.
+
+```bash
+# in the hr-fleet checkout
+#   edit fleet/home/receipt-ledger.yaml: image: ghcr.io/kryptt/receipt-ledger:X.Y.Z
+scripts/validate-manifests.sh
+git commit -am "receipt-ledger: X.Y.Z" && git push
+```
+
+New behavior takes effect on the next scheduled run. A bad image is rolled back by
+reverting the manifest bump (the prior tag's image is immutable in ghcr).
 
 ## License
 
