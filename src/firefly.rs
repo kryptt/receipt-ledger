@@ -42,17 +42,18 @@ pub enum SubmitOutcome {
 
 /// Outcome of a *checked* transfer submission ([`FireflyClient::submit_transfer_between`]).
 ///
-/// A transfer books both legs in the receipt's currency with no FX leg, which is
-/// only correct when that currency matches BOTH account currencies. Rather than
-/// risk a cross-currency mis-book (or a 422), the currency-agreement check runs
-/// before submission and surfaces a mismatch as a typed [`Self::CurrencyMismatch`]
-/// the caller routes to Review — distinct from a network/submit `Err`.
+/// The source leg books the exact figure that left the source account, so the
+/// transfer currency must match the SOURCE account currency. A *destination*
+/// currency difference is booked cross-currency (an FX-converted `foreign_amount`
+/// leg); a *source* disagreement means the debit is unknown, so rather than guess
+/// it the check surfaces a typed [`Self::CurrencyMismatch`] the caller routes to
+/// Review — distinct from a network/submit `Err`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "a CurrencyMismatch must route the payment to Review, not be dropped"]
 pub enum TransferSubmit {
     /// The transfer was submitted; carries the underlying create/duplicate result.
     Submitted(SubmitOutcome),
-    /// The transfer currency did not match a leg's account currency — not
+    /// The transfer currency did not match the SOURCE account currency — not
     /// submitted. The `reason` is ready to hand to the review mailbox.
     CurrencyMismatch { reason: String },
 }
@@ -374,7 +375,7 @@ impl<'a> FireflyClient<'a> {
     /// (→ Review). No FX: both legs are the same currency.
     pub async fn submit_transfer(&self, transfer: &ValidatedTransfer) -> Result<SubmitOutcome> {
         let (source, dest) = self.route_transfer_accounts(transfer)?;
-        let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
+        let group = build_transfer_group(transfer, source.as_str(), dest.as_str(), None);
         self.post_group(&group, transfer.external_id(), "transfer").await
     }
 
@@ -387,14 +388,24 @@ impl<'a> FireflyClient<'a> {
     /// both transfer entry points stay in lockstep on idempotency + duplicate
     /// handling.
     ///
-    /// The transfer books both legs in `transfer.money().currency` with no FX
-    /// leg, so it is only correct when that currency matches BOTH account
-    /// currencies. This method reads both account [`Target`]s and verifies the
-    /// agreement BEFORE submitting; a mismatch returns
-    /// [`TransferSubmit::CurrencyMismatch`] (→ the caller routes to Review)
-    /// rather than booking a silent cross-currency transfer. The actual
-    /// `build_transfer_group`/`post_group` is reached only once agreement holds,
-    /// so no caller can submit a mismatched transfer.
+    /// This method reads both account [`Target`]s and decides the booking shape
+    /// from the currencies:
+    /// - the transfer currency MUST equal the **source** account currency (the
+    ///   source leg books the exact figure that left it); a disagreement returns
+    ///   [`TransferSubmit::CurrencyMismatch`] (→ the caller routes to Review),
+    ///   since we cannot know the source-currency debit;
+    /// - if the **destination** currency equals the transfer currency, both legs
+    ///   book at the same figure with no FX leg;
+    /// - if the destination currency differs (e.g. a USD wire into a EUR own
+    ///   account), the destination leg carries an FX-estimated `foreign_amount`
+    ///   in the destination currency (the exact received amount after the
+    ///   beneficiary bank's conversion is unknown — the same modeling choice as a
+    ///   foreign card charge in [`build_group`]). The FX call failing is an `Err`
+    ///   (→ Review), never a transfer booked at an unknown rate.
+    ///
+    /// `build_transfer_group`/`post_group` is reached only after the source-leg
+    /// agreement holds, so no caller can submit a transfer whose debit currency
+    /// is unknown.
     pub async fn submit_transfer_between(
         &self,
         transfer: &ValidatedTransfer,
@@ -403,15 +414,36 @@ impl<'a> FireflyClient<'a> {
     ) -> Result<TransferSubmit> {
         let source_target = self.account_target(source.as_str()).await?;
         let dest_target = self.account_target(dest.as_str()).await?;
-        if let Some(reason) = transfer_currency_mismatch(
-            transfer.money().currency.as_str(),
-            &source_target.currency,
-            &dest_target.currency,
-        ) {
+        let tc = transfer.money().currency.as_str();
+        if let Some(reason) = transfer_source_currency_mismatch(tc, &source_target.currency) {
             return Ok(TransferSubmit::CurrencyMismatch { reason });
         }
 
-        let group = build_transfer_group(transfer, source.as_str(), dest.as_str());
+        let group = if tc.eq_ignore_ascii_case(&dest_target.currency) {
+            // Same currency on both legs — no FX leg.
+            build_transfer_group(transfer, source.as_str(), dest.as_str(), None)
+        } else {
+            // Cross-currency: convert the settled amount into the destination
+            // account's currency for the `foreign_amount` leg.
+            let rate = self
+                .fx
+                .rate(tc, &dest_target.currency, transfer.date())
+                .await
+                .with_context(|| {
+                    format!(
+                        "resolving FX rate {tc}->{} for cross-currency transfer",
+                        dest_target.currency
+                    )
+                })?;
+            let converted =
+                convert_amount(transfer.money().amount.value(), rate, dest_target.decimals);
+            build_transfer_group(
+                transfer,
+                source.as_str(),
+                dest.as_str(),
+                Some((converted, &dest_target.currency)),
+            )
+        };
         let outcome = self.post_group(&group, transfer.external_id(), "transfer").await?;
         Ok(TransferSubmit::Submitted(outcome))
     }
@@ -823,6 +855,16 @@ fn parse_account_target(body: &str) -> Result<Target> {
     Ok(Target { currency, decimals })
 }
 
+/// Convert `amount` at `rate` into a target currency, rounded to that currency's
+/// real minor-unit precision (`decimals`: 2 for USD/EUR, 0 for JPY/KRW) with
+/// banker's rounding (`MidpointNearestEven`) — over a large batch it does not
+/// bias the ledger high or low. The single place the conversion + rounding policy
+/// lives, shared by foreign-charge withdrawals ([`build_group`]) and
+/// cross-currency transfers (see [`submit_transfer_between`]). Pure.
+fn convert_amount(amount: Decimal, rate: Decimal, decimals: u32) -> Decimal {
+    (amount * rate).round_dp_with_strategy(decimals, RoundingStrategy::MidpointNearestEven)
+}
+
 /// Build the transaction group for a record, given the resolved `account` id,
 /// its `target` (currency + precision), and the conversion `rate` (multiply the
 /// record amount by it to get the target-currency amount). Pure — no I/O — so
@@ -855,13 +897,8 @@ fn build_group<'b>(
         // No conversion: book the record amount in the target currency.
         (amount.normalize().to_string(), None, None)
     } else {
-        // Convert to the account currency, rounded to the target currency's
-        // REAL minor-unit precision (2 for USD/EUR, 0 for JPY/KRW). We use
-        // banker's rounding (MidpointNearestEven): over a large batch it does
-        // not bias the ledger high or low, which matters for a feed that books
-        // many small conversions.
-        let converted = (amount * rate)
-            .round_dp_with_strategy(target.decimals, RoundingStrategy::MidpointNearestEven);
+        // Convert to the account currency; the original rides as the foreign leg.
+        let converted = convert_amount(amount, rate, target.decimals);
         (
             converted.normalize().to_string(),
             Some(amount.normalize().to_string()),
@@ -885,40 +922,51 @@ fn build_group<'b>(
     })
 }
 
-/// Whether a transfer's currency disagrees with either leg's account currency.
+/// Whether a transfer's currency disagrees with the **source** account currency.
 ///
-/// A transfer books both legs in `transfer_currency` with no FX leg, so booking
-/// is only correct when that currency matches BOTH the source and destination
-/// account currencies. Returns `Some(reason)` describing the first mismatch
-/// (→ route to Review, never submit a silent cross-currency transfer) or `None`
-/// when all three agree. Case-insensitive on the ISO codes. Pure —
-/// unit-testable without a live Firefly.
-fn transfer_currency_mismatch(
+/// The source leg books the exact figure that left the source account, so the
+/// transfer currency MUST equal the source account currency — otherwise we don't
+/// know how much left in the source's own currency and must route to Review
+/// (never guess the debit). A *destination*-currency difference, by contrast, is
+/// representable and supported: the destination leg carries an FX-estimated
+/// `foreign_amount` (see [`build_transfer_group`]'s `foreign` argument), exactly
+/// as a foreign card charge does in [`build_group`]. Returns `Some(reason)` on a
+/// source disagreement, else `None`. Case-insensitive. Pure.
+fn transfer_source_currency_mismatch(
     transfer_currency: &str,
     source_currency: &str,
-    dest_currency: &str,
 ) -> Option<String> {
     if !transfer_currency.eq_ignore_ascii_case(source_currency) {
         return Some(format!(
             "transfer currency {transfer_currency} does not match source account currency {source_currency}"
         ));
     }
-    if !transfer_currency.eq_ignore_ascii_case(dest_currency) {
-        return Some(format!(
-            "transfer currency {transfer_currency} does not match destination account currency {dest_currency}"
-        ));
-    }
     None
 }
 
-/// Build a `transfer` group for a statement payment: paying bank account
-/// (`source`) → card liability (`dest`), same currency on both legs (no FX).
-/// Pure — unit-testable without a live Firefly.
+/// Build a `transfer` group: `source` → `dest`. `amount`/`currency_code` is
+/// ALWAYS the source leg — the exact figure that left `source` in the transfer
+/// currency. `foreign` distinguishes the two transfer shapes:
+/// - `None` — same currency on both legs (a statement card payment, or a
+///   same-currency wire): no FX leg.
+/// - `Some((converted, dest_currency))` — a cross-currency transfer (e.g. a USD
+///   wire into a EUR own account): `converted` (the destination-currency
+///   estimate from [`convert_amount`]) rides as Firefly's `foreign_amount`. The
+///   estimate is necessary because the exact figure credited after the
+///   beneficiary bank's own conversion is not in the wire confirmation — the
+///   same modeling choice [`build_group`] makes for a foreign card charge.
+///
+/// Pure — unit-testable without a live Firefly or FX API.
 fn build_transfer_group<'b>(
     transfer: &'b ValidatedTransfer,
     source: &'b str,
     dest: &'b str,
+    foreign: Option<(Decimal, &'b str)>,
 ) -> TransactionGroup<'b> {
+    let (foreign_amount, foreign_currency_code) = match foreign {
+        Some((converted, ccy)) => (Some(converted.normalize().to_string()), Some(ccy)),
+        None => (None, None),
+    };
     TransactionGroup::single(Split {
         kind: "transfer",
         date: transfer.date().to_string(),
@@ -929,8 +977,8 @@ fn build_transfer_group<'b>(
         tags: vec![IMPORT_TAG],
         source_id: source,
         destination: Destination::Id(dest),
-        foreign_amount: None,
-        foreign_currency_code: None,
+        foreign_amount,
+        foreign_currency_code,
     })
 }
 
@@ -1244,7 +1292,7 @@ mod tests {
         assert_eq!(src.as_str(), "202", "DOP checking is the source");
         assert_eq!(dst.as_str(), "107", "DOP card is the destination");
 
-        let json = serde_json::to_value(build_transfer_group(&t, src.as_str(), dst.as_str())).unwrap();
+        let json = serde_json::to_value(build_transfer_group(&t, src.as_str(), dst.as_str(), None)).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "60999.81");
@@ -1271,7 +1319,7 @@ mod tests {
         // routing); the built group books a same-currency transfer between them.
         let t = transfer("USD", "1300.00");
         let json =
-            serde_json::to_value(build_transfer_group(&t, "1", "105")).unwrap();
+            serde_json::to_value(build_transfer_group(&t, "1", "105", None)).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "1300");
@@ -1284,16 +1332,67 @@ mod tests {
     // --- Fix 4: transfer currency-agreement guard --------------------------
 
     #[test]
-    fn transfer_currency_agreement_pure_check() {
-        // All three agree (case-insensitively) → no mismatch.
-        assert!(transfer_currency_mismatch("USD", "USD", "USD").is_none());
-        assert!(transfer_currency_mismatch("usd", "USD", "Usd").is_none());
-        // Source disagrees → mismatch naming the source.
-        let r = transfer_currency_mismatch("USD", "DOP", "USD").unwrap();
+    fn transfer_source_currency_agreement_pure_check() {
+        // Transfer currency equals the source account currency → no mismatch
+        // (the destination currency is irrelevant here — a difference is a
+        // supported FX case, not a mismatch).
+        assert!(transfer_source_currency_mismatch("USD", "USD").is_none());
+        assert!(transfer_source_currency_mismatch("usd", "USD").is_none());
+        // Source disagrees → mismatch naming the source (→ Review).
+        let r = transfer_source_currency_mismatch("USD", "DOP").unwrap();
         assert!(r.contains("source"), "{r}");
-        // Destination disagrees → mismatch naming the destination.
-        let r = transfer_currency_mismatch("USD", "USD", "DOP").unwrap();
-        assert!(r.contains("destination"), "{r}");
+    }
+
+    #[test]
+    fn cross_currency_transfer_books_foreign_amount_on_destination_leg() {
+        // A USD 4000 wire into a EUR account at 0.92 → 3680.00 EUR foreign leg.
+        // The source leg books the exact settled USD figure; the EUR estimate
+        // rides as foreign_amount/foreign_currency_code (Firefly's cross-currency
+        // transfer shape).
+        let t = transfer("USD", "4000.00");
+        let converted = convert_amount(Decimal::from_str("4000.00").unwrap(), Decimal::from_str("0.92").unwrap(), 2);
+        let group = build_transfer_group(&t, "127", "8", Some((converted, "EUR")));
+        let json = serde_json::to_value(&group).unwrap();
+        let split = &json["transactions"][0];
+
+        assert_eq!(split["type"], "transfer");
+        assert_eq!(split["amount"], "4000", "source leg = exact settled USD");
+        assert_eq!(split["currency_code"], "USD", "source-leg currency");
+        assert_eq!(split["foreign_amount"], "3680", "FX-estimated EUR (4000 × 0.92)");
+        assert_eq!(split["foreign_currency_code"], "EUR", "destination-leg currency");
+        assert_eq!(split["source_id"], "127");
+        assert_eq!(split["destination_id"], "8");
+    }
+
+    #[test]
+    fn same_currency_transfer_has_no_foreign_leg() {
+        // foreign = None → no foreign_amount/foreign_currency_code on the split.
+        let t = transfer("USD", "1300.00");
+        let group = build_transfer_group(&t, "127", "106", None);
+        let json = serde_json::to_value(&group).unwrap();
+        let split = &json["transactions"][0];
+        assert_eq!(split["amount"], "1300");
+        assert_eq!(split["currency_code"], "USD");
+        assert!(split.get("foreign_amount").is_none(), "no FX leg");
+        assert!(split.get("foreign_currency_code").is_none());
+    }
+
+    #[test]
+    fn convert_amount_rounds_to_target_precision() {
+        // USD 100 → JPY at 156.0 = 15600 (0 dp, no fractional yen); 4000 × 0.92 = 3680.
+        assert_eq!(
+            convert_amount(Decimal::from_str("100.00").unwrap(), Decimal::from_str("156.0").unwrap(), 0),
+            Decimal::from_str("15600").unwrap()
+        );
+        assert_eq!(
+            convert_amount(Decimal::from_str("4000.00").unwrap(), Decimal::from_str("0.92").unwrap(), 2),
+            Decimal::from_str("3680.00").unwrap()
+        );
+        // Banker's rounding at the 2-dp midpoint: 1.005 → 1.00 (round half to even).
+        assert_eq!(
+            convert_amount(Decimal::from_str("1.005").unwrap(), Decimal::ONE, 2),
+            Decimal::from_str("1.00").unwrap()
+        );
     }
 
     /// Seed the per-account target cache so `submit_transfer_between` can read
@@ -1374,7 +1473,7 @@ mod tests {
 
         let t = transfer("USD", "2100.00");
         let json =
-            serde_json::to_value(build_transfer_group(&t, source.as_str(), dest.as_str())).unwrap();
+            serde_json::to_value(build_transfer_group(&t, source.as_str(), dest.as_str(), None)).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "2100");
