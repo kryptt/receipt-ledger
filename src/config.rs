@@ -210,6 +210,21 @@ pub struct Config {
     /// (`RECEIPT_BP_MAX_CORRECTION_PCT`, default 20). A guard against a crafted or
     /// mis-parsed statement amount silently overwriting a journal with a wild value.
     pub bp_max_correction_pct: Decimal,
+    /// Phase 2: symmetric double-book guard on the *consumo* path
+    /// (`RECEIPT_BP_DOUBLE_BOOK_PROBE`, default off). When on, before booking a
+    /// Banco Popular charge the pipeline probes the account's in-window journals
+    /// for a statement booking (`bpstmt:`) that plausibly already represents it
+    /// (same fuzzy merchant + date-window signals as the reconciler) and routes
+    /// to Review instead of double-booking — closing the late-notification race
+    /// where a statement booked a charge before its consumo arrived. Off → the
+    /// consumo books as before (dedup only catches an identical re-send).
+    pub bp_double_book_probe: bool,
+    /// Phase 2: MCC→Firefly-category map for statement charge bookings, parsed
+    /// from `RECEIPT_BP_MCC_CATEGORY_MAP` (`mcc:category` pairs, e.g.
+    /// `"5411:Groceries,5814:Eating Out"`). A booked statement charge whose MCC is
+    /// in the map gets that Firefly `category_name`; an unmapped (or absent) MCC
+    /// books uncategorized. Empty by default.
+    pub bp_mcc_category: HashMap<String, String>,
 
     /// Deterministic validation policy applied to every extracted record.
     pub validation: ValidationPolicy,
@@ -274,6 +289,8 @@ impl Config {
             bp_autocorrect_amounts: env_bool("RECEIPT_BP_AUTOCORRECT_AMOUNTS"),
             bp_max_correction_pct: decimal_optional("RECEIPT_BP_MAX_CORRECTION_PCT")?
                 .unwrap_or_else(|| Decimal::from(20)),
+            bp_double_book_probe: env_bool("RECEIPT_BP_DOUBLE_BOOK_PROBE"),
+            bp_mcc_category: mcc_category_map("RECEIPT_BP_MCC_CATEGORY_MAP")?,
 
             validation: ValidationPolicy {
                 max_amount: decimal_optional("RECEIPT_MAX_AMOUNT")?,
@@ -434,6 +451,37 @@ fn parse_account_map(
     Ok(map)
 }
 
+/// Read and parse the MCC→category map env var (e.g.
+/// `"5411:Groceries,5814:Eating Out"`): comma-separated `mcc:category` pairs.
+/// The key is a 4-digit MCC; the value is a free-text Firefly category name (may
+/// contain spaces — only `,` separates entries and the FIRST `:` splits key from
+/// value). Absent/blank → empty map (charges book uncategorized). A malformed
+/// entry (no `:`, empty key, or empty category) is a hard startup error.
+fn mcc_category_map(key: &str) -> Result<HashMap<String, String>> {
+    match optional(key) {
+        None => Ok(HashMap::new()),
+        Some(raw) => parse_mcc_category_map(&raw).with_context(|| format!("env var {key}")),
+    }
+}
+
+/// Parse comma-separated `mcc:category` pairs into a map. The value is free text
+/// (only the FIRST `:` splits key from value, so a category may itself contain no
+/// `:` but may contain spaces). Empty mcc or category is a hard error. Pure.
+fn parse_mcc_category_map(raw: &str) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (mcc, category) = entry
+            .split_once(':')
+            .with_context(|| format!("entry {entry:?} is not `mcc:category`"))?;
+        let (mcc, category) = (mcc.trim(), category.trim());
+        if mcc.is_empty() || category.is_empty() {
+            anyhow::bail!("entry {entry:?} has an empty mcc or category");
+        }
+        map.insert(mcc.to_string(), category.to_string());
+    }
+    Ok(map)
+}
+
 /// Parse an optional [`Decimal`] env var. Absent → `None`; present but
 /// unparseable → hard error.
 fn decimal_optional(key: &str) -> Result<Option<Decimal>> {
@@ -461,6 +509,20 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcc_category_map_parses_pairs_incl_spaces() {
+        let m = parse_mcc_category_map("5411:Groceries, 5814:Eating Out").unwrap();
+        assert_eq!(m.get("5411").map(String::as_str), Some("Groceries"));
+        // A category with a space is preserved (only `,` and the first `:` delimit).
+        assert_eq!(m.get("5814").map(String::as_str), Some("Eating Out"));
+        // Empty input → empty map (charges book uncategorized).
+        assert!(parse_mcc_category_map("").unwrap().is_empty());
+        // Malformed entries are hard errors.
+        assert!(parse_mcc_category_map("5411").is_err(), "missing colon");
+        assert!(parse_mcc_category_map("5411:").is_err(), "empty category");
+        assert!(parse_mcc_category_map(":Groceries").is_err(), "empty mcc");
+    }
 
     #[test]
     fn account_id_parses_numeric() {

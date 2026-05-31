@@ -391,7 +391,16 @@ async fn book_charge(
         report.booked_new += 1;
         return;
     }
-    match firefly.submit(&validated, &external_id).await {
+    // Phase-2 (c): map the charge's MCC to a Firefly category, if configured.
+    let category = charge
+        .mcc
+        .as_ref()
+        .and_then(|m| cfg.bp_mcc_category.get(m.as_str()))
+        .map(String::as_str);
+    match firefly
+        .submit_with_category(&validated, &external_id, category)
+        .await
+    {
         Ok(SubmitOutcome::Created) => report.booked_new += 1,
         Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
         Err(e) => {

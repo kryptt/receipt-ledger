@@ -172,7 +172,17 @@ pub async fn run() -> Result<Summary> {
             continue;
         }
 
-        match process_message(msg, &llm, &firefly, &fx, &cfg.validation, cfg.dry_run).await {
+        match process_message(
+            msg,
+            &llm,
+            &firefly,
+            &fx,
+            &cfg.validation,
+            cfg.dry_run,
+            cfg.bp_double_book_probe,
+        )
+        .await
+        {
             Ok(Disposition::Booked) => {
                 summary.booked += 1;
                 route(&mailbox, &msg.id, true, cfg.dry_run).await;
@@ -270,6 +280,7 @@ async fn process_message(
     fx: &FxClient<'_>,
     policy: &ValidationPolicy,
     dry_run: bool,
+    double_book_probe: bool,
 ) -> Result<Disposition> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
     //    original sender.
@@ -372,6 +383,30 @@ async fn process_message(
                 .await?
                 {
                     review_reason.get_or_insert(reason);
+                    continue;
+                }
+
+                // 5c. Symmetric double-book guard (Phase 2, opt-in). A Banco
+                //     Popular consumo for a charge a statement already booked
+                //     (`bpstmt:<ref>`) would double-book — the consumo path keys
+                //     by composite-hash, the statement path by ref#, so Firefly
+                //     can't dedup across them. Probe in-window journals for a
+                //     plausible statement booking → Review instead of booking. A
+                //     read failure propagates as `Err` (deferred/Review centrally).
+                if double_book_probe
+                    && ext.source == crate::schema::Source::BancoPopular
+                    && let Some(j) = firefly
+                        .statement_duplicate_probe(
+                            ext,
+                            &crate::statement::reconcile::ReconcileParams::default(),
+                            &[],
+                        )
+                        .await?
+                {
+                    review_reason.get_or_insert(format!(
+                        "charge appears already booked by a statement (journal {} '{}') — not double-booking",
+                        j.id, j.merchant
+                    ));
                     continue;
                 }
 

@@ -203,6 +203,10 @@ struct Split<'a> {
     /// `foreign_amount`. Set only on a converted (cross-currency) split.
     #[serde(skip_serializing_if = "Option::is_none")]
     foreign_currency_code: Option<&'a str>,
+    /// Firefly category name (Phase-2 MCC→category for statement charges). When
+    /// `None` the key is omitted and the charge books uncategorized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category_name: Option<&'a str>,
 }
 
 impl<'a> FireflyClient<'a> {
@@ -251,6 +255,18 @@ impl<'a> FireflyClient<'a> {
     /// posts the split. Any of those resolutions failing is an `Err`, which the
     /// pipeline turns into a per-message Review (never a mis-booked amount).
     pub async fn submit(&self, record: &Validated, external_id: &str) -> Result<SubmitOutcome> {
+        self.submit_with_category(record, external_id, None).await
+    }
+
+    /// Submit a withdrawal like [`submit`](Self::submit), additionally setting the
+    /// Firefly `category_name` when `category` is `Some` (Phase-2 MCC→category for
+    /// statement charges). `submit` is the `category = None` case.
+    pub async fn submit_with_category(
+        &self,
+        record: &Validated,
+        external_id: &str,
+        category: Option<&str>,
+    ) -> Result<SubmitOutcome> {
         let record = record.as_extracted();
         let account = self.route_account(record)?;
         let target = self.account_target(account.as_str()).await?;
@@ -260,7 +276,14 @@ impl<'a> FireflyClient<'a> {
             .await
             .context("resolving FX rate for conversion")?;
 
-        let group = build_group(record, external_id, account.as_str(), &target, rate);
+        let group = build_group(
+            record,
+            external_id,
+            account.as_str(),
+            &target,
+            rate,
+            category,
+        );
         self.post_group(&group, external_id, "transaction").await
     }
 
@@ -569,6 +592,33 @@ impl<'a> FireflyClient<'a> {
         }
         info!(journal = group_id, from = %expected.normalize(), to = %billed.normalize(), "auto-corrected amount to statement billed figure");
         Ok(CorrectionOutcome::Corrected)
+    }
+
+    /// Phase-2 symmetric double-book probe (consumo path): does a statement
+    /// booking (`bpstmt:`) already cover this `record`'s charge? Routes the
+    /// record's account, lists the in-window `receipt-ledger` journals, and runs
+    /// the pure [`statement_already_booked`](crate::statement::reconcile::statement_already_booked)
+    /// matcher. `Some(journal)` → the caller routes to Review instead of booking a
+    /// duplicate; `None` → safe to book. A read failure propagates as `Err`.
+    pub async fn statement_duplicate_probe(
+        &self,
+        record: &Extracted,
+        p: &crate::statement::reconcile::ReconcileParams,
+        aliases: &[(String, String)],
+    ) -> Result<Option<ExistingJournal>> {
+        let account = self.route_account(record)?;
+        let window = chrono::Duration::days(p.date_window_days);
+        let journals = self
+            .list_transactions(account, record.date - window, record.date + window)
+            .await?;
+        Ok(crate::statement::reconcile::statement_already_booked(
+            &record.merchant,
+            record.date,
+            &journals,
+            p,
+            aliases,
+        )
+        .cloned())
     }
 
     /// The configured PayPal Credit account, when present — the destination leg
@@ -1035,6 +1085,7 @@ fn build_group<'b>(
     account: &'b str,
     target: &'b Target,
     rate: Decimal,
+    category: Option<&'b str>,
 ) -> TransactionGroup<'b> {
     let kind = match record.direction {
         Direction::Out => "withdrawal",
@@ -1072,6 +1123,7 @@ fn build_group<'b>(
         destination: Destination::Name(&record.merchant),
         foreign_amount,
         foreign_currency_code,
+        category_name: category,
     })
 }
 
@@ -1132,6 +1184,8 @@ fn build_transfer_group<'b>(
         destination: Destination::Id(dest),
         foreign_amount,
         foreign_currency_code,
+        // Transfers (statement payments / wires) are not categorized.
+        category_name: None,
     })
 }
 
@@ -1392,7 +1446,14 @@ mod tests {
             currency: "EUR".to_string(),
             decimals: 2,
         };
-        let group = build_group(&rec, "8XY12345AB678901C", "103", &target, Decimal::ONE);
+        let group = build_group(
+            &rec,
+            "8XY12345AB678901C",
+            "103",
+            &target,
+            Decimal::ONE,
+            None,
+        );
         let json = serde_json::to_value(&group).unwrap();
 
         assert_eq!(json["error_if_duplicate_hash"], true);
@@ -1730,6 +1791,25 @@ mod tests {
         }
     }
 
+    // --- Phase-2 (c): MCC-derived category on a charge booking -------------
+
+    #[test]
+    fn build_group_sets_category_name_only_when_provided() {
+        let rec = banco_record("USD");
+        let target = usd_target();
+        // With a category → category_name present.
+        let g = build_group(&rec, "h", "106", &target, Decimal::ONE, Some("Groceries"));
+        let split = &serde_json::to_value(&g).unwrap()["transactions"][0];
+        assert_eq!(split["category_name"], "Groceries");
+        // Without → key omitted (charge books uncategorized).
+        let g2 = build_group(&rec, "h", "106", &target, Decimal::ONE, None);
+        let split2 = &serde_json::to_value(&g2).unwrap()["transactions"][0];
+        assert!(
+            split2.get("category_name").is_none(),
+            "no category → key omitted"
+        );
+    }
+
     /// Seed the per-account target cache so `submit_transfer_between` can read
     /// account currencies without any network I/O.
     fn seed_target(c: &FireflyClient, account: &str, currency: &str) {
@@ -1902,7 +1982,7 @@ mod tests {
     fn same_currency_books_unchanged_without_foreign_fields() {
         let rec = banco_record("USD");
         let target = usd_target();
-        let group = build_group(&rec, "h", "106", &target, Decimal::ONE);
+        let group = build_group(&rec, "h", "106", &target, Decimal::ONE, None);
         let json = serde_json::to_value(&group).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["amount"], "1.5");
@@ -1922,7 +2002,7 @@ mod tests {
         );
         let rate = Decimal::from_str("0.0064").unwrap();
         let target = usd_target();
-        let group = build_group(&rec, "h", "106", &target, rate);
+        let group = build_group(&rec, "h", "106", &target, rate, None);
         let json = serde_json::to_value(&group).unwrap();
         let split = &json["transactions"][0];
 
@@ -1953,7 +2033,7 @@ mod tests {
             decimals: 0,
         };
         let rate = Decimal::from_str("156.0").unwrap();
-        let group = build_group(&rec, "h", "999", &jpy, rate);
+        let group = build_group(&rec, "h", "999", &jpy, rate, None);
         let json = serde_json::to_value(&group).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["amount"], "10191", "0-dp target → whole units");
@@ -1972,7 +2052,7 @@ mod tests {
             Currency::parse("EUR").unwrap(),
         );
         let target = usd_target();
-        let group = build_group(&rec, "h", "106", &target, Decimal::ONE);
+        let group = build_group(&rec, "h", "106", &target, Decimal::ONE, None);
         let json = serde_json::to_value(&group).unwrap();
         assert_eq!(json["transactions"][0]["amount"], "1");
 
@@ -1982,7 +2062,7 @@ mod tests {
             Amount::parse("1.015").unwrap(),
             Currency::parse("EUR").unwrap(),
         );
-        let group2 = build_group(&rec2, "h", "106", &target, Decimal::ONE);
+        let group2 = build_group(&rec2, "h", "106", &target, Decimal::ONE, None);
         let json2 = serde_json::to_value(&group2).unwrap();
         assert_eq!(json2["transactions"][0]["amount"], "1.02");
     }
@@ -2047,7 +2127,7 @@ mod tests {
             .block_on(c.fx.rate(rec.currency().as_str(), "USD", rec.date))
             .expect("seeded rate, no network");
         let target = usd_target();
-        let group = build_group(&rec, "h", account.as_str(), &target, rate);
+        let group = build_group(&rec, "h", account.as_str(), &target, rate, None);
         let json = serde_json::to_value(&group).unwrap();
         assert_eq!(json["transactions"][0]["amount"], "32.83");
         assert_eq!(json["transactions"][0]["foreign_currency_code"], "JPY");
@@ -2147,7 +2227,7 @@ mod tests {
                 Currency::parse("EUR").unwrap(),
             );
             let target = Target { currency: "USD".to_string(), decimals };
-            let group = build_group(&rec, "h", "106", &target, rate);
+            let group = build_group(&rec, "h", "106", &target, rate, None);
             let booked = Decimal::from_str(&group.transactions[0].amount).unwrap();
 
             let exact = amount * rate;

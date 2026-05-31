@@ -385,6 +385,44 @@ fn has_other_candidate(
     })
 }
 
+/// Symmetric double-book probe (consumo side, Phase 2): does any **statement
+/// booking** (`bpstmt:`-keyed journal) in `journals` plausibly already represent
+/// a charge with this `merchant` and authorization `date`? Returns the first such
+/// journal.
+///
+/// Uses the matcher's own merchant + date-window signals (similarity ≥
+/// `merchant_gray`, within `date_window_days`) — the same conservatism as the
+/// forward guard. Two deliberate choices:
+/// - **`bpstmt:` only.** A prior *consumo* journal (`composite_hash`) is NOT a
+///   double-book risk (an identical re-send dedups; a genuine second charge is
+///   new), so restricting to statement bookings is what makes this a no-op in the
+///   normal consumo-first flow — it fires only once a statement has booked ahead.
+/// - **Amount is not compared.** A foreign charge's consumo estimate and the
+///   statement's billed figure legitimately differ (§2.1), and the consumo's
+///   currency here is its *original* (pre-FX) currency — not the account currency
+///   the journal carries — so an amount/currency equality test would miss real
+///   duplicates. Merchant + date is the reliable cross-source signal; the cost is
+///   that a recurring same-merchant charge within the window is conservatively
+///   sent to Review rather than double-booked (fail-closed, by design).
+///
+/// Pure — no I/O; the caller supplies the in-window journals.
+#[must_use]
+pub fn statement_already_booked<'j>(
+    merchant: &str,
+    date: NaiveDate,
+    journals: &'j [ExistingJournal],
+    p: &ReconcileParams,
+    aliases: &[(String, String)],
+) -> Option<&'j ExistingJournal> {
+    journals.iter().find(|j| {
+        j.external_id
+            .as_deref()
+            .is_some_and(|e| e.starts_with("bpstmt:"))
+            && within_window(date, j.date, p.date_window_days)
+            && merchant_similarity(merchant, &j.merchant, aliases) >= p.merchant_gray
+    })
+}
+
 /// Confirmed vs AmountMismatch, by the tolerance band (from [`ReconcileParams`]).
 fn amount_verdict(
     charge: &StatementTxn,
@@ -520,6 +558,57 @@ mod tests {
             merchant: merchant.to_string(),
             external_id: None,
         }
+    }
+
+    // --- Phase-2 (d): symmetric double-book probe (consumo side) -----------
+
+    #[test]
+    fn double_book_probe_flags_only_statement_bookings_in_window() {
+        let p = ReconcileParams::default();
+        let day = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        let stmt = ExistingJournal {
+            external_id: Some("bpstmt:74542016112077674827117".to_string()),
+            ..journal("1001", "JR EAST SIBUYAKU", "33.33", 21)
+        };
+
+        // A consumo "JR EAST" on the same day matches the statement booking
+        // (token containment) → flagged (would double-book).
+        assert!(
+            statement_already_booked("JR EAST", day, std::slice::from_ref(&stmt), &p, &[])
+                .is_some()
+        );
+
+        // A CONSUMO-booked journal (non-`bpstmt:` external_id, or none) is NOT a
+        // double-book risk — the probe ignores it.
+        let consumo = ExistingJournal {
+            external_id: Some("8XY12345AB".to_string()),
+            ..stmt.clone()
+        };
+        assert!(
+            statement_already_booked("JR EAST", day, std::slice::from_ref(&consumo), &p, &[])
+                .is_none()
+        );
+        let untagged = ExistingJournal {
+            external_id: None,
+            ..stmt.clone()
+        };
+        assert!(
+            statement_already_booked("JR EAST", day, std::slice::from_ref(&untagged), &p, &[])
+                .is_none()
+        );
+
+        // Outside the date window (9 days > W=5) → no match.
+        let far = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert!(
+            statement_already_booked("JR EAST", far, std::slice::from_ref(&stmt), &p, &[])
+                .is_none()
+        );
+
+        // A different merchant → no match.
+        assert!(
+            statement_already_booked("STARBUCKS TOKYO", day, std::slice::from_ref(&stmt), &p, &[])
+                .is_none()
+        );
     }
 
     /// Ids of the outcomes, in order, as a coarse fingerprint for permutation tests.
