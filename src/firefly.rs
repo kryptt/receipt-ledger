@@ -259,7 +259,10 @@ impl<'a> FireflyClient<'a> {
         external_id: &str,
         kind: &str,
     ) -> Result<SubmitOutcome> {
-        let url = format!("{}/api/v1/transactions", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/transactions",
+            self.base_url.trim_end_matches('/')
+        );
         let resp = self
             .http
             .post(&url)
@@ -376,7 +379,8 @@ impl<'a> FireflyClient<'a> {
     pub async fn submit_transfer(&self, transfer: &ValidatedTransfer) -> Result<SubmitOutcome> {
         let (source, dest) = self.route_transfer_accounts(transfer)?;
         let group = build_transfer_group(transfer, source.as_str(), dest.as_str(), None);
-        self.post_group(&group, transfer.external_id(), "transfer").await
+        self.post_group(&group, transfer.external_id(), "transfer")
+            .await
     }
 
     /// Submit a transfer between two **explicitly supplied** accounts: `source`
@@ -444,7 +448,9 @@ impl<'a> FireflyClient<'a> {
                 Some((converted, &dest_target.currency)),
             )
         };
-        let outcome = self.post_group(&group, transfer.external_id(), "transfer").await?;
+        let outcome = self
+            .post_group(&group, transfer.external_id(), "transfer")
+            .await?;
         Ok(TransferSubmit::Submitted(outcome))
     }
 
@@ -506,8 +512,10 @@ impl<'a> FireflyClient<'a> {
             )
         };
         let kind = if dop { "DOP" } else { "USD" };
-        let source = source.with_context(|| format!("no Banco Popular {kind} paying account configured"))?;
-        let dest = dest.with_context(|| format!("no Banco Popular {kind} card account configured"))?;
+        let source =
+            source.with_context(|| format!("no Banco Popular {kind} paying account configured"))?;
+        let dest =
+            dest.with_context(|| format!("no Banco Popular {kind} card account configured"))?;
         Ok((source, dest))
     }
 
@@ -547,7 +555,9 @@ impl<'a> FireflyClient<'a> {
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
                 .await
-                .with_context(|| format!("listing transactions for account {}", account.as_str()))?;
+                .with_context(|| {
+                    format!("listing transactions for account {}", account.as_str())
+                })?;
 
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -558,8 +568,10 @@ impl<'a> FireflyClient<'a> {
                 );
             }
 
-            let (mut journals, pagination, skipped) = parse_transactions_page(&body)
-                .with_context(|| format!("parsing transactions page {page} for {}", account.as_str()))?;
+            let (mut journals, pagination, skipped) =
+                parse_transactions_page(&body).with_context(|| {
+                    format!("parsing transactions page {page} for {}", account.as_str())
+                })?;
             out.append(&mut journals);
             skipped_total += skipped;
 
@@ -567,7 +579,11 @@ impl<'a> FireflyClient<'a> {
                 break;
             }
             if page >= MAX_PAGES {
-                warn!(account = account.as_str(), total_pages = pagination.total_pages, "pagination cap hit; stopping");
+                warn!(
+                    account = account.as_str(),
+                    total_pages = pagination.total_pages,
+                    "pagination cap hit; stopping"
+                );
                 break;
             }
             page += 1;
@@ -597,16 +613,25 @@ impl<'a> FireflyClient<'a> {
             .await
             .context("listing Firefly rule-groups")?;
         let Some(group_id) = find_rule_group_id(&groups_body, group_title) else {
-            warn!(group = group_title, "alias rule-group not found; no merchant aliases applied");
+            warn!(
+                group = group_title,
+                "alias rule-group not found; no merchant aliases applied"
+            );
             return Ok(Vec::new());
         };
         // 2. read its rules and extract (trigger → canonical) pairs.
         let rules_body = self
-            .get_json(&format!("{base}/api/v1/rule-groups/{group_id}/rules?limit=500"))
+            .get_json(&format!(
+                "{base}/api/v1/rule-groups/{group_id}/rules?limit=500"
+            ))
             .await
             .with_context(|| format!("listing rules in group {group_id}"))?;
         let map = parse_alias_rules(&rules_body)?;
-        info!(group = group_title, aliases = map.len(), "loaded merchant alias map");
+        info!(
+            group = group_title,
+            aliases = map.len(),
+            "loaded merchant alias map"
+        );
         Ok(map)
     }
 
@@ -797,7 +822,10 @@ fn parse_transactions_page(body: &str) -> Result<(Vec<ExistingJournal>, Paginati
 /// caller (never silently dropped).
 fn existing_journal(group_id: &str, split: &TxSplit) -> Option<ExistingJournal> {
     let date = parse_firefly_date(&split.date)?;
-    let magnitude = Decimal::from_str_exact(split.amount.trim()).ok()?.abs().normalize();
+    let magnitude = Decimal::from_str_exact(split.amount.trim())
+        .ok()?
+        .abs()
+        .normalize();
     let amount = Amount::parse(&magnitude.to_string()).ok()?;
     let currency = Currency::parse(split.currency_code.trim()).ok()?;
     Some(ExistingJournal {
@@ -805,10 +833,7 @@ fn existing_journal(group_id: &str, split: &TxSplit) -> Option<ExistingJournal> 
         date,
         amount: Money::new(amount, currency),
         merchant: split.description.trim().to_string(),
-        external_id: split
-            .external_id
-            .clone()
-            .filter(|s| !s.trim().is_empty()),
+        external_id: split.external_id.clone().filter(|s| !s.trim().is_empty()),
     })
 }
 
@@ -1272,13 +1297,18 @@ mod tests {
 
     fn transfer(currency: &str, amount: &str) -> crate::validate::ValidatedTransfer {
         match crate::validate::validate_transfer(
-            Money::new(Amount::parse(amount).unwrap(), Currency::parse(currency).unwrap()),
+            Money::new(
+                Amount::parse(amount).unwrap(),
+                Currency::parse(currency).unwrap(),
+            ),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
             "Pago Via App".to_string(),
             format!("bpstmt:{currency}"),
         ) {
             crate::validate::TransferVerdict::Booked(t) => t,
-            crate::validate::TransferVerdict::Review { reason } => panic!("transfer should validate: {reason}"),
+            crate::validate::TransferVerdict::Review { reason } => {
+                panic!("transfer should validate: {reason}")
+            }
         }
     }
 
@@ -1292,15 +1322,22 @@ mod tests {
         assert_eq!(src.as_str(), "202", "DOP checking is the source");
         assert_eq!(dst.as_str(), "107", "DOP card is the destination");
 
-        let json = serde_json::to_value(build_transfer_group(&t, src.as_str(), dst.as_str(), None)).unwrap();
+        let json = serde_json::to_value(build_transfer_group(&t, src.as_str(), dst.as_str(), None))
+            .unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "60999.81");
         assert_eq!(split["currency_code"], "DOP");
         assert_eq!(split["source_id"], "202");
         assert_eq!(split["destination_id"], "107");
-        assert!(split.get("destination_name").is_none(), "transfer uses dest id, not name");
-        assert!(split.get("foreign_amount").is_none(), "same-currency transfer, no FX");
+        assert!(
+            split.get("destination_name").is_none(),
+            "transfer uses dest id, not name"
+        );
+        assert!(
+            split.get("foreign_amount").is_none(),
+            "same-currency transfer, no FX"
+        );
     }
 
     #[test]
@@ -1308,7 +1345,9 @@ mod tests {
         let http = Client::new();
         let fx = fx(&http);
         let c = client(&http, &fx);
-        let (src, dst) = c.route_transfer_accounts(&transfer("USD", "2491.46")).unwrap();
+        let (src, dst) = c
+            .route_transfer_accounts(&transfer("USD", "2491.46"))
+            .unwrap();
         assert_eq!(src.as_str(), "201", "USD savings is the source");
         assert_eq!(dst.as_str(), "106", "USD card is the destination");
     }
@@ -1318,15 +1357,20 @@ mod tests {
         // The PayPal-payment path supplies source + dest directly (no currency
         // routing); the built group books a same-currency transfer between them.
         let t = transfer("USD", "1300.00");
-        let json =
-            serde_json::to_value(build_transfer_group(&t, "1", "105", None)).unwrap();
+        let json = serde_json::to_value(build_transfer_group(&t, "1", "105", None)).unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "1300");
         assert_eq!(split["currency_code"], "USD");
         assert_eq!(split["source_id"], "1", "funding account is the source");
-        assert_eq!(split["destination_id"], "105", "PayPal Credit is the destination");
-        assert!(split.get("foreign_amount").is_none(), "same-currency, no FX");
+        assert_eq!(
+            split["destination_id"], "105",
+            "PayPal Credit is the destination"
+        );
+        assert!(
+            split.get("foreign_amount").is_none(),
+            "same-currency, no FX"
+        );
     }
 
     // --- Fix 4: transfer currency-agreement guard --------------------------
@@ -1350,7 +1394,11 @@ mod tests {
         // rides as foreign_amount/foreign_currency_code (Firefly's cross-currency
         // transfer shape).
         let t = transfer("USD", "4000.00");
-        let converted = convert_amount(Decimal::from_str("4000.00").unwrap(), Decimal::from_str("0.92").unwrap(), 2);
+        let converted = convert_amount(
+            Decimal::from_str("4000.00").unwrap(),
+            Decimal::from_str("0.92").unwrap(),
+            2,
+        );
         let group = build_transfer_group(&t, "127", "8", Some((converted, "EUR")));
         let json = serde_json::to_value(&group).unwrap();
         let split = &json["transactions"][0];
@@ -1358,8 +1406,14 @@ mod tests {
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "4000", "source leg = exact settled USD");
         assert_eq!(split["currency_code"], "USD", "source-leg currency");
-        assert_eq!(split["foreign_amount"], "3680", "FX-estimated EUR (4000 × 0.92)");
-        assert_eq!(split["foreign_currency_code"], "EUR", "destination-leg currency");
+        assert_eq!(
+            split["foreign_amount"], "3680",
+            "FX-estimated EUR (4000 × 0.92)"
+        );
+        assert_eq!(
+            split["foreign_currency_code"], "EUR",
+            "destination-leg currency"
+        );
         assert_eq!(split["source_id"], "127");
         assert_eq!(split["destination_id"], "8");
     }
@@ -1381,11 +1435,19 @@ mod tests {
     fn convert_amount_rounds_to_target_precision() {
         // USD 100 → JPY at 156.0 = 15600 (0 dp, no fractional yen); 4000 × 0.92 = 3680.
         assert_eq!(
-            convert_amount(Decimal::from_str("100.00").unwrap(), Decimal::from_str("156.0").unwrap(), 0),
+            convert_amount(
+                Decimal::from_str("100.00").unwrap(),
+                Decimal::from_str("156.0").unwrap(),
+                0
+            ),
             Decimal::from_str("15600").unwrap()
         );
         assert_eq!(
-            convert_amount(Decimal::from_str("4000.00").unwrap(), Decimal::from_str("0.92").unwrap(), 2),
+            convert_amount(
+                Decimal::from_str("4000.00").unwrap(),
+                Decimal::from_str("0.92").unwrap(),
+                2
+            ),
             Decimal::from_str("3680.00").unwrap()
         );
         // Banker's rounding at the 2-dp midpoint: 1.005 → 1.00 (round half to even).
@@ -1398,10 +1460,13 @@ mod tests {
     /// Seed the per-account target cache so `submit_transfer_between` can read
     /// account currencies without any network I/O.
     fn seed_target(c: &FireflyClient, account: &str, currency: &str) {
-        c.account_target
-            .lock()
-            .unwrap()
-            .insert(account.to_string(), Target { currency: currency.to_string(), decimals: 2 });
+        c.account_target.lock().unwrap().insert(
+            account.to_string(),
+            Target {
+                currency: currency.to_string(),
+                decimals: 2,
+            },
+        );
     }
 
     #[test]
@@ -1416,13 +1481,18 @@ mod tests {
         seed_target(&c, "105", "USD"); // dest (PayPal Credit) books in USD
 
         let t = transfer("USD", "1300.00");
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let outcome = rt
             .block_on(c.submit_transfer_between(&t, &acct("1"), &acct("105")))
             .expect("a currency mismatch is Ok(CurrencyMismatch), not Err");
         match outcome {
             TransferSubmit::CurrencyMismatch { reason } => {
-                assert!(reason.contains("source"), "names the disagreeing leg: {reason}");
+                assert!(
+                    reason.contains("source"),
+                    "names the disagreeing leg: {reason}"
+                );
             }
             TransferSubmit::Submitted(o) => panic!("expected mismatch, submitted {o:?}"),
         }
@@ -1433,8 +1503,14 @@ mod tests {
         let http = Client::new();
         let fx = fx(&http);
         let c = client(&http, &fx);
-        assert_eq!(c.paypal_credit_account().map(AccountId::as_str), Some("105"));
-        assert_eq!(c.paying_account_for_last4("0130").map(AccountId::as_str), Some("1"));
+        assert_eq!(
+            c.paypal_credit_account().map(AccountId::as_str),
+            Some("105")
+        );
+        assert_eq!(
+            c.paying_account_for_last4("0130").map(AccountId::as_str),
+            Some("1")
+        );
         // An unmapped last-4 → None (the pipeline routes such a payment to Review).
         assert!(c.paying_account_for_last4("9999").is_none());
     }
@@ -1448,7 +1524,10 @@ mod tests {
         let http = Client::new();
         let fx = fx(&http);
         let c = client(&http, &fx);
-        assert_eq!(c.swift_debtor_for_last4("4189").map(AccountId::as_str), Some("127"));
+        assert_eq!(
+            c.swift_debtor_for_last4("4189").map(AccountId::as_str),
+            Some("127")
+        );
         // The SWIFT debtor last-4 is NOT in the PayPal funding map.
         assert!(c.paying_account_for_last4("4189").is_none());
         // The PayPal funding last-4 is NOT in the SWIFT debtor map.
@@ -1466,21 +1545,36 @@ mod tests {
         let http = Client::new();
         let fx = fx(&http);
         let c = client(&http, &fx);
-        let source = c.swift_debtor_for_last4("4189").expect("debtor last-4 mapped");
-        let dest = c.swift_dest_for_bic("CHASUS33").expect("creditor BIC mapped");
+        let source = c
+            .swift_debtor_for_last4("4189")
+            .expect("debtor last-4 mapped");
+        let dest = c
+            .swift_dest_for_bic("CHASUS33")
+            .expect("creditor BIC mapped");
         assert_eq!(source.as_str(), "127");
         assert_eq!(dest.as_str(), "1");
 
         let t = transfer("USD", "2100.00");
-        let json =
-            serde_json::to_value(build_transfer_group(&t, source.as_str(), dest.as_str(), None)).unwrap();
+        let json = serde_json::to_value(build_transfer_group(
+            &t,
+            source.as_str(),
+            dest.as_str(),
+            None,
+        ))
+        .unwrap();
         let split = &json["transactions"][0];
         assert_eq!(split["type"], "transfer");
         assert_eq!(split["amount"], "2100");
         assert_eq!(split["currency_code"], "USD");
         assert_eq!(split["source_id"], "127", "BPD debtor is the source");
-        assert_eq!(split["destination_id"], "1", "own foreign account is the destination");
-        assert!(split.get("foreign_amount").is_none(), "same-currency, no FX");
+        assert_eq!(
+            split["destination_id"], "1",
+            "own foreign account is the destination"
+        );
+        assert!(
+            split.get("foreign_amount").is_none(),
+            "same-currency, no FX"
+        );
     }
 
     #[test]
@@ -1488,10 +1582,19 @@ mod tests {
         let http = Client::new();
         let fx = fx(&http);
         let c = client(&http, &fx);
-        assert_eq!(c.swift_dest_for_bic("CHASUS33").map(AccountId::as_str), Some("1"));
-        assert_eq!(c.swift_dest_for_bic("ABNANL2A").map(AccountId::as_str), Some("8"));
+        assert_eq!(
+            c.swift_dest_for_bic("CHASUS33").map(AccountId::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            c.swift_dest_for_bic("ABNANL2A").map(AccountId::as_str),
+            Some("8")
+        );
         // Lookup is case-insensitive (keys are uppercased at parse + lookup).
-        assert_eq!(c.swift_dest_for_bic("chasus33").map(AccountId::as_str), Some("1"));
+        assert_eq!(
+            c.swift_dest_for_bic("chasus33").map(AccountId::as_str),
+            Some("1")
+        );
         // An unmapped BIC → None (the pipeline routes such a wire to Review).
         assert!(c.swift_dest_for_bic("DEUTDEFF").is_none());
     }
@@ -1804,11 +1907,18 @@ mod tests {
           "meta":{"pagination":{"total_pages":3}}
         }"#;
         let (js, pag, skipped) = parse_transactions_page(body).unwrap();
-        assert_eq!(js.len(), 1, "only the receipt-ledger-tagged split is returned");
+        assert_eq!(
+            js.len(),
+            1,
+            "only the receipt-ledger-tagged split is returned"
+        );
         assert_eq!(skipped, 0);
         assert_eq!(js[0].id, "100");
         assert_eq!(js[0].date, NaiveDate::from_ymd_opt(2026, 4, 21).unwrap());
-        assert_eq!(js[0].amount.amount.value(), Decimal::from_str_exact("50.93").unwrap());
+        assert_eq!(
+            js[0].amount.amount.value(),
+            Decimal::from_str_exact("50.93").unwrap()
+        );
         assert_eq!(js[0].amount.currency.as_str(), "USD");
         assert_eq!(js[0].merchant, "JR EAST");
         assert_eq!(js[0].external_id.as_deref(), Some("bpstmt:1"));
@@ -1824,7 +1934,10 @@ mod tests {
         ]}}],"meta":{"pagination":{"total_pages":1}}}"#;
         let (js, _, _) = parse_transactions_page(body).unwrap();
         assert_eq!(js.len(), 1);
-        assert_eq!(js[0].amount.amount.value(), Decimal::from_str_exact("50.93").unwrap());
+        assert_eq!(
+            js[0].amount.amount.value(),
+            Decimal::from_str_exact("50.93").unwrap()
+        );
     }
 
     #[test]
@@ -1850,8 +1963,14 @@ mod tests {
     #[test]
     fn parses_alias_rules_and_finds_group() {
         let groups = r#"{"data":[{"id":"7","attributes":{"title":"receipt-ledger-aliases"}},{"id":"3","attributes":{"title":"Other"}}]}"#;
-        assert_eq!(find_rule_group_id(groups, "receipt-ledger-aliases").as_deref(), Some("7"));
-        assert_eq!(find_rule_group_id(groups, "RECEIPT-LEDGER-ALIASES").as_deref(), Some("7"));
+        assert_eq!(
+            find_rule_group_id(groups, "receipt-ledger-aliases").as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            find_rule_group_id(groups, "RECEIPT-LEDGER-ALIASES").as_deref(),
+            Some("7")
+        );
         assert_eq!(find_rule_group_id(groups, "nope"), None);
 
         let rules = r#"{"data":[
@@ -1860,9 +1979,16 @@ mod tests {
           {"attributes":{"triggers":[{"type":"amount_more","value":"5"}],"actions":[{"type":"set_destination_account","value":"Skip"}]}}
         ]}"#;
         let map = parse_alias_rules(rules).unwrap();
-        assert_eq!(map.len(), 2, "only rules with a description trigger + set-destination action");
+        assert_eq!(
+            map.len(),
+            2,
+            "only rules with a description trigger + set-destination action"
+        );
         assert_eq!(map[0], ("jompeame".to_string(), "Jompeame".to_string()));
-        assert_eq!(map[1], ("nagano dentetsu".to_string(), "Nagano Dentetsu".to_string()));
+        assert_eq!(
+            map[1],
+            ("nagano dentetsu".to_string(), "Nagano Dentetsu".to_string())
+        );
     }
 
     #[test]
@@ -1871,7 +1997,10 @@ mod tests {
             parse_firefly_date("2026-04-21T00:00:00-04:00"),
             NaiveDate::from_ymd_opt(2026, 4, 21)
         );
-        assert_eq!(parse_firefly_date("2026-04-21"), NaiveDate::from_ymd_opt(2026, 4, 21));
+        assert_eq!(
+            parse_firefly_date("2026-04-21"),
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+        );
         assert_eq!(parse_firefly_date("garbage"), None);
     }
 }

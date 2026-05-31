@@ -248,7 +248,10 @@ mod tests {
         assert!(Reference::parse("24492166114100057344389").is_some());
         assert!(Reference::parse("8398").is_none()); // too short (an MCC)
         assert!(Reference::parse("06013243xx").is_none()); // non-digit
-        assert_eq!(Reference::parse("  0601324353  ").unwrap().as_str(), "0601324353");
+        assert_eq!(
+            Reference::parse("  0601324353  ").unwrap().as_str(),
+            "0601324353"
+        );
     }
 
     #[test]
@@ -269,18 +272,31 @@ mod tests {
             auth_date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
             reference: Reference::parse("74987506133002256024229").unwrap(),
             merchant: "7-Eleven B315 Kastrup".to_string(),
-            money: Money::new(Amount::parse("7.28").unwrap(), SectionCurrency::Usd.currency()),
+            money: Money::new(
+                Amount::parse("7.28").unwrap(),
+                SectionCurrency::Usd.currency(),
+            ),
             direction: Direction::Out,
             mcc: Mcc::parse("5499"),
             auth_code: AuthCode::parse("020509"),
         };
         let e = txn.to_extracted(&Last4::parse("7524").unwrap());
-        assert_eq!(e.external_id.as_deref(), Some("bpstmt:74987506133002256024229"));
-        assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(), "anchor = auth date");
+        assert_eq!(
+            e.external_id.as_deref(),
+            Some("bpstmt:74987506133002256024229")
+        );
+        assert_eq!(
+            e.date,
+            NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
+            "anchor = auth date"
+        );
         assert_eq!(e.status, "posted");
         assert_eq!(e.account_hint.as_deref(), Some("7524"));
         assert_eq!(e.source, Source::BancoPopular);
         // The dedup key is the verbatim external_id (no composite hash).
-        assert_eq!(crate::dedup::external_id(&e), "bpstmt:74987506133002256024229");
+        assert_eq!(
+            crate::dedup::external_id(&e),
+            "bpstmt:74987506133002256024229"
+        );
     }
 }

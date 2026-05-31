@@ -110,8 +110,7 @@ fn strip_page_breaks(body: &str) -> String {
 /// XML line. Case-insensitive on the `ICMACK` token.
 fn is_page_break_line(line: &str) -> bool {
     let mut fields = line.split_whitespace();
-    let (Some(stamp), Some(reference), Some(page)) =
-        (fields.next(), fields.next(), fields.next())
+    let (Some(stamp), Some(reference), Some(page)) = (fields.next(), fields.next(), fields.next())
     else {
         return false;
     };
@@ -216,8 +215,7 @@ fn parse_swift(body: &str) -> Result<TransferRecord> {
 /// money. Detect it by either a `<NbOfTxs>` greater than 1 OR more than one
 /// `<CdtTrfTxInf>` block — whichever the body exposes.
 fn guard_single_transaction(body: &str) -> Result<()> {
-    let declared = tag_value(body, "NbOfTxs")
-        .and_then(|raw| raw.trim().parse::<u64>().ok());
+    let declared = tag_value(body, "NbOfTxs").and_then(|raw| raw.trim().parse::<u64>().ok());
     let blocks = count_occurrences(body, "<CdtTrfTxInf");
     let txns = match (declared, blocks) {
         // Trust the larger of the declared count and the observed block count:
@@ -289,13 +287,14 @@ fn parse_settlement_date(body: &str) -> Result<NaiveDate> {
 /// inner `<Id>` value — the last four alphanumeric characters of the account id
 /// (the IBAN `DO96BPDO00000000000802394189` → `4189`).
 fn parse_debtor_last4(body: &str) -> Result<String> {
-    let (_, dbtr) =
-        element(body, "DbtrAcct").ok_or_else(|| anyhow!("no `<DbtrAcct>` debtor account element"))?;
-    let id = innermost_id(&dbtr)
-        .ok_or_else(|| anyhow!("`<DbtrAcct>` carries no `<Id>` value"))?;
+    let (_, dbtr) = element(body, "DbtrAcct")
+        .ok_or_else(|| anyhow!("no `<DbtrAcct>` debtor account element"))?;
+    let id = innermost_id(&dbtr).ok_or_else(|| anyhow!("`<DbtrAcct>` carries no `<Id>` value"))?;
     let alnum: Vec<char> = id.chars().filter(char::is_ascii_alphanumeric).collect();
     if alnum.len() < 4 {
-        return Err(anyhow!("debtor account id {id:?} has fewer than 4 alphanumerics"));
+        return Err(anyhow!(
+            "debtor account id {id:?} has fewer than 4 alphanumerics"
+        ));
     }
     Ok(alnum[alnum.len() - 4..].iter().collect())
 }
@@ -491,7 +490,10 @@ mod tests {
     #[test]
     fn parses_sample_1() {
         let t = ok(sample_1());
-        assert_eq!(t.money.amount.value(), Decimal::from_str("2100.00").unwrap());
+        assert_eq!(
+            t.money.amount.value(),
+            Decimal::from_str("2100.00").unwrap()
+        );
         assert_eq!(t.money.currency.as_str(), "USD");
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
         assert_eq!(swift_debtor_last4(&t), "4189");
@@ -503,7 +505,10 @@ mod tests {
     #[test]
     fn parses_sample_2() {
         let t = ok(sample_2());
-        assert_eq!(t.money.amount.value(), Decimal::from_str("4000.00").unwrap());
+        assert_eq!(
+            t.money.amount.value(),
+            Decimal::from_str("4000.00").unwrap()
+        );
         assert_eq!(t.money.currency.as_str(), "USD");
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
         assert_eq!(swift_debtor_last4(&t), "4189");
@@ -516,7 +521,10 @@ mod tests {
         // Sample 1 specifically interleaves page-break lines and underscore rules
         // between the SWIFT fields; it must still parse every field by tag.
         let t = ok(sample_1());
-        assert_eq!(t.money.amount.value(), Decimal::from_str("2100.00").unwrap());
+        assert_eq!(
+            t.money.amount.value(),
+            Decimal::from_str("2100.00").unwrap()
+        );
         assert_eq!(swift_debtor_last4(&t), "4189");
     }
 
@@ -538,7 +546,10 @@ mod tests {
                  <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
                  <Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n";
         let t = ok(body);
-        assert_eq!(t.money.amount.value(), Decimal::from_str("2100.00").unwrap());
+        assert_eq!(
+            t.money.amount.value(),
+            Decimal::from_str("2100.00").unwrap()
+        );
         assert_eq!(t.money.currency.as_str(), "USD");
     }
 
@@ -627,7 +638,10 @@ mod tests {
         let body = "MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
              <IntrBkSttlmAmt Ccy=\"USD\">not-a-number</IntrBkSttlmAmt>\nincomplete";
         let r = try_parse_swift(body).expect("markers present → Some");
-        assert!(r.is_err(), "missing/malformed required fields must be an Err");
+        assert!(
+            r.is_err(),
+            "missing/malformed required fields must be an Err"
+        );
     }
 
     #[test]

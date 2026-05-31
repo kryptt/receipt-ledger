@@ -465,16 +465,34 @@ Done."#;
         // 5xx (router restarting / overloaded), 502/503/504, 429, 408 → transient.
         for code in [502u16, 503, 504, 500] {
             assert!(
-                matches!(classify_status(StatusCode::from_u16(code).unwrap(), "x".into()), LlmError::Transient(_)),
+                matches!(
+                    classify_status(StatusCode::from_u16(code).unwrap(), "x".into()),
+                    LlmError::Transient(_)
+                ),
                 "{code} should be transient"
             );
         }
-        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()), LlmError::Transient(_)));
-        assert!(matches!(classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()), LlmError::Transient(_)));
+        assert!(matches!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()),
+            LlmError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()),
+            LlmError::Transient(_)
+        ));
         // 404 (model not found), 401/403 (auth), 400 (bad request) → permanent → Review.
-        assert!(matches!(classify_status(StatusCode::NOT_FOUND, "x".into()), LlmError::Permanent(_)));
-        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED, "x".into()), LlmError::Permanent(_)));
-        assert!(matches!(classify_status(StatusCode::BAD_REQUEST, "x".into()), LlmError::Permanent(_)));
+        assert!(matches!(
+            classify_status(StatusCode::NOT_FOUND, "x".into()),
+            LlmError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::UNAUTHORIZED, "x".into()),
+            LlmError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::BAD_REQUEST, "x".into()),
+            LlmError::Permanent(_)
+        ));
     }
 
     #[test]

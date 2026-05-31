@@ -288,7 +288,11 @@ mod tests {
     fn deterministic_extract_passes_through_consumo_to_llm() {
         // A normal consumo body → None, so the pipeline uses the LLM prompt path
         // (UNCHANGED). SWIFT handling never touches the consumo route.
-        assert!(BancoPopularAdapter.deterministic_extract(consumo_body()).is_none());
+        assert!(
+            BancoPopularAdapter
+                .deterministic_extract(consumo_body())
+                .is_none()
+        );
     }
 
     #[test]

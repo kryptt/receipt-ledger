@@ -45,11 +45,18 @@ enum RowKind<'a> {
     /// `VISA PRESTIGE DOP|USD` — opens a section.
     SectionTitle(SectionCurrency),
     /// `****-****-****-NNNN … <corte> … <balance anterior>` — the card/header row.
-    Card { last4: Last4, cut: NaiveDate, balance_anterior: Option<rust_decimal::Decimal> },
+    Card {
+        last4: Last4,
+        cut: NaiveDate,
+        balance_anterior: Option<rust_decimal::Decimal>,
+    },
     /// A transaction row. The reference is already parsed during classification
     /// (it needs no section context); only the year-inference of the dates is
     /// deferred to the fold, where the cut date is known.
-    Txn { reference: Reference, row: &'a TextRow },
+    Txn {
+        reference: Reference,
+        row: &'a TextRow,
+    },
     /// `MCC(4)  AUTH(6)` continuation for the preceding transaction.
     Continuation { mcc: Mcc, auth: AuthCode },
     /// The footer label row carrying `BALANCE TOTAL`.
@@ -77,7 +84,11 @@ pub fn parse_statement(rows: &[TextRow]) -> Result<ParsedStatement> {
         match classify_row(row) {
             RowKind::SectionTitle(cur) => current = Some(cur),
 
-            RowKind::Card { last4, cut, balance_anterior } => {
+            RowKind::Card {
+                last4,
+                cut,
+                balance_anterior,
+            } => {
                 let cur = current.context("card row before any section title")?;
                 cut_date = Some(cut);
                 // The card header repeats on every page; collapse consecutive
@@ -110,9 +121,7 @@ pub fn parse_statement(rows: &[TextRow]) -> Result<ParsedStatement> {
             RowKind::BalanceLabel => balance_pending = true,
 
             RowKind::BalanceValue(total) => {
-                if balance_pending
-                    && let Some(section) = out.sections.last_mut()
-                {
+                if balance_pending && let Some(section) = out.sections.last_mut() {
                     section.balance_total = Some(total);
                     balance_pending = false;
                 }
@@ -123,7 +132,9 @@ pub fn parse_statement(rows: &[TextRow]) -> Result<ParsedStatement> {
     }
 
     if out.sections.is_empty() {
-        return Err(anyhow!("no statement sections found (not an estado de cuenta?)"));
+        return Err(anyhow!(
+            "no statement sections found (not an estado de cuenta?)"
+        ));
     }
     Ok(out)
 }
@@ -137,7 +148,11 @@ fn classify_row(row: &TextRow) -> RowKind<'_> {
         return RowKind::SectionTitle(cur);
     }
     if let Some((last4, cut, balance_anterior)) = card_row(row) {
-        return RowKind::Card { last4, cut, balance_anterior };
+        return RowKind::Card {
+            last4,
+            cut,
+            balance_anterior,
+        };
     }
     if let Some(reference) = txn_reference(row) {
         return RowKind::Txn { reference, row };
@@ -313,7 +328,10 @@ fn parse_decimal_cell(s: &str) -> Option<Decimal> {
 
 /// The last cell that parses as a decimal — used for the footer BALANCE TOTAL.
 fn last_decimal(row: &TextRow) -> Option<Decimal> {
-    row.cells.iter().rev().find_map(|c| parse_decimal_cell(&c.text))
+    row.cells
+        .iter()
+        .rev()
+        .find_map(|c| parse_decimal_cell(&c.text))
 }
 
 /// How many of a row's cells parse as decimals — spots the footer's numeric
@@ -338,7 +356,10 @@ mod tests {
             y,
             cells: cells
                 .iter()
-                .map(|(x, t)| Cell { x: *x, text: t.to_string() })
+                .map(|(x, t)| Cell {
+                    x: *x,
+                    text: t.to_string(),
+                })
                 .collect(),
         }
     }
@@ -461,16 +482,26 @@ mod tests {
         assert_eq!(s.txns.len(), 3);
 
         let payment = &s.txns[0];
-        assert_eq!(payment.direction, Direction::In, "negative = credit/payment");
+        assert_eq!(
+            payment.direction,
+            Direction::In,
+            "negative = credit/payment"
+        );
         assert_eq!(payment.merchant, "Pago Via App");
         assert_eq!(payment.money.currency.as_str(), "DOP");
-        assert_eq!(payment.money.amount.value(), Decimal::from_str("60999.81").unwrap());
+        assert_eq!(
+            payment.money.amount.value(),
+            Decimal::from_str("60999.81").unwrap()
+        );
 
         let charge = &s.txns[1];
         assert_eq!(charge.direction, Direction::Out);
         assert_eq!(charge.merchant, "DONACION JOMPEAME JOMPEAME.COM");
         assert_eq!(charge.reference.as_str(), "24492166114100057344389");
-        assert_eq!(charge.money.amount.value(), Decimal::from_str("1000.00").unwrap());
+        assert_eq!(
+            charge.money.amount.value(),
+            Decimal::from_str("1000.00").unwrap()
+        );
 
         let usd = &s.txns[2];
         assert_eq!(usd.section, SectionCurrency::Usd);
@@ -483,7 +514,10 @@ mod tests {
         let s = parse_statement(&sample()).unwrap();
         let charge = &s.txns[1];
         assert_eq!(charge.mcc.as_ref().map(Mcc::as_str), Some("8398"));
-        assert_eq!(charge.auth_code.as_ref().map(AuthCode::as_str), Some("090531"));
+        assert_eq!(
+            charge.auth_code.as_ref().map(AuthCode::as_str),
+            Some("090531")
+        );
         // The payment had no continuation row.
         assert_eq!(s.txns[0].mcc, None);
     }
@@ -506,7 +540,10 @@ mod tests {
         let cut = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
         let reference = Reference::parse("0601324353").unwrap();
         let txn = parse_txn(&r, reference, SectionCurrency::Usd, cut).unwrap();
-        assert_eq!(txn.money.amount.value(), Decimal::from_str("42.15").unwrap());
+        assert_eq!(
+            txn.money.amount.value(),
+            Decimal::from_str("42.15").unwrap()
+        );
         assert_eq!(txn.merchant, "SOME MERCHANT");
     }
 
@@ -514,10 +551,19 @@ mod tests {
     fn year_inference_same_and_prior_year() {
         let cut = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
         // Month <= cut month (May) → cut year.
-        assert_eq!(infer_year("28/04", cut).unwrap(), NaiveDate::from_ymd_opt(2026, 4, 28).unwrap());
-        assert_eq!(infer_year("22/05", cut).unwrap(), NaiveDate::from_ymd_opt(2026, 5, 22).unwrap());
+        assert_eq!(
+            infer_year("28/04", cut).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
+        );
+        assert_eq!(
+            infer_year("22/05", cut).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 5, 22).unwrap()
+        );
         // Month after cut month → previous year (Dec→Jan wrap).
-        assert_eq!(infer_year("31/12", cut).unwrap(), NaiveDate::from_ymd_opt(2025, 12, 31).unwrap());
+        assert_eq!(
+            infer_year("31/12", cut).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()
+        );
     }
 
     #[test]
@@ -540,7 +586,10 @@ mod tests {
             RowKind::SectionTitle(SectionCurrency::Usd)
         ));
         assert!(matches!(
-            classify_row(&row(680.0, &[(25.0, "****-****-****-7524"), (375.0, "22/05/2026")])),
+            classify_row(&row(
+                680.0,
+                &[(25.0, "****-****-****-7524"), (375.0, "22/05/2026")]
+            )),
             RowKind::Card { .. }
         ));
         assert!(matches!(
@@ -562,6 +611,9 @@ mod tests {
         assert!(parse_decimal_cell("7.28").is_some());
         assert!(parse_decimal_cell("Kastrup").is_none());
         assert!(parse_decimal_cell("").is_none());
-        assert!(parse_decimal_cell("-").is_none(), "a lone minus is not a number");
+        assert!(
+            parse_decimal_cell("-").is_none(),
+            "a lone minus is not a number"
+        );
     }
 }

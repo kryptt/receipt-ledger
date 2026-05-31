@@ -114,10 +114,9 @@ pub async fn process_statement(
     fx: &FxClient<'_>,
     cfg: &Config,
 ) -> Result<StatementReport> {
-    let password = cfg
-        .bp_statement_password
-        .as_deref()
-        .ok_or_else(|| anyhow!("statement password (RECEIPT_BP_STATEMENT_PASSWORD) not configured"))?;
+    let password = cfg.bp_statement_password.as_deref().ok_or_else(|| {
+        anyhow!("statement password (RECEIPT_BP_STATEMENT_PASSWORD) not configured")
+    })?;
     let pdf_att = msg
         .attachments
         .iter()
@@ -151,7 +150,11 @@ pub async fn process_statement(
             SectionCurrency::Usd => cfg.banco_popular_usd_account.as_ref(),
             SectionCurrency::Dop => cfg.banco_popular_dop_account.as_ref(),
         }) else {
-            let rows = parsed.txns.iter().filter(|t| t.section == section.currency).count();
+            let rows = parsed
+                .txns
+                .iter()
+                .filter(|t| t.section == section.currency)
+                .count();
             warn!(currency = ?section.currency, rows, "no card account configured; section → review");
             report.review += rows;
             continue;
@@ -178,7 +181,11 @@ pub async fn process_statement(
         let recon = reconcile(&charges, &journals, &params, &aliases);
         report.unmatched_booked += recon.unmatched_journals.len();
         for j in &recon.unmatched_journals {
-            info!(journal = j.id, merchant = j.merchant, "unmatched Firefly journal (audit) → review");
+            info!(
+                journal = j.id,
+                merchant = j.merchant,
+                "unmatched Firefly journal (audit) → review"
+            );
         }
 
         // recon.charges is positional with `charges`.
@@ -282,7 +289,15 @@ async fn book_charge(
         }
     };
     let ext = validated.as_extracted();
-    match crate::usd_ceiling_review(fx, &cfg.validation, ext.currency().as_str(), ext.amount().value(), ext.date).await {
+    match crate::usd_ceiling_review(
+        fx,
+        &cfg.validation,
+        ext.currency().as_str(),
+        ext.amount().value(),
+        ext.date,
+    )
+    .await
+    {
         Ok(Some(reason)) => {
             info!(reference = charge.reference.as_str(), %reason, "BookNew over ceiling → review");
             report.review += 1;
@@ -370,7 +385,10 @@ async fn book_payment(
         }
     };
     if cfg.dry_run {
-        info!(reference = payment.reference.as_str(), "DRY RUN: would book payment transfer");
+        info!(
+            reference = payment.reference.as_str(),
+            "DRY RUN: would book payment transfer"
+        );
         report.payments_booked += 1;
         return;
     }
@@ -417,7 +435,11 @@ mod tests {
 
     #[test]
     fn pdf_with_cuenta_subject_is_statement() {
-        let m = msg("Fwd: Cuenta: ****-****-****-7524 | Fecha: 22/05/2026", "rhansen@kitsd.com", vec![pdf_att()]);
+        let m = msg(
+            "Fwd: Cuenta: ****-****-****-7524 | Fecha: 22/05/2026",
+            "rhansen@kitsd.com",
+            vec![pdf_att()],
+        );
         assert_eq!(classify_message(&m, None), Ingest::Statement);
     }
 
@@ -430,23 +452,64 @@ mod tests {
     #[test]
     fn pdf_without_marker_is_notification() {
         let m = msg("here is a receipt", "someone@example.com", vec![pdf_att()]);
-        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Notification);
+        assert_eq!(
+            classify_message(&m, Some("kitsd.com")),
+            Ingest::Notification
+        );
     }
 
     #[test]
     fn no_pdf_is_notification_even_with_cuenta_subject() {
         let m = msg("Cuenta: 123", "rhansen@kitsd.com", vec![other_att()]);
-        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Notification);
+        assert_eq!(
+            classify_message(&m, Some("kitsd.com")),
+            Ingest::Notification
+        );
     }
 
     #[test]
     fn report_clean_only_without_flags() {
-        let clean = StatementReport { reconciled: 5, booked_new: 2, payments_booked: 1, ..Default::default() };
+        let clean = StatementReport {
+            reconciled: 5,
+            booked_new: 2,
+            payments_booked: 1,
+            ..Default::default()
+        };
         assert!(clean.is_clean());
-        assert!(!StatementReport { amount_mismatch: 1, ..Default::default() }.is_clean());
-        assert!(!StatementReport { unmatched_booked: 1, ..Default::default() }.is_clean());
-        assert!(!StatementReport { balance_mismatch: 1, ..Default::default() }.is_clean());
-        assert!(!StatementReport { review: 1, ..Default::default() }.is_clean());
-        assert!(!StatementReport { deferred: 1, ..Default::default() }.is_clean());
+        assert!(
+            !StatementReport {
+                amount_mismatch: 1,
+                ..Default::default()
+            }
+            .is_clean()
+        );
+        assert!(
+            !StatementReport {
+                unmatched_booked: 1,
+                ..Default::default()
+            }
+            .is_clean()
+        );
+        assert!(
+            !StatementReport {
+                balance_mismatch: 1,
+                ..Default::default()
+            }
+            .is_clean()
+        );
+        assert!(
+            !StatementReport {
+                review: 1,
+                ..Default::default()
+            }
+            .is_clean()
+        );
+        assert!(
+            !StatementReport {
+                deferred: 1,
+                ..Default::default()
+            }
+            .is_clean()
+        );
     }
 }

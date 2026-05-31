@@ -107,7 +107,12 @@ pub fn validate_transfer(
     };
     match reason {
         Some(reason) => TransferVerdict::Review { reason },
-        None => TransferVerdict::Booked(ValidatedTransfer { money, date, description, external_id }),
+        None => TransferVerdict::Booked(ValidatedTransfer {
+            money,
+            date,
+            description,
+            external_id,
+        }),
     }
 }
 
@@ -532,7 +537,10 @@ mod tests {
     // --- transfer gate (statement payments) ------------------------------
 
     fn money(amount: &str, currency: &str) -> Money {
-        Money::new(Amount::parse(amount).unwrap(), Currency::parse(currency).unwrap())
+        Money::new(
+            Amount::parse(amount).unwrap(),
+            Currency::parse(currency).unwrap(),
+        )
     }
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
@@ -547,7 +555,12 @@ mod tests {
 
     #[test]
     fn valid_payment_mints_transfer() {
-        match validate_transfer(money("60999.81", "DOP"), day(), "Pago Via App".into(), "bpstmt:1".into()) {
+        match validate_transfer(
+            money("60999.81", "DOP"),
+            day(),
+            "Pago Via App".into(),
+            "bpstmt:1".into(),
+        ) {
             TransferVerdict::Booked(t) => {
                 assert_eq!(t.money().currency.as_str(), "DOP");
                 assert_eq!(t.external_id(), "bpstmt:1");

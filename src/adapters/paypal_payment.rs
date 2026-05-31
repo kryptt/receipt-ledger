@@ -42,8 +42,10 @@ const USER_PAID_MARKER: &str = "you paid";
 /// what distinguishes a receipt from a quote. Tightening this to an AND of the
 /// user-paid phrase + a structural marker (rather than the old weak OR) stops a
 /// non-receipt that merely contains "you paid" from booking a spurious transfer.
-const STRUCTURAL_MARKERS: &[&str] =
-    &["paypal credit will receive", "receipt for your payment to paypal credit"];
+const STRUCTURAL_MARKERS: &[&str] = &[
+    "paypal credit will receive",
+    "receipt for your payment to paypal credit",
+];
 
 /// The fixed description booked for the transfer split.
 const PAYMENT_DESCRIPTION: &str = "Payment to PayPal Credit";
@@ -175,7 +177,9 @@ fn parse_payment_date(body: &str) -> Result<NaiveDate> {
     if let Some(date) = date_after_label(body).or_else(|| date_after_on_headline(body)) {
         return Ok(date);
     }
-    Err(anyhow!("no parseable payment date (`Date` block or `on <Month DD, YYYY>`)"))
+    Err(anyhow!(
+        "no parseable payment date (`Date` block or `on <Month DD, YYYY>`)"
+    ))
 }
 
 /// The value on the line following a line that is exactly `Date` (the
@@ -347,7 +351,10 @@ mod tests {
             .expect("deterministic adapter always takes over")
             .expect("the sample receipt parses");
         let t = transfer(outcome);
-        assert_eq!(t.money.amount.value(), Decimal::from_str("1300.00").unwrap());
+        assert_eq!(
+            t.money.amount.value(),
+            Decimal::from_str("1300.00").unwrap()
+        );
         assert_eq!(t.money.currency.as_str(), "USD");
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
         assert_eq!(t.external_id, "pp-payment:49R50555FK9130709");
@@ -370,13 +377,16 @@ mod tests {
         // confirmation marker (`PayPal Credit will receive` here).
         assert!(PaypalPaymentAdapter.is_transaction(sample_body()));
         // The subject-phrase structural marker also suffices alongside "you paid".
-        assert!(PaypalPaymentAdapter.is_transaction(
-            "Receipt for your payment to PayPal Credit\nYou paid $1.00 USD.",
-        ));
+        assert!(
+            PaypalPaymentAdapter
+                .is_transaction("Receipt for your payment to PayPal Credit\nYou paid $1.00 USD.",)
+        );
         // "you paid" alone (a dispute/quote echoing the phrase) is NOT a receipt:
         // no `will receive`/`receipt for your payment` structure → no spurious book.
-        assert!(!PaypalPaymentAdapter
-            .is_transaction("Regarding your dispute: you paid $1.00 USD, but we disagree."));
+        assert!(
+            !PaypalPaymentAdapter
+                .is_transaction("Regarding your dispute: you paid $1.00 USD, but we disagree.")
+        );
         // The bare structural line without "you paid" is also not a receipt.
         assert!(!PaypalPaymentAdapter.is_transaction("PayPal Credit will receive your statement."));
         assert!(!PaypalPaymentAdapter.is_transaction("Your statement is ready to view."));
@@ -397,9 +407,18 @@ mod tests {
 
     #[test]
     fn funding_last4_reads_digits_after_x() {
-        assert_eq!(four_digits_after_x("JPMORGAN CHASE x-0130").as_deref(), Some("0130"));
-        assert_eq!(four_digits_after_x("Visa x-1234 ending").as_deref(), Some("1234"));
-        assert_eq!(four_digits_after_x("x-5678 at line start").as_deref(), Some("5678"));
+        assert_eq!(
+            four_digits_after_x("JPMORGAN CHASE x-0130").as_deref(),
+            Some("0130")
+        );
+        assert_eq!(
+            four_digits_after_x("Visa x-1234 ending").as_deref(),
+            Some("1234")
+        );
+        assert_eq!(
+            four_digits_after_x("x-5678 at line start").as_deref(),
+            Some("5678")
+        );
         // Not four digits, or no `x-`, → None.
         assert_eq!(four_digits_after_x("x-12"), None);
         assert_eq!(four_digits_after_x("no card here"), None);

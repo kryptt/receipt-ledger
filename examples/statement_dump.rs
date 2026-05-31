@@ -26,7 +26,11 @@ fn main() -> anyhow::Result<()> {
         );
     }
     println!("transactions: {}", st.txns.len());
-    let charges = st.txns.iter().filter(|t| matches!(t.direction, receipt_ledger::schema::Direction::Out)).count();
+    let charges = st
+        .txns
+        .iter()
+        .filter(|t| matches!(t.direction, receipt_ledger::schema::Direction::Out))
+        .count();
     let payments = st.txns.len() - charges;
     println!("  charges: {charges}, payments/credits: {payments}");
     Ok(())

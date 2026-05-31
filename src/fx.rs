@@ -88,7 +88,10 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 /// Classify an HTTP status into a [`RateError`] variant: server errors plus the
 /// retryable 408/429 are transient; every other non-success is permanent.
 fn classify_status(status: reqwest::StatusCode, msg: String) -> RateError {
-    if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::REQUEST_TIMEOUT {
+    if status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+    {
         RateError::Transient(msg)
     } else {
         RateError::Permanent(msg)
@@ -143,8 +146,15 @@ fn load_cache(path: &str) -> HashMap<CacheKey, CacheEntry> {
         .into_iter()
         .map(|p| {
             (
-                (p.from.to_ascii_uppercase(), p.to.to_ascii_uppercase(), p.date),
-                CacheEntry { rate: p.rate, fetched_at: p.fetched_at },
+                (
+                    p.from.to_ascii_uppercase(),
+                    p.to.to_ascii_uppercase(),
+                    p.date,
+                ),
+                CacheEntry {
+                    rate: p.rate,
+                    fetched_at: p.fetched_at,
+                },
             )
         })
         .collect()
@@ -231,10 +241,13 @@ impl<'a> FxClient<'a> {
     /// Insert a freshly-resolved rate into the cache, stamped with the current
     /// time so the per-day TTL can later expire a today/future rate.
     fn cache_put(&self, key: CacheKey, rate: Decimal) {
-        self.cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, CacheEntry { rate, fetched_at: Utc::now().timestamp() });
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            key,
+            CacheEntry {
+                rate,
+                fetched_at: Utc::now().timestamp(),
+            },
+        );
     }
 
     /// Attach a Banco Popular DOP-rate provider, used for any conversion where
@@ -358,7 +371,10 @@ impl<'a> FxClient<'a> {
             // `fetched_at: i64::MAX` makes the seeded entry never expire under the
             // TTL, so a fixture seeded on today's date still returns without a
             // network call regardless of the wall clock.
-            CacheEntry { rate, fetched_at: i64::MAX },
+            CacheEntry {
+                rate,
+                fetched_at: i64::MAX,
+            },
         );
         Self {
             http,
@@ -474,7 +490,12 @@ impl<'a> DopRate<'a> {
         let cur = currency.trim().to_ascii_uppercase();
 
         // Memo hit — no network. Scoped lock, released before any await.
-        if let Some(state) = self.table.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(state) = self
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             return Self::resolve(state, &cur);
         }
 
@@ -488,7 +509,9 @@ impl<'a> DopRate<'a> {
     fn resolve(state: &TableState, cur: &str) -> std::result::Result<Decimal, RateError> {
         match state {
             TableState::Loaded(table) => table.get(cur).copied().ok_or_else(|| {
-                RateError::Permanent(format!("Banco Popular publishes no '{cur}' rate (only USD/EUR)"))
+                RateError::Permanent(format!(
+                    "Banco Popular publishes no '{cur}' rate (only USD/EUR)"
+                ))
             }),
             TableState::Failed(e) => Err(e.clone()),
         }
@@ -522,7 +545,8 @@ impl<'a> DopRate<'a> {
     async fn try_load_table(&self) -> std::result::Result<HashMap<String, Decimal>, RateError> {
         let token = self.fetch_token().await?;
         let body = self.fetch_rates(&token).await?;
-        parse_rate_table(&body).map_err(|e| RateError::Permanent(format!("parsing consultaTasa: {e}")))
+        parse_rate_table(&body)
+            .map_err(|e| RateError::Permanent(format!("parsing consultaTasa: {e}")))
     }
 
     /// Mint an OAuth2 access token via the client-credentials grant.
@@ -538,13 +562,17 @@ impl<'a> DopRate<'a> {
             .send_classified(
                 self.http
                     .post(&self.token_url)
-                    .header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
                     .header(reqwest::header::ACCEPT, "application/json")
                     .body(form),
                 "DOP token endpoint",
             )
             .await?;
-        parse_token(&body).map_err(|e| RateError::Permanent(format!("decoding DOP token response: {e}")))
+        parse_token(&body)
+            .map_err(|e| RateError::Permanent(format!("decoding DOP token response: {e}")))
     }
 
     /// Fetch the raw `consultaTasa` body with the bearer token + client-id header
@@ -577,7 +605,10 @@ impl<'a> DopRate<'a> {
         if status.is_success() {
             return Ok(body);
         }
-        Err(classify_status(status, format!("{what} returned {status}: {}", body.trim())))
+        Err(classify_status(
+            status,
+            format!("{what} returned {status}: {}", body.trim()),
+        ))
     }
 }
 
@@ -639,7 +670,11 @@ where
     let text = match serde_json::Value::deserialize(de)? {
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => s,
-        other => return Err(D::Error::custom(format!("expected number or string, got {other}"))),
+        other => {
+            return Err(D::Error::custom(format!(
+                "expected number or string, got {other}"
+            )));
+        }
     };
     Decimal::from_str(text.trim()).map_err(D::Error::custom)
 }
@@ -783,14 +818,35 @@ mod tests {
     fn classify_status_transient_vs_permanent() {
         use reqwest::StatusCode;
         // 521 (Cloudflare origin down), 500, 429, 408 → transient (retry).
-        assert!(matches!(classify_status(StatusCode::from_u16(521).unwrap(), "x".into()), RateError::Transient(_)));
-        assert!(matches!(classify_status(StatusCode::INTERNAL_SERVER_ERROR, "x".into()), RateError::Transient(_)));
-        assert!(matches!(classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()), RateError::Transient(_)));
-        assert!(matches!(classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()), RateError::Transient(_)));
+        assert!(matches!(
+            classify_status(StatusCode::from_u16(521).unwrap(), "x".into()),
+            RateError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR, "x".into()),
+            RateError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()),
+            RateError::Transient(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()),
+            RateError::Transient(_)
+        ));
         // 401/403/400 → permanent (don't retry; route to Review).
-        assert!(matches!(classify_status(StatusCode::UNAUTHORIZED, "x".into()), RateError::Permanent(_)));
-        assert!(matches!(classify_status(StatusCode::FORBIDDEN, "x".into()), RateError::Permanent(_)));
-        assert!(matches!(classify_status(StatusCode::BAD_REQUEST, "x".into()), RateError::Permanent(_)));
+        assert!(matches!(
+            classify_status(StatusCode::UNAUTHORIZED, "x".into()),
+            RateError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::FORBIDDEN, "x".into()),
+            RateError::Permanent(_)
+        ));
+        assert!(matches!(
+            classify_status(StatusCode::BAD_REQUEST, "x".into()),
+            RateError::Permanent(_)
+        ));
     }
 
     #[test]

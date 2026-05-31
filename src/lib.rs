@@ -52,7 +52,9 @@ pub struct Summary {
 pub async fn run() -> Result<Summary> {
     let cfg = Config::from_env().context("loading configuration")?;
     if cfg.dry_run {
-        info!("DRY RUN enabled (RECEIPT_DRY_RUN): no Firefly writes, no mailbox moves, no state advance");
+        info!(
+            "DRY RUN enabled (RECEIPT_DRY_RUN): no Firefly writes, no mailbox moves, no state advance"
+        );
     }
     let http = build_http_client()?;
 
@@ -134,7 +136,8 @@ pub async fn run() -> Result<Summary> {
                 Ok(report) => {
                     summary.booked += report.booked_new + report.payments_booked;
                     summary.duplicates += report.reconciled;
-                    summary.review += report.review + report.amount_mismatch + report.unmatched_booked;
+                    summary.review +=
+                        report.review + report.amount_mismatch + report.unmatched_booked;
                     if report.deferred > 0 {
                         // Some rows need a rate the provider couldn't give right
                         // now. Leave the whole message in INBOX; the rows that did
@@ -225,7 +228,9 @@ pub async fn run() -> Result<Summary> {
     if cfg.dry_run {
         info!("DRY RUN: not advancing JMAP state");
     } else if hold_state {
-        warn!("deferred messages kept in INBOX (provider outage); not advancing JMAP state — will retry next run");
+        warn!(
+            "deferred messages kept in INBOX (provider outage); not advancing JMAP state — will retry next run"
+        );
     } else {
         jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
     }
@@ -357,8 +362,14 @@ async fn process_message(
                 // A transient rate outage propagates as `Err` and is deferred by
                 // `run()`'s central classifier; a permanent FX error also
                 // propagates (→ Review). An over-ceiling verdict is `Ok(Some)`.
-                if let Some(reason) =
-                    usd_ceiling_review(fx, policy, ext.currency().as_str(), ext.amount().value(), ext.date).await?
+                if let Some(reason) = usd_ceiling_review(
+                    fx,
+                    policy,
+                    ext.currency().as_str(),
+                    ext.amount().value(),
+                    ext.date,
+                )
+                .await?
                 {
                     review_reason.get_or_insert(reason);
                     continue;
@@ -490,7 +501,10 @@ async fn book_transfer(
     };
 
     if dry_run {
-        info!(external_id = transfer.external_id(), "DRY RUN: would book payment transfer");
+        info!(
+            external_id = transfer.external_id(),
+            "DRY RUN: would book payment transfer"
+        );
         return Ok(Disposition::Booked);
     }
     // `submit_transfer_between` books cross-currency (USD→EUR) by FX-converting
@@ -498,7 +512,10 @@ async fn book_transfer(
     // SOURCE account currency; if it doesn't, the source-leg debit is unknown and
     // it returns a typed CurrencyMismatch we route to Review (never a guessed
     // debit). A transient FX outage propagates as `Err` → deferred by `run()`.
-    match firefly.submit_transfer_between(&transfer, source, dest).await? {
+    match firefly
+        .submit_transfer_between(&transfer, source, dest)
+        .await?
+    {
         TransferSubmit::Submitted(SubmitOutcome::Created) => Ok(Disposition::Booked),
         TransferSubmit::Submitted(SubmitOutcome::Duplicate) => Ok(Disposition::Duplicate),
         TransferSubmit::CurrencyMismatch { reason } => Ok(Disposition::Review(reason)),
@@ -526,7 +543,10 @@ pub(crate) async fn usd_ceiling_review(
         .context("resolving FX rate for USD ceiling")?;
     match usd_ceiling::check(amount, rate, Some(ceiling)) {
         CeilingVerdict::Within { .. } => Ok(None),
-        CeilingVerdict::Over { usd_equivalent, ceiling } => Ok(Some(format!(
+        CeilingVerdict::Over {
+            usd_equivalent,
+            ceiling,
+        } => Ok(Some(format!(
             "amount ≈ ${} (>{} USD) — routed to review",
             usd_equivalent.round_dp(2).normalize(),
             ceiling.normalize()
@@ -596,7 +616,10 @@ mod book_transfer_tests {
     /// A SWIFT transfer record for the given creditor BIC and debtor last-4.
     fn swift_record(bic: &str, debtor_last4: &str) -> TransferRecord {
         TransferRecord {
-            money: Money::new(Amount::parse("2100.00").unwrap(), Currency::parse("USD").unwrap()),
+            money: Money::new(
+                Amount::parse("2100.00").unwrap(),
+                Currency::parse("USD").unwrap(),
+            ),
             date: NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
             description: "SWIFT wire to RODOLFO HANSEN".to_string(),
             external_id: "swift:5dd60267-659f-446e-92c4-c1540b8f8253".to_string(),
@@ -630,7 +653,9 @@ mod book_transfer_tests {
         let http = Client::new();
         let fx = FxClient::new(&http, "http://fx.invalid");
         let c = client(&http, &fx);
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         rt.block_on(book_transfer(record, &c, &fx, &no_ceiling(), false))
             .expect("book_transfer should not error on these review paths")
     }
@@ -640,7 +665,10 @@ mod book_transfer_tests {
         // A wire to a BIC absent from RECEIPT_SWIFT_DEST_BY_BIC must NOT auto-book.
         match run(swift_record("DEUTDEFF", "4189")) {
             Disposition::Review(reason) => {
-                assert!(reason.contains("DEUTDEFF"), "names the unmapped BIC: {reason}");
+                assert!(
+                    reason.contains("DEUTDEFF"),
+                    "names the unmapped BIC: {reason}"
+                );
                 assert!(reason.contains("RECEIPT_SWIFT_DEST_BY_BIC"), "{reason}");
             }
             other => panic!("expected Review for unmapped BIC, got {other:?}"),
@@ -652,7 +680,10 @@ mod book_transfer_tests {
         // BIC maps, but the debtor last-4 does not → Review (no source guess).
         match run(swift_record("CHASUS33", "0000")) {
             Disposition::Review(reason) => {
-                assert!(reason.contains("0000"), "names the unmapped last-4: {reason}");
+                assert!(
+                    reason.contains("0000"),
+                    "names the unmapped last-4: {reason}"
+                );
                 assert!(reason.contains("RECEIPT_SWIFT_DEBTOR_BY_LAST4"), "{reason}");
             }
             other => panic!("expected Review for unmapped last-4, got {other:?}"),
@@ -666,10 +697,21 @@ mod book_transfer_tests {
         let http = Client::new();
         let fx = FxClient::new(&http, "http://fx.invalid");
         let c = client(&http, &fx);
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let d = rt
-            .block_on(book_transfer(swift_record("CHASUS33", "4189"), &c, &fx, &no_ceiling(), true))
+            .block_on(book_transfer(
+                swift_record("CHASUS33", "4189"),
+                &c,
+                &fx,
+                &no_ceiling(),
+                true,
+            ))
             .expect("dry-run books without network");
-        assert!(matches!(d, Disposition::Booked), "both legs resolve → Booked (dry-run)");
+        assert!(
+            matches!(d, Disposition::Booked),
+            "both legs resolve → Booked (dry-run)"
+        );
     }
 }

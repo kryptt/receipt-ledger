@@ -195,7 +195,17 @@ pub fn reconcile(
         // one charge; the others are separate purchases at the same merchant).
         // Disambiguate by AMOUNT: the claimant whose amount is *clearly* nearest
         // the journal's is the match; the rest are different charges.
-        resolve_cluster(ji, &claimants, charges, journals, p, aliases, &mut winner, &mut conflict, &mut book);
+        resolve_cluster(
+            ji,
+            &claimants,
+            charges,
+            journals,
+            p,
+            aliases,
+            &mut winner,
+            &mut conflict,
+            &mut book,
+        );
     }
 
     // --- 2c. apply -------------------------------------------------------
@@ -211,7 +221,9 @@ pub fn reconcile(
             match intent {
                 Intent::Book => ChargeOutcome::BookNew,
                 Intent::Review(reason) => ChargeOutcome::Review { reason },
-                Intent::Claim { .. } => unreachable!("every Claim is resolved into winner/conflict/book"),
+                Intent::Claim { .. } => {
+                    unreachable!("every Claim is resolved into winner/conflict/book")
+                }
             }
         };
         outcome[ci] = Some(decided);
@@ -229,7 +241,10 @@ pub fn reconcile(
         .map(|(_, j)| j.clone())
         .collect();
 
-    Reconciliation { charges: charges_out, unmatched_journals }
+    Reconciliation {
+        charges: charges_out,
+        unmatched_journals,
+    }
 }
 
 /// Decide one charge's intent against the currently-free journals (pass 1).
@@ -248,7 +263,12 @@ fn intent_for(
                 && same_currency(charge, j)
                 && within_window(charge.auth_date, j.date, p.date_window_days)
         })
-        .map(|(i, j)| (i, merchant_similarity(&charge.merchant, &j.merchant, aliases)))
+        .map(|(i, j)| {
+            (
+                i,
+                merchant_similarity(&charge.merchant, &j.merchant, aliases),
+            )
+        })
         .filter(|&(_, s)| s >= p.merchant_gray)
         .collect();
     // Deterministic order: score desc, then journal id asc (so equal-score ties
@@ -279,7 +299,10 @@ fn intent_for(
             p.score_epsilon
         ));
     }
-    Intent::Claim { journal: best_j, score: best_s }
+    Intent::Claim {
+        journal: best_j,
+        score: best_s,
+    }
 }
 
 /// Disambiguate several same-merchant charges that all claim one journal, by
@@ -363,11 +386,17 @@ fn has_other_candidate(
 }
 
 /// Confirmed vs AmountMismatch, by the tolerance band (from [`ReconcileParams`]).
-fn amount_verdict(charge: &StatementTxn, journal: &ExistingJournal, tolerance: Decimal) -> ChargeOutcome {
+fn amount_verdict(
+    charge: &StatementTxn,
+    journal: &ExistingJournal,
+    tolerance: Decimal,
+) -> ChargeOutcome {
     let statement = charge.money.amount.value();
     let booked = journal.amount.amount.value();
     if (statement - booked).abs() <= tolerance {
-        ChargeOutcome::Confirmed { journal_id: journal.id.clone() }
+        ChargeOutcome::Confirmed {
+            journal_id: journal.id.clone(),
+        }
     } else {
         ChargeOutcome::AmountMismatch {
             journal_id: journal.id.clone(),
@@ -420,7 +449,11 @@ fn token_containment(a: &str, b: &str) -> f64 {
     if ta.is_empty() || tb.is_empty() {
         return 0.0;
     }
-    let (small, big) = if ta.len() <= tb.len() { (&ta, &tb) } else { (&tb, &ta) };
+    let (small, big) = if ta.len() <= tb.len() {
+        (&ta, &tb)
+    } else {
+        (&tb, &ta)
+    };
     let hits = small.iter().filter(|t| big.contains(*t)).count();
     hits as f64 / small.len() as f64
 }
@@ -438,7 +471,10 @@ fn tokens(s: &str) -> Vec<String> {
 /// [`crate::validate`]'s status normaliser (which also collapses punctuation);
 /// kept separate on purpose — different domain, different rules.
 fn normalize_merchant(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 fn within_window(a: NaiveDate, b: NaiveDate, days: i64) -> bool {
@@ -459,7 +495,10 @@ mod tests {
             auth_date: d,
             reference: Reference::parse(reference).unwrap(),
             merchant: merchant.to_string(),
-            money: Money::new(Amount::parse(amount).unwrap(), SectionCurrency::Usd.currency()),
+            money: Money::new(
+                Amount::parse(amount).unwrap(),
+                SectionCurrency::Usd.currency(),
+            ),
             direction: Direction::Out,
             mcc: None,
             auth_code: None,
@@ -467,7 +506,10 @@ mod tests {
     }
 
     fn usd(amount: &str) -> Money {
-        Money::new(Amount::parse(amount).unwrap(), Currency::parse("USD").unwrap())
+        Money::new(
+            Amount::parse(amount).unwrap(),
+            Currency::parse("USD").unwrap(),
+        )
     }
 
     fn journal(id: &str, merchant: &str, amount: &str, day: u32) -> ExistingJournal {
@@ -508,7 +550,11 @@ mod tests {
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         match &r.charges[0].1 {
-            ChargeOutcome::AmountMismatch { journal_id, statement, booked } => {
+            ChargeOutcome::AmountMismatch {
+                journal_id,
+                statement,
+                booked,
+            } => {
                 assert_eq!(journal_id, "J1");
                 assert_eq!(*statement, Decimal::from_str_exact("50.93").unwrap());
                 assert_eq!(*booked, Decimal::from_str_exact("51.10").unwrap());
@@ -522,7 +568,10 @@ mod tests {
         // H2 regression: a custom tolerance must actually change the verdict.
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
-        let wide = ReconcileParams { amount_tolerance: Decimal::new(50, 2), ..Default::default() }; // 0.50
+        let wide = ReconcileParams {
+            amount_tolerance: Decimal::new(50, 2),
+            ..Default::default()
+        }; // 0.50
         let r = reconcile(&charges, &journals, &wide, &[]);
         assert!(
             matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
@@ -545,7 +594,10 @@ mod tests {
     fn gray_zone_near_match_is_reviewed_not_booked() {
         let charges = [charge("0601324353", "NAGANO DENTETSU", "6.66", 23)];
         let journals = [journal("J1", "NAGANO DENX", "6.66", 23)];
-        let p = ReconcileParams { merchant_threshold: 0.99, ..Default::default() };
+        let p = ReconcileParams {
+            merchant_threshold: 0.99,
+            ..Default::default()
+        };
         let r = reconcile(&charges, &journals, &p, &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert_eq!(r.unmatched_journals.len(), 1);
@@ -554,7 +606,10 @@ mod tests {
     #[test]
     fn ambiguous_two_equal_candidates_reviewed() {
         let charges = [charge("0601324353", "7-ELEVEN", "7.28", 17)];
-        let journals = [journal("J1", "7-ELEVEN", "7.28", 17), journal("J2", "7-ELEVEN", "7.28", 17)];
+        let journals = [
+            journal("J1", "7-ELEVEN", "7.28", 17),
+            journal("J2", "7-ELEVEN", "7.28", 17),
+        ];
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert_eq!(r.unmatched_journals.len(), 2);
@@ -562,7 +617,12 @@ mod tests {
 
     #[test]
     fn prior_bpstmt_booking_confirmed_by_external_id() {
-        let charges = [charge("74987506133002256024229", "7-Eleven B315 Kastrup", "7.28", 17)];
+        let charges = [charge(
+            "74987506133002256024229",
+            "7-Eleven B315 Kastrup",
+            "7.28",
+            17,
+        )];
         let journals = [ExistingJournal {
             id: "J9".to_string(),
             date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
@@ -571,7 +631,12 @@ mod tests {
             external_id: Some("bpstmt:74987506133002256024229".to_string()),
         }];
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert_eq!(r.charges[0].1, ChargeOutcome::Confirmed { journal_id: "J9".to_string() });
+        assert_eq!(
+            r.charges[0].1,
+            ChargeOutcome::Confirmed {
+                journal_id: "J9".to_string()
+            }
+        );
     }
 
     #[test]
@@ -588,12 +653,19 @@ mod tests {
         let dop = ExistingJournal {
             id: "J1".into(),
             date: NaiveDate::from_ymd_opt(2026, 4, 21).unwrap(),
-            amount: Money::new(Amount::parse("50.93").unwrap(), Currency::parse("DOP").unwrap()),
+            amount: Money::new(
+                Amount::parse("50.93").unwrap(),
+                Currency::parse("DOP").unwrap(),
+            ),
             merchant: "JR EAST".into(),
             external_id: None,
         };
         let r = reconcile(&charges, &[dop], &ReconcileParams::default(), &[]);
-        assert_eq!(r.charges[0].1, ChargeOutcome::BookNew, "USD charge must not match a DOP journal");
+        assert_eq!(
+            r.charges[0].1,
+            ChargeOutcome::BookNew,
+            "USD charge must not match a DOP journal"
+        );
     }
 
     /// H1 regression: two charges both match one journal; whichever is processed
@@ -608,7 +680,12 @@ mod tests {
         for order in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
             let r = reconcile(&order, &journals, &ReconcileParams::default(), &[]);
             let books = kinds(&r).iter().filter(|k| **k == "book").count();
-            assert_eq!(books, 0, "no charge may BookNew against a contended journal: {:?}", kinds(&r));
+            assert_eq!(
+                books,
+                0,
+                "no charge may BookNew against a contended journal: {:?}",
+                kinds(&r)
+            );
             // Exactly one confirmed (the winner) or both reviewed; never a dup booking.
             let confirmed = kinds(&r).iter().filter(|k| **k == "confirmed").count();
             assert!(confirmed <= 1);
@@ -630,7 +707,11 @@ mod tests {
         let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21);
         let r = reconcile(&[a, b], &journals, &ReconcileParams::default(), &[]);
 
-        assert!(!kinds(&r).contains(&"book"), "contended charges must not BookNew: {:?}", kinds(&r));
+        assert!(
+            !kinds(&r).contains(&"book"),
+            "contended charges must not BookNew: {:?}",
+            kinds(&r)
+        );
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
     }
@@ -648,7 +729,12 @@ mod tests {
         let c3 = charge("0601000003", "BRAND NEW CAFE", "3.00", 19);
 
         let mut sorted_a = {
-            let r = reconcile(&[c1.clone(), c2.clone(), c3.clone()], &journals, &ReconcileParams::default(), &[]);
+            let r = reconcile(
+                &[c1.clone(), c2.clone(), c3.clone()],
+                &journals,
+                &ReconcileParams::default(),
+                &[],
+            );
             let mut k = kinds(&r);
             k.sort_unstable();
             k
@@ -667,16 +753,28 @@ mod tests {
 
     #[test]
     fn token_containment_basics() {
-        assert_eq!(token_containment("jompeame", "donacion jompeame jompeame.com"), 1.0);
-        assert_eq!(token_containment("nagano dentetsu", "nagano dentetsu nagano"), 1.0);
-        assert_eq!(token_containment("starbuckskorea", "starbuckscoffee tokyo"), 0.0);
+        assert_eq!(
+            token_containment("jompeame", "donacion jompeame jompeame.com"),
+            1.0
+        );
+        assert_eq!(
+            token_containment("nagano dentetsu", "nagano dentetsu nagano"),
+            1.0
+        );
+        assert_eq!(
+            token_containment("starbuckskorea", "starbuckscoffee tokyo"),
+            0.0
+        );
         assert_eq!(token_containment("", "anything"), 0.0);
     }
 
     #[test]
     fn canonicalize_via_alias_map() {
         let aliases = vec![("jompeame".to_string(), "Jompeame".to_string())];
-        assert_eq!(canonicalize("DONACION JOMPEAME JOMPEAME.COM", &aliases), "Jompeame");
+        assert_eq!(
+            canonicalize("DONACION JOMPEAME JOMPEAME.COM", &aliases),
+            "Jompeame"
+        );
         assert_eq!(canonicalize("JOMPEAME", &aliases), "Jompeame");
         assert_eq!(canonicalize("Unrelated Cafe", &aliases), "Unrelated Cafe");
     }
@@ -687,7 +785,12 @@ mod tests {
     /// with NO alias rule configured.
     #[test]
     fn contained_merchant_confirms_without_alias() {
-        let charges = [charge("0601324353", "DONACION JOMPEAME JOMPEAME.COM", "1000.00", 24)];
+        let charges = [charge(
+            "0601324353",
+            "DONACION JOMPEAME JOMPEAME.COM",
+            "1000.00",
+            24,
+        )];
         let journals = [journal("J1", "JOMPEAME", "1000.00", 24)];
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert!(
@@ -718,7 +821,10 @@ mod tests {
         );
         assert_eq!(r.charges[1].1, ChargeOutcome::BookNew);
         assert_eq!(r.charges[2].1, ChargeOutcome::BookNew);
-        assert!(r.unmatched_journals.is_empty(), "journal consumed by the amount match");
+        assert!(
+            r.unmatched_journals.is_empty(),
+            "journal consumed by the amount match"
+        );
     }
 
     /// Cluster where two charges are equidistant from the journal — no clear
@@ -733,7 +839,10 @@ mod tests {
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
         assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
         assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
-        assert!(!kinds(&r).contains(&"book"), "ambiguous cluster never books");
+        assert!(
+            !kinds(&r).contains(&"book"),
+            "ambiguous cluster never books"
+        );
     }
 
     /// With an alias rule, even names that share *no* tokens canonicalize to the

@@ -44,15 +44,36 @@ struct Affine {
 
 impl Affine {
     fn identity() -> Self {
-        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
+        }
     }
 
     fn translate(x: f32, y: f32) -> Self {
-        Affine { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: x, f: y }
+        Affine {
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: x,
+            f: y,
+        }
     }
 
     fn from_pdf(m: &pdf::content::Matrix) -> Self {
-        Affine { a: m.a, b: m.b, c: m.c, d: m.d, e: m.e, f: m.f }
+        Affine {
+            a: m.a,
+            b: m.b,
+            c: m.c,
+            d: m.d,
+            e: m.e,
+            f: m.f,
+        }
     }
 
     /// `self × other` under the row-vector convention: a point transformed by
@@ -70,7 +91,10 @@ impl Affine {
 
     /// Map a point through the transform.
     fn apply(&self, x: f32, y: f32) -> (f32, f32) {
-        (self.a * x + self.c * y + self.e, self.b * x + self.d * y + self.f)
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
     }
 }
 
@@ -147,7 +171,9 @@ fn collect_runs<R: Resolve>(
                 tlm = Affine::from_pdf(matrix);
                 tm = tlm;
             }
-            Op::MoveTextPosition { translation: Point { x, y } } => {
+            Op::MoveTextPosition {
+                translation: Point { x, y },
+            } => {
                 tlm = Affine::translate(*x, *y).then(&tlm);
                 tm = tlm;
             }
@@ -196,10 +222,14 @@ fn recurse_xobject<R: Resolve>(
     depth: u8,
 ) {
     let Some(res) = resources else { return };
-    let Some(xref) = res.xobjects.get(name) else { return };
+    let Some(xref) = res.xobjects.get(name) else {
+        return;
+    };
     let Ok(xobj) = resolve.get(*xref) else { return };
     let XObject::Form(form) = &*xobj else { return };
-    let Ok(form_ops) = form.operations(resolve) else { return };
+    let Ok(form_ops) = form.operations(resolve) else {
+        return;
+    };
     let dict = form.dict();
     let form_ctm = form_matrix(&dict.matrix).then(&ctm);
     // The form may carry its own resource dictionary; fall back to the parent's.
@@ -223,7 +253,14 @@ fn form_matrix(matrix: &Option<Primitive>) -> Affine {
             Err(_) => return Affine::identity(),
         }
     }
-    Affine { a: v[0], b: v[1], c: v[2], d: v[3], e: v[4], f: v[5] }
+    Affine {
+        a: v[0],
+        b: v[1],
+        c: v[2],
+        d: v[3],
+        e: v[4],
+        f: v[5],
+    }
 }
 
 /// Record a run at the current text origin (mapped through `Tm × CTM`), unless
@@ -233,7 +270,11 @@ fn push_run(runs: &mut Vec<Run>, ctm: &Affine, tm: &Affine, text: &str) {
         return;
     }
     let (x, y) = tm.then(ctm).apply(0.0, 0.0);
-    runs.push(Run { x, y, text: text.to_string() });
+    runs.push(Run {
+        x,
+        y,
+        text: text.to_string(),
+    });
 }
 
 /// Group positioned runs into x-ordered rows, top-to-bottom.
@@ -258,13 +299,19 @@ pub fn group_runs(mut runs: Vec<Run>) -> Vec<TextRow> {
     for run in runs {
         match anchor_y {
             Some(y) if (run.y - y).abs() > ROW_Y_TOLERANCE => {
-                rows.push(TextRow { y, cells: std::mem::take(&mut current) });
+                rows.push(TextRow {
+                    y,
+                    cells: std::mem::take(&mut current),
+                });
                 anchor_y = Some(run.y);
             }
             None => anchor_y = Some(run.y),
             _ => {}
         }
-        current.push(Cell { x: run.x, text: run.text });
+        current.push(Cell {
+            x: run.x,
+            text: run.text,
+        });
     }
     if let Some(y) = anchor_y {
         rows.push(TextRow { y, cells: current });
@@ -323,7 +370,11 @@ mod tests {
     use super::*;
 
     fn run(x: f32, y: f32, t: &str) -> Run {
-        Run { x, y, text: t.to_string() }
+        Run {
+            x,
+            y,
+            text: t.to_string(),
+        }
     }
 
     #[test]
@@ -362,7 +413,10 @@ mod tests {
     #[test]
     fn win1252_recovers_accents_and_specials() {
         // 0xF3 = ó (Latin-1 region), 0xED = í, 0x80 = €, 0x96 = en-dash.
-        assert_eq!(decode_win1252(&[b'p', b'r', 0xF3, b'x', b'i', b'm', b'o']), "próximo");
+        assert_eq!(
+            decode_win1252(&[b'p', b'r', 0xF3, b'x', b'i', b'm', b'o']),
+            "próximo"
+        );
         assert_eq!(decode_win1252(&[0x80]), "€");
         assert_eq!(decode_win1252(&[0x96]), "–");
         // Unassigned position → replacement char, not a panic.

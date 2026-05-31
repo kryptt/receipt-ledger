@@ -45,12 +45,10 @@ const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
 /// Default Banco Popular `BPDConsultaTasa` rates endpoint (IBM API Connect
 /// sandbox) — the full `consultaTasa` URL. Production and development share this
 /// host per the OpenAPI `servers` block. Override with `RECEIPT_DOP_RATES_URL`.
-const DEFAULT_DOP_RATES_URL: &str =
-    "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/consultatasa/consultaTasa";
+const DEFAULT_DOP_RATES_URL: &str = "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/consultatasa/consultaTasa";
 /// Default OAuth2 token endpoint (client-credentials grant) for the DOP rates
 /// API. Override with `RECEIPT_DOP_TOKEN_URL`.
-const DEFAULT_DOP_TOKEN_URL: &str =
-    "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/bpd/Authentication/oauth2/token";
+const DEFAULT_DOP_TOKEN_URL: &str = "https://api.us-east-a.apiconnect.ibmappdomain.cloud/apiportalpopular/bpdsandbox/bpd/Authentication/oauth2/token";
 /// Default OAuth2 scope for the DOP rates API. Override with `RECEIPT_DOP_SCOPE`.
 const DEFAULT_DOP_SCOPE: &str = "scope_1";
 /// Default in-run retry budget (seconds) for transient DOP-rate failures: the
@@ -291,7 +289,10 @@ pub struct DopRateConfig {
 /// (DOP support disabled). Exactly one of id/secret set is a hard error — a
 /// half-configured provider must fail loudly, not silently disable DOP.
 fn dop_rate_from_env() -> Result<Option<DopRateConfig>> {
-    match (optional("RECEIPT_DOP_CLIENT_ID"), optional("RECEIPT_DOP_CLIENT_SECRET")) {
+    match (
+        optional("RECEIPT_DOP_CLIENT_ID"),
+        optional("RECEIPT_DOP_CLIENT_SECRET"),
+    ) {
         (None, None) => Ok(None),
         (Some(client_id), Some(client_secret)) => Ok(Some(DopRateConfig {
             rates_url: env_or("RECEIPT_DOP_RATES_URL", DEFAULT_DOP_RATES_URL),
