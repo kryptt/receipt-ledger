@@ -19,10 +19,21 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    init_tracing();
     install_crypto_provider();
 
-    match receipt_ledger::run().await {
+    // Init logging + (optionally) traces. Returns `Some(Telemetry)` ONLY when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set; unset → fmt-only, unchanged behavior.
+    let telemetry = init_tracing();
+
+    // The shared HTTP client for the money path (JMAP / Firefly / FX / LLM).
+    let result = match receipt_ledger::build_http_client() {
+        Ok(client) => receipt_ledger::run(client).await,
+        // A client build failure is a real (config-level) failure: surface it as
+        // a non-zero exit, same as any other fatal startup error.
+        Err(e) => Err(e),
+    };
+
+    let exit = match result {
         Ok(summary) => {
             info!(
                 processed = summary.processed,
@@ -41,7 +52,15 @@ async fn main() -> ExitCode {
             error!(error = ?e, "fatal error");
             ExitCode::FAILURE
         }
+    };
+
+    // Flush + shut down the tracer provider on a BOUNDED budget before the tokio
+    // runtime drops. A slow/unreachable collector is abandoned within the timeout
+    // and never changes `exit` — telemetry is strictly non-blocking and additive.
+    if let Some(telemetry) = telemetry {
+        telemetry.shutdown().await;
     }
+    exit
 }
 
 /// Log output format, selected by `RECEIPT_LOG_FORMAT`. JSON (the default) is for
@@ -62,19 +81,18 @@ fn parse_log_format(raw: Option<&str>) -> LogFormat {
     }
 }
 
-fn init_tracing() {
+/// Build the subscriber (fmt layer always; OpenTelemetry layer only when an OTLP
+/// endpoint is configured) and install it process-wide. Returns `Some(Telemetry)`
+/// when trace export is on, so `main` knows it owes a flush.
+///
+/// The format is read directly from env here — this runs before
+/// `Config::from_env`, so it must not depend on it.
+fn init_tracing() -> Option<receipt_ledger::telemetry::Telemetry> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,receipt_ledger=info"));
-    // `.json()` and `.compact()` return different builder types, so each arm must
-    // terminate in its own `.init()` (no shared binding, no boxing). The format is
-    // read directly from env here — `init_tracing` runs before `Config::from_env`,
-    // so it must not depend on it.
-    let format = parse_log_format(std::env::var("RECEIPT_LOG_FORMAT").ok().as_deref());
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    match format {
-        LogFormat::Json => builder.json().init(),
-        LogFormat::Text => builder.with_target(false).init(),
-    }
+    let json =
+        parse_log_format(std::env::var("RECEIPT_LOG_FORMAT").ok().as_deref()) == LogFormat::Json;
+    receipt_ledger::telemetry::init(json, filter)
 }
 
 /// Install the ring crypto provider for rustls. We use reqwest's

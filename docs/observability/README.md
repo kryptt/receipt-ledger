@@ -134,6 +134,47 @@ groups:
           summary: "receipt-ledger run failed (non-zero exit)"
 ```
 
+## Traces
+
+Phase 2 (value-gated, **off by default**). When an OTLP endpoint is configured the
+binary exports a per-run span tree over **OTLP/HTTP (JSON)** so a run's Loki log lines
+link to its Tempo trace. With the endpoint unset, behavior is byte-for-byte identical
+to logs-only: no exporter, no provider, no per-event cost.
+
+**Enable it** by setting the standard env var on the CronJob:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://<tempo-distributor>.<ns>:4318
+```
+
+- Traces export **only** when `OTEL_EXPORTER_OTLP_ENDPOINT` is set to a non-blank
+  value. The **fleet manifest must set this** to turn traces on; the operator wires
+  the real endpoint. Tempo's OTLP/HTTP ingest is typically
+  `http://<tempo-distributor>.<ns>:4318` (the binary appends `/v1/traces`).
+- Transport is **HTTP, not gRPC** — no `tonic` is pulled. The only new dependencies
+  are pure-Rust (`opentelemetry*`, `prost`, `const-hex`); the static-musl build is
+  unaffected.
+
+**Span tree.** One **root span per run** (`stage="run"`), with child stage spans:
+`fetch`, `model_selection`, per-message `process` (with a child `extract` span for the
+LLM call), and for statements `statement` → `decrypt` / `parse` / `reconcile_book`.
+
+**Loki↔Tempo link.** Every JSON log line emitted within the run carries a `trace_id`
+field equal to the run's Tempo trace id (recorded on the root span; the fmt layer
+renders enclosing-span fields on each event). Use it to pivot from a Loki line to the
+Tempo trace.
+
+**No PII in spans.** Span attributes are an allowlist — `stage`, `outcome`, and counts
+only. In particular the `extract`/LLM span carries **none** of: the prompt, the model
+completion, the raw email body, merchant, amount, last-4, or ref#. A span-shaping test
+(`extract_span_carries_no_pii_fields`) pins this.
+
+**Flush is bounded and non-blocking.** After the run, the tracer provider is
+force-flushed and shut down on a small bounded budget (3s). If the collector is
+unreachable or slow the flush is abandoned within the timeout — the run still books and
+exits with its normal code; telemetry can never delay the run or flip the exit code
+(test: `shutdown_is_bounded_when_collector_unreachable`).
+
 ## Dashboard
 
 A Grafana dashboard (panels: dispositions by source over time, deferred/no-progress,

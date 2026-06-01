@@ -7,7 +7,7 @@ description = "Transaction-notification-email → Firefly III ingestor (one-shot
 
 [dependencies]
 anyhow = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -46,10 +46,31 @@ pdf = "0.9"
 # exactly (ECB estimate vs billed), so merchant similarity is a key signal.
 strsim = "0.11"
 
+# OTLP trace export to Tempo (Phase-2 observability), OFF unless
+# OTEL_EXPORTER_OTLP_ENDPOINT is set — see src/telemetry.rs. We deliberately take
+# the OTLP-over-HTTP path with the JSON wire format (`http-json`, NOT `grpc-tonic`):
+# no tonic/hyper-grpc stack. The default `BatchSpanProcessor` runs on a dedicated
+# thread with no tokio reactor, so it is paired with the BLOCKING reqwest client
+# (`reqwest-blocking-client`); the async `reqwest-client` panics "no reactor" on
+# that thread. The blocking client reuses the same reqwest/rustls(+ring) crates
+# already in the tree, so the only genuinely new crates are pure-Rust
+# (opentelemetry*, prost, const-hex). The musl/Dockerfile builder is unaffected
+# (no new C toolchain). Versions are a mutually-compatible set:
+# opentelemetry/otlp/sdk 0.32, tracing-opentelemetry 0.33.
+opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client"] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+
 [dev-dependencies]
 # Property-based testing for the pure deterministic core (amount parsing, FX
 # rounding reconciliation, dedup invariants, balanced-span round-trip).
 proptest = "1"
+# `testing` enables the in-memory span exporter the telemetry tests use to give
+# spans real (non-zero) trace_ids without a live collector. Dev-only — feature
+# unification adds it to the same opentelemetry_sdk build, not to the binary's
+# runtime path (the in-memory exporter is never constructed outside #[cfg(test)]).
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "testing"] }
 
 [profile.release]
 lto = true

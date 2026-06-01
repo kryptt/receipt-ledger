@@ -15,13 +15,14 @@ pub mod llm;
 pub mod model_selection;
 pub mod schema;
 pub mod statement;
+pub mod telemetry;
 pub mod unwrap;
 pub mod usd_ceiling;
 pub mod validate;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 use crate::adapters::{DestHint, Outcome, SourceHint, TransferRecord};
 use crate::config::{Config, ValidationPolicy};
@@ -58,20 +59,37 @@ pub struct Summary {
 
 /// Run the full one-shot pipeline. Returns the run summary on success; an
 /// `Err` here is a real (non-zero-exit) failure.
-pub async fn run() -> Result<Summary> {
+///
+/// `http` is the shared client (built in `main` so the optional OTLP trace
+/// exporter can reuse the same reqwest/rustls stack); the money path uses it for
+/// JMAP, Firefly, FX, and the LLM.
+///
+/// This is instrumented as the **root span** of the run (`stage = "run"`): every
+/// child stage span and every log line nests under it, so when trace export is
+/// on (see [`telemetry`]) one trace_id covers the whole run and links Loki↔Tempo.
+#[tracing::instrument(name = "run", skip(http), fields(trace_id = tracing::field::Empty))]
+pub async fn run(http: Client) -> Result<Summary> {
+    // Fill the root span's trace_id from the OTel context (no-op when traces are
+    // off), so every event below carries the run's trace_id.
+    crate::telemetry::record_trace_id();
     let cfg = Config::from_env().context("loading configuration")?;
     if cfg.dry_run {
         info!(
             "DRY RUN enabled (RECEIPT_DRY_RUN): no Firefly writes, no mailbox moves, no state advance"
         );
     }
-    let http = build_http_client()?;
 
     // --- 1. JMAP read -----------------------------------------------------
-    let mailbox = Mailbox::connect(&cfg).await.context("JMAP connect")?;
+    // `fetch` stage span: connect + fetch new mail. Attributes are an allowlist
+    // (stage + a count); never any message content.
+    let mailbox = Mailbox::connect(&cfg)
+        .instrument(tracing::info_span!("fetch", stage = "fetch"))
+        .await
+        .context("JMAP connect")?;
     let prior_state = jmap::load_state(&cfg.state_path);
     let (messages, new_state) = mailbox
         .fetch_new(prior_state)
+        .instrument(tracing::info_span!("fetch", stage = "fetch"))
         .await
         .context("fetching new mail")?;
 
@@ -89,14 +107,19 @@ pub async fn run() -> Result<Summary> {
     // any Summary exists, so it can't be a summary field — emit a dedicated
     // structured event (`stage = "model_selection"`) so a log-derived alert can
     // key on it directly.
-    let model =
-        match model_selection::select_model(&http, &cfg.ollama_url, &cfg.model_allowlist).await {
-            Ok(m) => m,
-            Err(e) => {
-                error!(stage = "model_selection", error = ?e, "model selection failed");
-                return Err(e).context("selecting extraction model");
-            }
-        };
+    let model = match model_selection::select_model(&http, &cfg.ollama_url, &cfg.model_allowlist)
+        .instrument(tracing::info_span!(
+            "model_selection",
+            stage = "model_selection"
+        ))
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            error!(stage = "model_selection", error = ?e, "model selection failed");
+            return Err(e).context("selecting extraction model");
+        }
+    };
     info!(%model, "using extraction model");
     let llm = LlmClient::new(&http, &cfg.ollama_url, model, cfg.llm_timeout);
     // FX over the shared client; converts foreign charges into the target
@@ -397,6 +420,17 @@ fn review_reason_category(reason: &str) -> &'static str {
 }
 
 /// The deterministic-core + I/O pipeline for one message.
+///
+/// Instrumented as a `process` child span of the run. **No-PII span allowlist:**
+/// the only attributes are `stage` and (recorded later) the resolved `source`
+/// label and bare `outcome` discriminant — never the raw body, merchant, amount,
+/// last-4, or ref#. `msg` and the clients are `skip`ped so their contents never
+/// land on the span.
+#[tracing::instrument(
+    name = "process",
+    skip_all,
+    fields(stage = "process", source = tracing::field::Empty, outcome = tracing::field::Empty)
+)]
 #[allow(clippy::too_many_arguments)]
 async fn process_message(
     msg: &FetchedMessage,
@@ -435,8 +469,10 @@ async fn process_message(
         }
     };
     // The canonical observability `source` label — `adapter.name()`
-    // (paypal / paypal_payment / banco_popular). Stable + low-cardinality.
+    // (paypal / paypal_payment / banco_popular). Stable + low-cardinality, so it
+    // is safe to record on the `process` span (allowlist: stage/source/outcome).
     let source = adapter.name();
+    tracing::Span::current().record("source", source);
 
     // 3b. Deterministic pre-filter: if the body clearly is not a transaction
     //     notification (a PayPal shipping update, plan reminder, survey), skip
@@ -464,7 +500,16 @@ async fn process_message(
             // and `run()` classifies every such error to Defer (kept in INBOX,
             // retried next run) at one chokepoint — so no call site can forget to
             // defer and accidentally burn a real receipt to Review.
-            let json = llm.extract_json(&prompt).await.context("LLM extraction")?;
+            //
+            // `extract` span: NO-PII allowlist. The prompt is built from the raw
+            // email body (`adapter.prompt(&unwrapped.body)`) and the model's
+            // completion is likewise sensitive — NEITHER is attached to the span.
+            // The only attribute is the `stage` label; see the span-shaping test.
+            let json = llm
+                .extract_json(&prompt)
+                .instrument(tracing::info_span!("extract", stage = "extract"))
+                .await
+                .context("LLM extraction")?;
             // `postprocess_with_body` applies any deterministic body-derived
             // override (PayPal P1: a cross-currency receipt's authoritative USD
             // total) on top of the model's extraction.
@@ -579,6 +624,8 @@ async fn process_message(
     } else {
         Disposition::Review(review_reason.unwrap_or_else(|| "no record booked".to_string()))
     };
+    // Record the bare outcome discriminant on the span (allowlisted, no payload).
+    tracing::Span::current().record("outcome", disposition_label(&disposition));
     Ok((source, disposition))
 }
 
@@ -756,7 +803,7 @@ async fn route(mailbox: &Mailbox, id: &str, processed: bool, dry_run: bool) {
 /// sane cap for those request/response APIs; the LLM chat-completions path
 /// overrides it per-request (see [`LlmClient`]) because a cold reasoning model
 /// can run for minutes — far longer than mail or ledger calls should ever take.
-fn build_http_client() -> Result<Client> {
+pub fn build_http_client() -> Result<Client> {
     Client::builder()
         .user_agent(concat!("receipt-ledger/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(120))

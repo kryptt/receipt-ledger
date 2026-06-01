@@ -17,7 +17,7 @@
 use anyhow::{Result, anyhow};
 use chrono::Duration;
 use rust_decimal::Decimal;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use super::reconcile::{ChargeOutcome, ReconcileParams, reconcile};
 use super::{SectionCurrency, StatementTxn, parse, pdf};
@@ -118,6 +118,12 @@ impl StatementReport {
 /// (no password, no PDF, decrypt/parse failure) is returned as `Err` so the
 /// caller routes the whole message to Review; per-row problems are counted in
 /// the [`StatementReport`] and the run continues.
+///
+/// Instrumented as a `statement` child span of the run, with `decrypt`, `parse`,
+/// and `reconcile_book` sub-spans for the stages. **No-PII span allowlist:** the
+/// only span attributes are `stage` and section counts — never a merchant,
+/// amount, last-4, reference, or any statement content.
+#[tracing::instrument(name = "statement", skip_all, fields(stage = "statement"))]
 pub async fn process_statement(
     msg: &FetchedMessage,
     mailbox: &Mailbox,
@@ -134,9 +140,20 @@ pub async fn process_statement(
         .find(|a| a.is_pdf())
         .ok_or_else(|| anyhow!("message classified as statement but has no PDF attachment"))?;
 
-    let bytes = mailbox.download(&pdf_att.blob_id).await?;
-    let rows = pdf::extract_rows(bytes, password)?;
-    let parsed = parse::parse_statement(&rows)?;
+    // `decrypt` stage: download + RC4-decrypt + positioned-text extraction.
+    let bytes = mailbox
+        .download(&pdf_att.blob_id)
+        .instrument(tracing::info_span!("decrypt", stage = "decrypt"))
+        .await?;
+    let rows = {
+        let _g = tracing::info_span!("decrypt", stage = "decrypt").entered();
+        pdf::extract_rows(bytes, password)?
+    };
+    // `parse` stage: reassemble columns into typed statement rows (pure, sync).
+    let parsed = {
+        let _g = tracing::info_span!("parse", stage = "parse").entered();
+        parse::parse_statement(&rows)?
+    };
     info!(
         sections = parsed.sections.len(),
         txns = parsed.txns.len(),
@@ -156,6 +173,11 @@ pub async fn process_statement(
         None => Vec::new(),
     };
 
+    // `reconcile_book` stage: per-section reconcile of statement rows against
+    // booked journals, then book/correct/transfer. Wrapped in an instrumented
+    // async block so the whole stage is one child span. `?` inside propagates a
+    // fatal Firefly error out to the caller (→ Review) exactly as before.
+    async {
     for section in &parsed.sections {
         let Some(account) = (match section.currency {
             SectionCurrency::Usd => cfg.banco_popular_usd_account.as_ref(),
@@ -272,6 +294,10 @@ pub async fn process_statement(
 
         check_balance(section, &charges, &payments, &mut report);
     }
+    Ok::<(), anyhow::Error>(())
+    }
+    .instrument(tracing::info_span!("reconcile_book", stage = "reconcile_book"))
+    .await?;
 
     // Canonical structured statement event — explicit named fields (NOT `?report`,
     // which under JSON logging serializes as one opaque Debug string LogQL can't
