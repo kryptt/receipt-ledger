@@ -162,6 +162,8 @@ and a missing required value fails loudly.
 | `RECEIPT_JMAP_PASSWORD` | — (required) | Basic-auth password. |
 | `RECEIPT_STATE_PATH` | `/state/jmap.state` | Persisted `Email/changes` cursor (mount a volume so runs are incremental). |
 | `RECEIPT_FX_CACHE_PATH` | `/state/fx-cache.json` | Persistent FX-rate cache (same volume as the cursor). A date's rate is fetched once and reused across runs; past-date rates never expire, the current day's has a 15-min TTL. Avoids re-hitting Frankfurter / the rate-limited Banco Popular `consultaTasa` every run. |
+| `RECEIPT_LOG_FORMAT` | `json` | Log output format: `json` (Loki/LogQL-friendly, the default) or `text`/`plain`/`compact` (readable local dev). See [`docs/observability/`](docs/observability/) for the log-derived metrics + alerts. |
+| `RECEIPT_LOG_PII` | `false` | When off (default), per-row financial detail (merchant/amount) is suppressed from logs **regardless of `RUST_LOG`/dry-run**, so a misconfig can't ship PII to Loki. Set `true` to observe a statement cycle's full plan. |
 | `RECEIPT_OLLAMA_URL` | `http://ollama-router.ai:11434/v1` | OpenAI-compatible base. |
 | `RECEIPT_MODEL_ALLOWLIST` | `gemma4:e2b` | Comma-separated, priority order. The highest-priority *loaded* model is used (avoids cold-loads); the first is loaded on demand as a fallback. |
 | `RECEIPT_LLM_TIMEOUT_SECS` | `600` | Per-request timeout for the extraction call. |
