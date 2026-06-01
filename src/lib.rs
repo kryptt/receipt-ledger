@@ -21,7 +21,7 @@ pub mod validate;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::adapters::{DestHint, Outcome, SourceHint, TransferRecord};
 use crate::config::{Config, ValidationPolicy};
@@ -50,6 +50,10 @@ pub struct Summary {
     /// separately because a correction is an in-place mutation, not a booking — it
     /// would otherwise be invisible in the run summary.
     pub corrected: usize,
+    /// No-progress signal: messages left in the INBOX this run because they
+    /// deferred (provider outage). The co-primary alert keys on this staying > 0
+    /// across runs (a defer-forever backlog). `> 0` also means JMAP state was held.
+    pub deferred: usize,
 }
 
 /// Run the full one-shot pipeline. Returns the run summary on success; an
@@ -80,10 +84,19 @@ pub async fn run() -> Result<Summary> {
     }
     info!(count = messages.len(), "new messages to process");
 
-    // Model selection is shared across the batch — pick once per run.
-    let model = model_selection::select_model(&http, &cfg.ollama_url, &cfg.model_allowlist)
-        .await
-        .context("selecting extraction model")?;
+    // Model selection is shared across the batch — pick once per run. A failure
+    // here aborts the run (non-zero exit, caught by kube-state-metrics) *before*
+    // any Summary exists, so it can't be a summary field — emit a dedicated
+    // structured event (`stage = "model_selection"`) so a log-derived alert can
+    // key on it directly.
+    let model =
+        match model_selection::select_model(&http, &cfg.ollama_url, &cfg.model_allowlist).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!(stage = "model_selection", error = ?e, "model selection failed");
+                return Err(e).context("selecting extraction model");
+            }
+        };
     info!(%model, "using extraction model");
     let llm = LlmClient::new(&http, &cfg.ollama_url, model, cfg.llm_timeout);
     // FX over the shared client; converts foreign charges into the target
@@ -145,6 +158,11 @@ pub async fn run() -> Result<Summary> {
     // refetched next run. Already-booked rows dedup; moved messages are filtered
     // out by the INBOX check in `fetch_new`.
     let mut hold_state = false;
+    // No-progress signal: messages left in the INBOX this run because they
+    // deferred (provider outage / per-row rate defer). The co-primary alert keys
+    // on this staying > 0 across runs. Counted explicitly because `route()` is
+    // fire-and-forget and deferred messages are never routed.
+    let mut deferred_messages = 0usize;
     for msg in &messages {
         summary.processed += 1;
 
@@ -164,6 +182,7 @@ pub async fn run() -> Result<Summary> {
                         // now. Leave the whole message in INBOX; the rows that did
                         // book dedup on retry (book USD now, retry DOP later).
                         hold_state = true;
+                        deferred_messages += 1;
                         warn!(id = %msg.id, ?report, deferred = report.deferred,
                             "statement has deferred rows (rate provider down); kept in INBOX for retry");
                     } else {
@@ -182,6 +201,7 @@ pub async fn run() -> Result<Summary> {
                     // dedup on retry. Never burn a statement to Review for a
                     // transient network failure.
                     hold_state = true;
+                    deferred_messages += 1;
                     warn!(id = %msg.id, error = %e, "statement deferred (provider outage); kept in INBOX for retry");
                 }
                 Err(e) => {
@@ -205,25 +225,44 @@ pub async fn run() -> Result<Summary> {
         )
         .await
         {
-            Ok(Disposition::Booked) => {
-                summary.booked += 1;
-                route(&mailbox, &msg.id, true, cfg.dry_run).await;
-            }
-            Ok(Disposition::Duplicate) => {
-                summary.duplicates += 1;
-                route(&mailbox, &msg.id, true, cfg.dry_run).await;
-            }
-            Ok(Disposition::Skipped(reason)) => {
-                // Not a transaction at all — a clean skip, NOT a review. Move
-                // to Processed: it never needed human eyes.
-                summary.skipped += 1;
-                info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
-                route(&mailbox, &msg.id, true, cfg.dry_run).await;
-            }
-            Ok(Disposition::Review(reason)) => {
-                summary.review += 1;
-                warn!(id = %msg.id, %reason, "routing to review");
-                route(&mailbox, &msg.id, false, cfg.dry_run).await;
+            Ok((source, disposition)) => {
+                // Per-message structured OUTCOME event — the LogQL substrate for
+                // the source×disposition metric. Carries only low-cardinality
+                // labels: `source`, the bare disposition discriminant, and (for a
+                // review) a bounded reason CATEGORY — never the free-form reason
+                // string, which can carry PII (last-4/currency/account).
+                let review_category = match &disposition {
+                    Disposition::Review(reason) => Some(review_reason_category(reason)),
+                    _ => None,
+                };
+                info!(
+                    id = %msg.id,
+                    source,
+                    disposition = disposition_label(&disposition),
+                    review_reason_category = review_category,
+                    "message outcome"
+                );
+                match disposition {
+                    Disposition::Booked => {
+                        summary.booked += 1;
+                        route(&mailbox, &msg.id, true, cfg.dry_run).await;
+                    }
+                    Disposition::Duplicate => {
+                        summary.duplicates += 1;
+                        route(&mailbox, &msg.id, true, cfg.dry_run).await;
+                    }
+                    Disposition::Skipped(reason) => {
+                        // Not a transaction at all — a clean skip, NOT a review.
+                        summary.skipped += 1;
+                        info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
+                        route(&mailbox, &msg.id, true, cfg.dry_run).await;
+                    }
+                    Disposition::Review(reason) => {
+                        summary.review += 1;
+                        warn!(id = %msg.id, %reason, "routing to review");
+                        route(&mailbox, &msg.id, false, cfg.dry_run).await;
+                    }
+                }
             }
             // CENTRAL DEFER CHOKEPOINT: any transient FX/LLM provider outage,
             // wherever it originated in processing this message, arrives here as a
@@ -233,6 +272,7 @@ pub async fn run() -> Result<Summary> {
             // forget to defer. Booked rows dedup on retry.
             Err(e) if is_transient_outage(&e) => {
                 hold_state = true;
+                deferred_messages += 1;
                 warn!(id = %msg.id, error = %e, "deferred (provider outage); kept in INBOX for retry");
             }
             Err(e) => {
@@ -267,6 +307,7 @@ pub async fn run() -> Result<Summary> {
         jmap::save_state(&cfg.state_path, &new_state).context("saving JMAP state")?;
     }
 
+    summary.deferred = deferred_messages;
     Ok(summary)
 }
 
@@ -294,6 +335,43 @@ fn is_transient_outage(e: &anyhow::Error) -> bool {
     crate::fx::is_transient(e) || crate::llm::is_transient(e)
 }
 
+/// The low-cardinality disposition label for the per-message outcome event — the
+/// bare enum discriminant only. The `Skipped`/`Review` payload Strings are NEVER
+/// included (they can carry last-4/currency/account → PII).
+fn disposition_label(d: &Disposition) -> &'static str {
+    match d {
+        Disposition::Booked => "booked",
+        Disposition::Duplicate => "duplicate",
+        Disposition::Skipped(_) => "skipped",
+        Disposition::Review(_) => "review",
+    }
+}
+
+/// Map a review `reason` to a **bounded** category for the outcome event, so a
+/// reviewer can see *why* reviews accumulate without the free-form (PII-bearing)
+/// reason string reaching Loki. Classifies our own reason strings; unknown → `other`.
+fn review_reason_category(reason: &str) -> &'static str {
+    let r = reason.to_ascii_lowercase();
+    if r.contains("not a recognisable forward") {
+        "not_a_forward"
+    } else if r.contains("no adapter") {
+        "no_adapter"
+    } else if r.contains("already booked by a statement") {
+        "double_book"
+    } else if r.contains("routed to review") {
+        // the USD-ceiling reason ("amount ≈ $X (>Y USD) — routed to review")
+        "over_ceiling"
+    } else if r.contains("currency") {
+        "currency_mismatch"
+    } else if r.contains("account") {
+        "no_account"
+    } else if r.contains("extracted no") || r.contains("no record") {
+        "extraction"
+    } else {
+        "other"
+    }
+}
+
 /// The deterministic-core + I/O pipeline for one message.
 #[allow(clippy::too_many_arguments)]
 async fn process_message(
@@ -305,14 +383,16 @@ async fn process_message(
     dry_run: bool,
     double_book_probe: bool,
     aliases: &[(String, String)],
-) -> Result<Disposition> {
+) -> Result<(&'static str, Disposition)> {
     // 2. Unwrap the Gmail forward (manual marker or auto-forward) + detect the
-    //    original sender.
+    //    original sender. No adapter is known yet, so the observability `source`
+    //    is `unknown` for the pre-routing failures.
     let unwrapped = match unwrap::unwrap_message(msg.from.as_deref(), &msg.text) {
         Some(u) => u,
         None => {
-            return Ok(Disposition::Review(
-                "not a recognisable forward".to_string(),
+            return Ok((
+                "unknown",
+                Disposition::Review("not a recognisable forward".to_string()),
             ));
         }
     };
@@ -321,22 +401,30 @@ async fn process_message(
     let adapter = match adapters::select(&unwrapped.original_sender) {
         Some(a) => a,
         None => {
-            return Ok(Disposition::Review(format!(
-                "no adapter for sender {}",
-                unwrapped.original_sender
-            )));
+            return Ok((
+                "unknown",
+                Disposition::Review(format!(
+                    "no adapter for sender {}",
+                    unwrapped.original_sender
+                )),
+            ));
         }
     };
+    // The canonical observability `source` label — `adapter.name()`
+    // (paypal / paypal_payment / banco_popular). Stable + low-cardinality.
+    let source = adapter.name();
 
     // 3b. Deterministic pre-filter: if the body clearly is not a transaction
     //     notification (a PayPal shipping update, plan reminder, survey), skip
     //     it cleanly without an LLM call. Never a Review — it never was a
     //     transaction.
     if !adapter.is_transaction(&unwrapped.body) {
-        return Ok(Disposition::Skipped(format!(
-            "{} mail did not look like a transaction notification",
-            adapter.name()
-        )));
+        return Ok((
+            source,
+            Disposition::Skipped(format!(
+                "{source} mail did not look like a transaction notification"
+            )),
+        ));
     }
 
     // 4. Extraction. A fixed-format source (PayPal Credit payment receipt) parses
@@ -366,14 +454,22 @@ async fn process_message(
         Outcome::Transaction(records) => records,
         // A payment receipt → book as a transfer (funding account → credit), a
         // distinct path from the withdrawal loop below.
-        Outcome::Transfer(tr) => return book_transfer(tr, firefly, fx, policy, dry_run).await,
+        Outcome::Transfer(tr) => {
+            return Ok((
+                source,
+                book_transfer(tr, firefly, fx, policy, dry_run).await?,
+            ));
+        }
         // The mail was classified as a non-transaction → clean skip.
-        Outcome::NotATransaction { reason } => return Ok(Disposition::Skipped(reason)),
+        Outcome::NotATransaction { reason } => {
+            return Ok((source, Disposition::Skipped(reason)));
+        }
     };
 
     if records.is_empty() {
-        return Ok(Disposition::Review(
-            "adapter extracted no records".to_string(),
+        return Ok((
+            source,
+            Disposition::Review("adapter extracted no records".to_string()),
         ));
     }
 
@@ -452,13 +548,14 @@ async fn process_message(
         }
     }
 
-    Ok(if booked_any {
+    let disposition = if booked_any {
         Disposition::Booked
     } else if dup_any {
         Disposition::Duplicate
     } else {
         Disposition::Review(review_reason.unwrap_or_else(|| "no record booked".to_string()))
-    })
+    };
+    Ok((source, disposition))
 }
 
 /// Book a payment as a Firefly transfer: funding account (source, resolved from
@@ -771,6 +868,64 @@ mod book_transfer_tests {
         assert!(
             matches!(d, Disposition::Booked),
             "both legs resolve → Booked (dry-run)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod outcome_label_tests {
+    use super::{Disposition, disposition_label, review_reason_category};
+
+    #[test]
+    fn disposition_label_is_bare_discriminant() {
+        assert_eq!(disposition_label(&Disposition::Booked), "booked");
+        assert_eq!(disposition_label(&Disposition::Duplicate), "duplicate");
+        // The payload String (which may carry PII) is never reflected in the label.
+        assert_eq!(
+            disposition_label(&Disposition::Skipped("merchant Foo x-1234".into())),
+            "skipped"
+        );
+        assert_eq!(
+            disposition_label(&Disposition::Review("amount ≈ $9000".into())),
+            "review"
+        );
+    }
+
+    #[test]
+    fn review_reason_category_maps_known_reasons() {
+        assert_eq!(
+            review_reason_category("not a recognisable forward"),
+            "not_a_forward"
+        );
+        assert_eq!(
+            review_reason_category("no adapter for sender x@y.com"),
+            "no_adapter"
+        );
+        assert_eq!(
+            review_reason_category("charge appears already booked by a statement (journal 5 'X')"),
+            "double_book"
+        );
+        assert_eq!(
+            review_reason_category("amount ≈ $9000 (>5000 USD) — routed to review"),
+            "over_ceiling"
+        );
+        assert_eq!(
+            review_reason_category(
+                "transfer currency USD does not match source account currency DOP"
+            ),
+            "currency_mismatch"
+        );
+        assert_eq!(
+            review_reason_category("no paying account configured for PayPal funding last-4 9999"),
+            "no_account"
+        );
+        assert_eq!(
+            review_reason_category("adapter extracted no records"),
+            "extraction"
+        );
+        assert_eq!(
+            review_reason_category("something we don't classify"),
+            "other"
         );
     }
 }

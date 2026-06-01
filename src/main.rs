@@ -32,6 +32,7 @@ async fn main() -> ExitCode {
                 skipped = summary.skipped,
                 statements = summary.statements,
                 corrected = summary.corrected,
+                deferred = summary.deferred,
                 "run complete"
             );
             ExitCode::SUCCESS
