@@ -81,18 +81,21 @@ pub async fn run(http: Client) -> Result<Summary> {
     }
 
     // --- 1. JMAP read -----------------------------------------------------
-    // `fetch` stage span: connect + fetch new mail. Attributes are an allowlist
-    // (stage + a count); never any message content.
-    let mailbox = Mailbox::connect(&cfg)
-        .instrument(tracing::info_span!("fetch", stage = "fetch"))
-        .await
-        .context("JMAP connect")?;
+    // `fetch` stage span: connect + fetch new mail under ONE child span (mirrors
+    // the `reconcile_book` async-block pattern), so the trace has exactly one
+    // `fetch` child. Attributes are an allowlist (stage only); never message
+    // content. The `.context(...)` error messages and control flow are unchanged.
     let prior_state = jmap::load_state(&cfg.state_path);
-    let (messages, new_state) = mailbox
-        .fetch_new(prior_state)
-        .instrument(tracing::info_span!("fetch", stage = "fetch"))
-        .await
-        .context("fetching new mail")?;
+    let (mailbox, messages, new_state) = async {
+        let mailbox = Mailbox::connect(&cfg).await.context("JMAP connect")?;
+        let (messages, new_state) = mailbox
+            .fetch_new(prior_state)
+            .await
+            .context("fetching new mail")?;
+        Ok::<_, anyhow::Error>((mailbox, messages, new_state))
+    }
+    .instrument(tracing::info_span!("fetch", stage = "fetch"))
+    .await?;
 
     if messages.is_empty() {
         info!("no new messages");

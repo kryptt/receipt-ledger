@@ -158,19 +158,17 @@ fn run_complete_emits_exactly_the_contract_fields() {
 fn message_outcome_non_review_omits_review_category() {
     let captured = capture(|| log_message_outcome("msg-1", "paypal", "booked", None));
     let fields = fields_for(&captured, message_outcome::MSG);
-    // The always-present contract fields must all be there...
-    for name in message_outcome::ALWAYS {
-        assert!(
-            fields.contains(*name),
-            "message outcome missing always-field {name:?}; got {fields:?}"
-        );
-    }
-    // ...and a non-review outcome must NOT carry the review category (a `None`
-    // Option records nothing — this is the documented contract).
-    assert!(
-        !fields.contains(message_outcome::REVIEW_REASON_CATEGORY),
-        "message outcome leaked {:?} on a non-review disposition",
-        message_outcome::REVIEW_REASON_CATEGORY
+    // EXACT field-set equality: the always-present contract fields PLUS `id`
+    // (always emitted for correlation; intentionally not in the queried contract).
+    // A non-review outcome carries NO review category (a `None` Option records
+    // nothing — the documented contract). Equality (not subset) means a stray
+    // field — e.g. an accidental PII field — added to `log_message_outcome` now
+    // fails CI instead of slipping through.
+    let mut want = expected(message_outcome::ALWAYS);
+    want.insert("id".to_string());
+    assert_eq!(
+        fields, &want,
+        "non-review message outcome field set drifted; want exactly ALWAYS+id"
     );
 }
 
@@ -179,19 +177,14 @@ fn message_outcome_review_includes_review_category() {
     let captured =
         capture(|| log_message_outcome("msg-2", "paypal", "review", Some("over_ceiling")));
     let fields = fields_for(&captured, message_outcome::MSG);
+    // EXACT field-set equality: ALWAYS + ON_REVIEW (review_reason_category) + `id`.
+    // Any unlisted field added to `log_message_outcome` now fails CI.
     let mut want = expected(message_outcome::ALWAYS);
     want.extend(expected(message_outcome::ON_REVIEW));
-    // The contract fields (source, disposition, review_reason_category) must all
-    // be present on a review. `id` is emitted for correlation but is not part of
-    // the queried contract, so assert the contract is a subset rather than ==.
-    assert!(
-        want.is_subset(fields),
-        "review message outcome missing contract fields; want ⊆ got, want={want:?} got={fields:?}"
-    );
-    assert!(
-        fields.contains(message_outcome::REVIEW_REASON_CATEGORY),
-        "review message outcome dropped {:?}",
-        message_outcome::REVIEW_REASON_CATEGORY
+    want.insert("id".to_string());
+    assert_eq!(
+        fields, &want,
+        "review message outcome field set drifted; want exactly ALWAYS+ON_REVIEW+id"
     );
 }
 
@@ -202,6 +195,120 @@ fn statement_reconcile_emits_exactly_the_contract_fields() {
         fields_for(&captured, statement_reconcile::MSG),
         &expected(statement_reconcile::ALL),
         "statement reconciliation field set drifted from obs_fields::statement_reconcile::ALL"
+    );
+}
+
+/// Per-event value capture: maps a message to its field name→stringified value
+/// map. Used to assert not just the field SET but specific serialized values.
+type CapturedValues = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
+
+/// A field visitor that records every field's stringified value (and pulls out
+/// `message` as the event key).
+#[derive(Default)]
+struct ValueVisitor {
+    message: Option<String>,
+    values: HashMap<String, String>,
+}
+
+impl Visit for ValueVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let v = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = Some(v);
+        } else {
+            self.values.insert(field.name().to_string(), v);
+        }
+    }
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = Some(value.to_string());
+        } else {
+            self.values
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.values
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct ValueCaptureLayer {
+    captured: CapturedValues,
+}
+
+impl<S> Layer<S> for ValueCaptureLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = ValueVisitor::default();
+        event.record(&mut visitor);
+        if let Some(message) = visitor.message {
+            self.captured
+                .lock()
+                .expect("capture mutex poisoned")
+                .insert(message, visitor.values);
+        }
+    }
+}
+
+fn capture_values<F: FnOnce()>(body: F) -> HashMap<String, HashMap<String, String>> {
+    let captured: CapturedValues = Arc::new(Mutex::new(HashMap::new()));
+    let subscriber = Registry::default().with(ValueCaptureLayer {
+        captured: Arc::clone(&captured),
+    });
+    with_default(subscriber, body);
+    Arc::try_unwrap(captured)
+        .expect("layer outlived capture scope")
+        .into_inner()
+        .expect("capture mutex poisoned")
+}
+
+#[test]
+fn statement_reconcile_with_balance_delta_present_emits_contract_and_values() {
+    // The default-report test drives balance_delta=None → "absent". This case
+    // exercises the `Some(_)` branch: the SAME contract field set, plus
+    // `balance_checked` must serialize `true` and `balance_delta` the numeric
+    // string (NOT "absent").
+    use rust_decimal::Decimal;
+    let report = StatementReport {
+        balance_delta: Some(Decimal::new(1234, 2)), // 12.34
+        ..Default::default()
+    };
+    let captured = capture_values(|| log_statement_reconcile(&report));
+    let values = captured
+        .get(statement_reconcile::MSG)
+        .expect("statement reconciliation event was emitted");
+
+    // Same field-name set as the contract (Some(_) does not add/drop a field).
+    let names: HashSet<String> = values.keys().cloned().collect();
+    assert_eq!(
+        names,
+        expected(statement_reconcile::ALL),
+        "Some(balance_delta) must emit exactly the contract field set"
+    );
+    assert_eq!(
+        values
+            .get(statement_reconcile::BALANCE_CHECKED)
+            .map(String::as_str),
+        Some("true"),
+        "balance_checked must serialize `true` when the check ran"
+    );
+    assert_eq!(
+        values
+            .get(statement_reconcile::BALANCE_DELTA)
+            .map(String::as_str),
+        Some("12.34"),
+        "balance_delta must be the numeric string, not \"absent\""
     );
 }
 

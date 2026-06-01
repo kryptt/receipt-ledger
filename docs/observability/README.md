@@ -167,10 +167,35 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://<tempo-distributor>.<ns>:4318
 `fetch`, `model_selection`, per-message `process` (with a child `extract` span for the
 LLM call), and for statements `statement` → `decrypt` / `parse` / `reconcile_book`.
 
-**Loki↔Tempo link.** Every JSON log line emitted within the run carries a `trace_id`
-field equal to the run's Tempo trace id (recorded on the root span; the fmt layer
-renders enclosing-span fields on each event). Use it to pivot from a Loki line to the
-Tempo trace.
+**Loki↔Tempo link.** Every JSON log line emitted within the run carries the run's
+Tempo `trace_id`, recorded on the **root span** — `tracing`'s JSON fmt layer renders
+enclosing-span fields under a top-level **`spans`** array (one object per enclosing
+span, outermost first), **not** as a top-level key. A confirmed line looks like:
+
+```json
+{"timestamp":"…","level":"INFO","fields":{"message":"new messages to process","count":3},
+ "target":"receipt_ledger","span":{"stage":"fetch","name":"fetch"},
+ "spans":[{"stage":"run","trace_id":"5b8aa5a2…","name":"run"},{"stage":"fetch","name":"fetch"}]}
+```
+
+So `trace_id` lives at `spans[0].trace_id` (the root `run` span is element 0). A naive
+`| json | trace_id != ""` finds nothing because there is no top-level `trace_id`. Loki's
+`| json` flattens nested JSON with `_` separators and array elements by index, so the
+root span's id is exposed as the label **`spans_0_trace_id`**:
+
+```logql
+# Find a run's lines and surface its Tempo trace id, then pivot to Tempo by that id.
+{namespace="apps", app="receipt-ledger"}
+  | json
+  | spans_0_trace_id != ""
+  | line_format "{{.spans_0_trace_id}} {{.message}}"
+```
+
+The flattened accessor name (`spans_0_trace_id`) is what Loki produced for the JSON shape
+above; **verify it against your Loki version** (older/newer `| json` flatteners may differ,
+and a `label_format`/`drop` in your pipeline can rename it) and adjust the accessor if
+needed. The JSON shape itself — `trace_id` under `spans[0]` (the root `run` span), never
+top-level — is fixed by the emitter and confirmed from the binary's output.
 
 **No PII in spans.** Span attributes are an allowlist — `stage`, `outcome`, and counts
 only. In particular the `extract`/LLM span carries **none** of: the prompt, the model

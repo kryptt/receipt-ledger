@@ -12,13 +12,11 @@
 //! logic lives in the library crate ([`receipt_ledger::run`]); this binary is a
 //! thin shell that wires logging, the crypto provider, and the exit code.
 
-use std::process::ExitCode;
-
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
-async fn main() -> ExitCode {
+async fn main() -> ! {
     install_crypto_provider();
 
     // Init logging + (optionally) traces. Returns `Some(Telemetry)` ONLY when
@@ -33,24 +31,31 @@ async fn main() -> ExitCode {
         Err(e) => Err(e),
     };
 
-    let exit = match result {
+    // 0 = success (incl. "nothing to do"); 1 = a real failure (→ `CronJobFailing`).
+    let exit_code = match result {
         Ok(summary) => {
             receipt_ledger::log_run_complete(&summary);
-            ExitCode::SUCCESS
+            0
         }
         Err(e) => {
             error!(error = ?e, "fatal error");
-            ExitCode::FAILURE
+            1
         }
     };
 
-    // Flush + shut down the tracer provider on a BOUNDED budget before the tokio
-    // runtime drops. A slow/unreachable collector is abandoned within the timeout
-    // and never changes `exit` — telemetry is strictly non-blocking and additive.
+    // Shut down the tracer provider on a BOUNDED budget. A slow/unreachable
+    // collector is abandoned within the timeout and never changes `exit_code` —
+    // telemetry is strictly non-blocking and additive.
     if let Some(telemetry) = telemetry {
         telemetry.shutdown().await;
     }
-    exit
+
+    // Exit explicitly rather than returning: `shutdown` may have DETACHED a blocking
+    // flush task against a half-open collector, and the multi-threaded runtime's
+    // destructor would otherwise WAIT for that task (blocking threads can't be
+    // interrupted), delaying exit well past FLUSH_TIMEOUT. `process::exit` terminates
+    // now without running the runtime destructor, so the documented bound holds.
+    std::process::exit(exit_code);
 }
 
 /// Log output format, selected by `RECEIPT_LOG_FORMAT`. JSON (the default) is for

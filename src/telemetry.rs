@@ -33,11 +33,19 @@
 //!
 //! ## Flush on exit (bounded, non-blocking)
 //!
-//! The money path never waits on telemetry. [`Telemetry::shutdown`] force-flushes
-//! and shuts the provider down on a **bounded** budget ([`FLUSH_TIMEOUT`]) on a
-//! blocking thread; if the collector is unreachable or slow the flush is abandoned
-//! and the run exits with its normal code. Telemetry can never delay the run past
-//! the timeout nor flip the exit code.
+//! The money path never waits on telemetry. [`Telemetry::shutdown`] shuts the
+//! provider down on a **bounded** budget ([`FLUSH_TIMEOUT`]) on a blocking thread;
+//! if the collector is unreachable or slow the shutdown is abandoned and the run
+//! exits with its normal code. Telemetry can never delay the run past the timeout
+//! nor flip the exit code.
+//!
+//! The bound has a subtlety: when the [`tokio::time::timeout`] fires it *detaches*
+//! the `spawn_blocking` task — but the multi-threaded runtime's `Drop` then waits
+//! for outstanding blocking tasks to finish (blocking threads can't be safely
+//! interrupted), so a half-open collector would still delay process exit well past
+//! [`FLUSH_TIMEOUT`]. The bound is therefore guaranteed in `main`, which calls
+//! [`std::process::exit`] right after [`Telemetry::shutdown`] returns — terminating
+//! the process without running the runtime destructor.
 
 use std::time::Duration;
 
@@ -69,31 +77,38 @@ pub struct Telemetry {
 }
 
 impl Telemetry {
-    /// Force-flush and shut the provider down on a **bounded** budget.
+    /// Shut the provider down on a **bounded** budget, draining the final batch.
     ///
-    /// The `rt-tokio` batch processor drains on the tokio runtime, so the
-    /// (synchronous, network-bound) flush runs on a `spawn_blocking` task — which
-    /// carries the runtime context the processor needs — wrapped in a
-    /// [`FLUSH_TIMEOUT`] [`tokio::time::timeout`]. A reachable collector flushes
-    /// promptly; an unreachable/slow one trips the timeout and the blocking task
-    /// is **detached** (it finishes harmlessly in the background as the process
-    /// exits). Either way this returns within the budget and never propagates an
-    /// error — telemetry must not delay the run past the timeout nor flip its
-    /// exit code. Must be called from within the tokio runtime (i.e. from `main`).
+    /// The export runs on the SDK's own dedicated thread via a BLOCKING reqwest
+    /// client (no `rt-tokio`; see [`build_provider`]). `provider.shutdown()` itself
+    /// drains the `BatchSpanProcessor` (a final export) then stops it and `join`s
+    /// that thread — a synchronous, network-bound, potentially blocking call — so
+    /// it runs on a `spawn_blocking` task wrapped in a [`FLUSH_TIMEOUT`]
+    /// [`tokio::time::timeout`]. A reachable collector drains promptly; an
+    /// unreachable/half-open one trips the timeout and the blocking task is
+    /// **detached**.
+    ///
+    /// A detached blocking task would otherwise stall the multi-threaded runtime's
+    /// destructor (it waits for outstanding blocking threads), so the hard bound is
+    /// completed by `main` calling [`std::process::exit`] immediately after this
+    /// returns — the process terminates without running the runtime destructor.
+    /// This never propagates an error and never flips the exit code. Must be called
+    /// from within the tokio runtime (i.e. from `main`).
     pub async fn shutdown(self) {
         let provider = self.provider;
         let flush = tokio::task::spawn_blocking(move || {
-            // force_flush drains the batch processor; shutdown stops it. Both are
-            // best-effort: a failed export is logged by the SDK's internal handler
-            // and ignored here.
-            let _ = provider.force_flush();
-            let _ = provider.shutdown();
+            // `shutdown()` already drains+exports the buffered batch before stopping
+            // the processor, so a separate `force_flush()` is redundant. The SDK's
+            // own thread-join inside `shutdown()` calls `handle.join().unwrap()`,
+            // which can panic if that thread already unwound; isolate it so a flush
+            // panic can never abort the process or poison anything. Best-effort: a
+            // failed export is logged by the SDK's internal handler and ignored.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = provider.shutdown();
+            }));
         });
-        match tokio::time::timeout(FLUSH_TIMEOUT, flush).await {
-            Ok(_) => {}
-            Err(_) => {
-                tracing::debug!("telemetry flush exceeded budget; abandoning (run unaffected)");
-            }
+        if tokio::time::timeout(FLUSH_TIMEOUT, flush).await.is_err() {
+            tracing::debug!("telemetry flush exceeded budget; abandoning (run unaffected)");
         }
     }
 }
@@ -130,7 +145,10 @@ pub fn init(json: bool, env_filter: tracing_subscriber::EnvFilter) -> Option<Tel
             // A misconfigured endpoint must not abort the run (telemetry is
             // additive). Fall back to fmt-only and carry on.
             install_fmt_only(json, env_filter);
-            tracing::warn!(error = %e, endpoint, "OTLP exporter init failed; continuing without traces");
+            // Sanitize before logging: an operator could embed credentials in the
+            // URL (`http://user:pass@host:4318`); the raw string must never reach
+            // Loki. `sanitize_endpoint` strips any userinfo.
+            tracing::warn!(error = %e, endpoint = %sanitize_endpoint(&endpoint), "OTLP exporter init failed; continuing without traces");
             return None;
         }
     };
@@ -197,6 +215,31 @@ fn build_provider(endpoint: &str) -> anyhow::Result<SdkTracerProvider> {
         .build())
 }
 
+/// Strip any `userinfo` (`user:pass@`) from an OTLP endpoint URL so embedded
+/// credentials never reach the logs. Dependency-free: splits on the first `://`
+/// and drops everything up to and including the last `@` in the authority (the
+/// segment before the next `/`). A URL with no scheme or no userinfo is returned
+/// unchanged. This is a log-sanitizer, not a URL parser — it does not validate.
+fn sanitize_endpoint(endpoint: &str) -> String {
+    let Some((scheme, rest)) = endpoint.split_once("://") else {
+        return endpoint.to_string();
+    };
+    // The authority ends at the first '/' (path), if any; userinfo lives only in
+    // the authority, so confine the '@' search to it.
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (rest, None),
+    };
+    let host = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => host,
+        None => authority,
+    };
+    match path {
+        Some(p) => format!("{scheme}://{host}/{p}"),
+        None => format!("{scheme}://{host}"),
+    }
+}
+
 /// The span field that carries the run's `trace_id` for the Loki↔Tempo link.
 /// Declare it `= tracing::field::Empty` on the root span, then call
 /// [`record_trace_id`] inside the span to fill it.
@@ -257,16 +300,26 @@ mod tests {
         assert_eq!(OTEL_ENDPOINT_ENV, "OTEL_EXPORTER_OTLP_ENDPOINT");
     }
 
-    /// req 5 (flush is bounded + non-blocking): with the collector UNREACHABLE,
-    /// `Telemetry::shutdown` must still return within ~`FLUSH_TIMEOUT` and never
-    /// hang — so a down/slow Tempo can never delay the run or flip its exit code.
-    /// Needs the tokio runtime the batch processor (`rt-tokio`) runs on.
+    /// req 5 (flush is bounded + non-blocking): against a collector that accepts
+    /// (or never answers) the TCP connection but never responds, `Telemetry::
+    /// shutdown` must still return within ~`FLUSH_TIMEOUT` and never hang — so a
+    /// down/slow Tempo can never delay the run or flip its exit code.
+    ///
+    /// The endpoint is an unroutable TEST-NET / private address (`10.255.255.1`):
+    /// the connect HANGS until the export's own timeout, exercising the half-open /
+    /// slow-collector path (NOT an instantly-refused port like `:1`, which would
+    /// return immediately and never prove the bound is enforced by our timeout).
+    /// The bound here is the `Telemetry::shutdown` `tokio::time::timeout` over the
+    /// `spawn_blocking` task; the process-level hard bound (`std::process::exit`
+    /// after this returns, skipping the runtime destructor that would otherwise
+    /// await the detached blocking task) lives in `main` and can't be unit-tested
+    /// without forking. We assert the in-task bound is TIGHT.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_is_bounded_when_collector_unreachable() {
-        // A routable-but-dead local port: the export request will fail/time out
-        // rather than connect. (No server is listening here.)
-        let provider = build_provider("http://127.0.0.1:1/v1/traces")
-            .expect("provider builds even though the endpoint is dead");
+        // A non-routable address: the TCP connect hangs rather than being refused,
+        // so the export sits until its own timeout — the slow-collector case.
+        let provider = build_provider("http://10.255.255.1:4318/v1/traces")
+            .expect("provider builds even though the endpoint is unreachable");
         // Produce a span so there is a batch to (fail to) flush.
         {
             let tracer = provider.tracer("test");
@@ -276,12 +329,13 @@ mod tests {
 
         let start = std::time::Instant::now();
         // shutdown runs the flush on a spawn_blocking task under a tokio timeout;
-        // assert it returns within the bounded budget even with the dead endpoint.
+        // assert it returns within a TIGHT window of the budget even though the
+        // endpoint never responds.
         telemetry.shutdown().await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed < FLUSH_TIMEOUT + Duration::from_secs(2),
-            "shutdown must abandon a dead collector within ~the timeout, took {elapsed:?}"
+            elapsed < FLUSH_TIMEOUT + Duration::from_millis(500),
+            "shutdown must abandon a hanging collector within ~the timeout, took {elapsed:?}"
         );
     }
 
@@ -492,8 +546,9 @@ mod tests {
     #[test]
     fn extract_span_carries_no_pii_fields() {
         // req 6 (no-PII span allowlist): the extract/LLM span's attributes are an
-        // allowlist (stage/outcome/counts) and must NOT include the prompt,
-        // completion, raw body, merchant, amount, last-4, or ref#.
+        // ALLOWLIST — exactly `{stage}`. An allowlist (not a denylist) means ANY
+        // added field of ANY name now fails this test, not just the handful of
+        // known-PII names we'd have to remember to enumerate.
         let cap = Capture::default();
         let subscriber = tracing_subscriber::registry()
             .with(otel_layer_in_memory())
@@ -513,23 +568,37 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "extract")
             .expect("the extract span emitted an event");
-        let forbidden = [
-            "prompt",
-            "completion",
-            "body",
-            "email_body",
-            "merchant",
-            "amount",
-            "last4",
-            "last_4",
-            "reference",
-            "ref",
-        ];
-        for f in &forbidden {
-            assert!(
-                !fields.iter().any(|name| name == f),
-                "extract span must not carry PII field {f:?}; had {fields:?}"
-            );
-        }
+        let captured: std::collections::HashSet<&str> = fields.iter().map(String::as_str).collect();
+        let allowed: std::collections::HashSet<&str> = ["stage"].into_iter().collect();
+        assert_eq!(
+            captured, allowed,
+            "extract span attributes must be exactly {{stage}}; had {fields:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_endpoint_strips_userinfo_and_preserves_the_rest() {
+        // Credentials in the authority are removed; everything else is untouched.
+        assert_eq!(
+            sanitize_endpoint("http://user:pass@tempo:4318/v1/traces"),
+            "http://tempo:4318/v1/traces"
+        );
+        // No userinfo → unchanged (incl. the path).
+        assert_eq!(
+            sanitize_endpoint("http://tempo:4318/v1/traces"),
+            "http://tempo:4318/v1/traces"
+        );
+        // No path.
+        assert_eq!(
+            sanitize_endpoint("https://user:pass@host:4318"),
+            "https://host:4318"
+        );
+        // A '@' in the PATH must not be mistaken for userinfo.
+        assert_eq!(
+            sanitize_endpoint("http://tempo:4318/v1/tr@ces"),
+            "http://tempo:4318/v1/tr@ces"
+        );
+        // No scheme → returned as-is (we don't guess).
+        assert_eq!(sanitize_endpoint("tempo:4318"), "tempo:4318");
     }
 }

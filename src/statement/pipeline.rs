@@ -140,15 +140,16 @@ pub async fn process_statement(
         .find(|a| a.is_pdf())
         .ok_or_else(|| anyhow!("message classified as statement but has no PDF attachment"))?;
 
-    // `decrypt` stage: download + RC4-decrypt + positioned-text extraction.
-    let bytes = mailbox
-        .download(&pdf_att.blob_id)
-        .instrument(tracing::info_span!("decrypt", stage = "decrypt"))
-        .await?;
-    let rows = {
-        let _g = tracing::info_span!("decrypt", stage = "decrypt").entered();
-        pdf::extract_rows(bytes, password)?
-    };
+    // `decrypt` stage: download + RC4-decrypt + positioned-text extraction under
+    // ONE child span (async block: the async download then the sync extract), so
+    // the trace has exactly one `decrypt` child. Control flow + error handling are
+    // unchanged (`?` propagates a fatal download/extract error to the caller).
+    let rows = async {
+        let bytes = mailbox.download(&pdf_att.blob_id).await?;
+        pdf::extract_rows(bytes, password)
+    }
+    .instrument(tracing::info_span!("decrypt", stage = "decrypt"))
+    .await?;
     // `parse` stage: reassemble columns into typed statement rows (pure, sync).
     let parsed = {
         let _g = tracing::info_span!("parse", stage = "parse").entered();

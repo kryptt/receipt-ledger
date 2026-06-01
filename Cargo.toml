@@ -4,6 +4,11 @@ version = "0.15.0"
 edition = "2024"
 license = "MIT"
 description = "Transaction-notification-email → Firefly III ingestor (one-shot CronJob)"
+# This is an APPLICATION (a one-shot CronJob binary), not a library. Its `pub` API
+# surface exists only so the integration tests in `tests/` can drive the pipeline;
+# it is NOT a SemVer contract. Mark it unpublishable so a changed signature (e.g.
+# `run(http: Client)`) can never be an accidental crates.io publish / breaking release.
+publish = false
 
 [dependencies]
 anyhow = "1"
