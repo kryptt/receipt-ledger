@@ -1,9 +1,10 @@
 ---
 title: "feat: Observability — structured logs + log-derived metrics (Phase 1), traces (Phase 2, gated)"
 type: feat
-status: active
+status: phase-1-shipped
 date: 2026-06-01
 deepened: 2026-06-01
+shipped: 2026-06-01  # Phase 1 (Units 1–6) released as 0.15.0; deployed via hr-fleet
 origin: docs/brainstorms/2026-06-01-observability-requirements.md
 ---
 
@@ -153,7 +154,7 @@ no alert) and a **Review pile-up** of by-design flags. See origin:
 
 ### Phase 1 — structured logs + log-derived metric fields (no new heavy deps)
 
-- [ ] **Unit 1: JSON log output behind a format toggle**
+- [x] **Unit 1: JSON log output behind a format toggle**
 
 **Goal:** Emit machine-parseable JSON logs so Loki fields are queryable; keep
 local dev readable.
@@ -187,7 +188,7 @@ local dev readable.
 **Verification:** a run with the default prints one JSON object per log line; the
 end-of-run summary line is valid JSON with the expected keys.
 
-- [ ] **Unit 2: Per-message structured outcome event + per-source run rollup**
+- [x] **Unit 2: Per-message structured outcome event + per-source run rollup**
 
 **Goal:** Emit `{source, disposition}` per message (the LogQL substrate) and ensure
 the run `Summary` carries enough for source-broken-down recording rules.
@@ -234,7 +235,7 @@ the run `Summary` carries enough for source-broken-down recording rules.
 **Verification:** a fixture batch yields one outcome event per message with
 low-cardinality `source`/`disposition`/`review_reason_category` and zero PII.
 
-- [ ] **Unit 3: No-progress + outage/defer run fields**
+- [x] **Unit 3: No-progress + outage/defer run fields**
 
 **Goal:** Make the co-primary *no-progress* signal and the outage indicators
 alertable from the run summary.
@@ -293,7 +294,7 @@ alertable from the run summary.
 runs by these fields; the model-selection failure surfaces as its own event (not the
 summary); the plan's signal-division-of-labor is reflected in Unit 6's example rules.
 
-- [ ] **Unit 4: Statement reconcile-health fields + closing-balance delta**
+- [x] **Unit 4: Statement reconcile-health fields + closing-balance delta**
 
 **Goal:** Surface statement health and a correctness signal as structured fields.
 
@@ -338,7 +339,7 @@ log in `run()`'s statement arm.
 **Verification:** the statement summary event carries a numeric `balance_delta`; a
 non-reconciling fixture surfaces it and the mismatch flag.
 
-- [ ] **Unit 5: PII/secret discipline guardrail**
+- [x] **Unit 5: PII/secret discipline guardrail**
 
 **Goal:** Make the prod PII boundary fail-safe and audit the telemetry sinks for
 secret/raw-body leakage.
@@ -390,7 +391,14 @@ secret/raw-body leakage.
 `RUST_LOG` (incl. dry-run); `redact()` provably strips secrets from error logs; the
 new info events are PII-free by construction.
 
-- [ ] **Unit 6: Recording + alert rules, dashboard, and a field-name contract test**
+- [x] **Unit 6: Recording + alert rules, dashboard, and a field-name contract test** _(partial — shipped; two sub-items deferred)_
+  - Shipped in `docs/observability/README.md`: the field contract + example LogQL
+    recording rules + Prometheus alert rules (ReceiptLedgerNoProgress, ReviewPileup,
+    BalanceMismatch, RunFailing).
+  - **Deferred:** (a) the in-app stable field-name **constants module + automated
+    contract test** (field names are currently inline at the emission sites — a
+    rename would not fail CI); (b) the **Grafana dashboard JSON**. Both are
+    cluster-side / hardening follow-ons, not blockers for the alertable-fields goal.
 
 **Goal:** Close the loop to a *working* alert (not just emitted fields), and prevent
 silent field-name drift from breaking alerts. Promoted from optional → **required**:
