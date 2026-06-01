@@ -1,3 +1,4 @@
 /target
 /.grepai
 rust_out
+/.context
