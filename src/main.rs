@@ -14,7 +14,7 @@
 
 use std::process::ExitCode;
 
-use tracing::{error, info};
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -35,17 +35,7 @@ async fn main() -> ExitCode {
 
     let exit = match result {
         Ok(summary) => {
-            info!(
-                processed = summary.processed,
-                booked = summary.booked,
-                duplicates = summary.duplicates,
-                review = summary.review,
-                skipped = summary.skipped,
-                statements = summary.statements,
-                corrected = summary.corrected,
-                deferred = summary.deferred,
-                "run complete"
-            );
+            receipt_ledger::log_run_complete(&summary);
             ExitCode::SUCCESS
         }
         Err(e) => {

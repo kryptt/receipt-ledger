@@ -299,9 +299,18 @@ pub async fn process_statement(
     .instrument(tracing::info_span!("reconcile_book", stage = "reconcile_book"))
     .await?;
 
-    // Canonical structured statement event — explicit named fields (NOT `?report`,
-    // which under JSON logging serializes as one opaque Debug string LogQL can't
-    // field-query). `balance_checked` distinguishes Some(0) from "not checked".
+    log_statement_reconcile(&report);
+    Ok(report)
+}
+
+/// Emit the `statement reconciliation complete` event. Extracted from the
+/// pipeline so the field-name contract test (`tests/obs_field_contract.rs`) can
+/// drive it from a bare [`StatementReport`]. Explicit named fields (NOT
+/// `?report`, which under JSON logging serializes as one opaque Debug string
+/// LogQL can't field-query); `balance_checked` distinguishes `Some(0)` from "not
+/// checked". The field identifiers/values are byte-identical to the previous
+/// inline site — pinned in [`crate::obs_fields::statement_reconcile`].
+pub fn log_statement_reconcile(report: &StatementReport) {
     let balance_delta_str = report
         .balance_delta
         .map(|d| d.normalize().to_string())
@@ -320,7 +329,6 @@ pub async fn process_statement(
         balance_delta = %balance_delta_str,
         "statement reconciliation complete"
     );
-    Ok(report)
 }
 
 /// Closing-balance internal consistency: `BALANCE ANTERIOR + Σcharges −

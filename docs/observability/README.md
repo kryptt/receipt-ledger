@@ -54,6 +54,14 @@ abort emits no run-complete summary; an exit-0 stuck run is not a Job failure).
 > **Loki retention must be ≥ the no-progress window.** A "deferred across N runs"
 > alert needs the run-complete lines retained that long. If retention is short, key
 > no-progress on KSM `last_successful_time` age (which persists) instead.
+>
+> **Verified (2026-06-01, this cluster):** `loki-stack` (ns `monitor`, filesystem
+> tsdb, `compactor.retention_enabled: true`) has a **14d default retention**; the
+> `retention_stream` overrides don't match `{namespace="home", app="receipt-ledger"}`,
+> so our lines get the 14d default. The example windows here are ≤ 12h (`deferred`
+> 3h, `balance_delta` 12h) — **14d ≫ 12h**, so log-counted no-progress is safe. The
+> co-primary alert still ANDs in KSM `last_successful_time`, so it holds even if
+> retention is later shortened.
 
 ## Example LogQL recording rules
 
@@ -177,13 +185,33 @@ exits with its normal code; telemetry can never delay the run or flip the exit c
 
 ## Dashboard
 
-A Grafana dashboard (panels: dispositions by source over time, deferred/no-progress,
-review-rate, statement balance_delta, run success from KSM) is a follow-on — build it
-from the recording rules above. Not required for the alerts to fire.
+A ready-to-import Grafana dashboard lives at [`dashboard.json`](./dashboard.json)
+(schemaVersion 39, templated `datasource`). Its panels mirror the recording/alert
+rules above:
+
+- **Dispositions by source over time** — `receiptledger:outcomes:rate5m` stacked by
+  `source` / `disposition`.
+- **Review rate (5m)** — `sum(receiptledger:outcomes:rate5m{disposition="review"})`,
+  red past the `ReceiptLedgerReviewPileup` threshold (> 5).
+- **Deferred on last run (no-progress)** — `receiptledger:deferred:last`.
+- **Time since last successful run** — age of
+  `kube_cronjob_status_last_successful_time{cronjob="receipt-ledger"}`, red past the
+  3h no-progress window (the two together are the `ReceiptLedgerNoProgress` co-primary).
+- **Failed jobs** — `kube_job_status_failed{job_name=~"receipt-ledger.*"}`
+  (`ReceiptLedgerRunFailing`).
+- **Statement closing-balance delta** — `abs(receiptledger:balance_delta:last)`, red
+  past `0.01` (`ReceiptLedgerBalanceMismatch`).
+
+Point its `datasource` variable at the Prometheus/Mimir instance holding the recorded
+metrics + kube-state-metrics. As with the rules, importing it is the cluster-side step;
+the app's job is only to emit the fields.
 
 ## Follow-up
 
-- An automated field-name **contract test** (capture the structured events via a
-  tracing test layer and assert the field set) would make a rename fail CI rather than
-  silently break a rule. Deferred: needs a tracing-capture harness; until then the
-  field names here are the contract and are diff-visible at the emission sites.
+- The automated field-name **contract test** is now implemented
+  (`tests/obs_field_contract.rs`). A `tracing` capture layer records the field-name set
+  per event message; the test drives each emit-helper (`log_run_complete`,
+  `log_message_outcome`, `log_statement_reconcile`, `log_model_selection_failed`) and
+  asserts the captured set equals the canonical constants in `src/obs_fields.rs` (the
+  single source of truth for every field name and event message above). Renaming or
+  dropping a field at an emission site now fails CI instead of silently breaking a rule.

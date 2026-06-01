@@ -13,6 +13,7 @@ pub mod fx;
 pub mod jmap;
 pub mod llm;
 pub mod model_selection;
+pub mod obs_fields;
 pub mod schema;
 pub mod statement;
 pub mod telemetry;
@@ -116,7 +117,7 @@ pub async fn run(http: Client) -> Result<Summary> {
     {
         Ok(m) => m,
         Err(e) => {
-            error!(stage = "model_selection", error = ?e, "model selection failed");
+            log_model_selection_failed(&e);
             return Err(e).context("selecting extraction model");
         }
     };
@@ -212,13 +213,15 @@ pub async fn run(http: Client) -> Result<Summary> {
                         let clean = report.is_clean();
                         // Per-message outcome event for statements too (source is
                         // statically `banco_popular`), so the source×disposition
-                        // LogQL metric isn't blind to the statement path. `?report`
-                        // is numeric-only (no PII), safe to log unguarded.
-                        info!(
-                            id = %msg.id,
-                            source = "banco_popular",
-                            disposition = if clean { "booked" } else { "review" },
-                            "message outcome"
+                        // LogQL metric isn't blind to the statement path. No
+                        // review-reason category on this path (statement reviews are
+                        // not adapter reasons); `None` records nothing, so the JSON
+                        // is identical to the previous inline three-field event.
+                        log_message_outcome(
+                            &msg.id,
+                            "banco_popular",
+                            if clean { "booked" } else { "review" },
+                            None,
                         );
                         if clean {
                             info!(id = %msg.id, ?report, "statement clean → processed");
@@ -268,12 +271,11 @@ pub async fn run(http: Client) -> Result<Summary> {
                     Disposition::Review(reason) => Some(review_reason_category(reason)),
                     _ => None,
                 };
-                info!(
-                    id = %msg.id,
+                log_message_outcome(
+                    &msg.id,
                     source,
-                    disposition = disposition_label(&disposition),
-                    review_reason_category = review_category,
-                    "message outcome"
+                    disposition_label(&disposition),
+                    review_category,
                 );
                 match disposition {
                     Disposition::Booked => {
@@ -417,6 +419,57 @@ fn review_reason_category(reason: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+// --- structured-event emit helpers -----------------------------------------
+//
+// Each canonical structured event is emitted through exactly one of these tiny
+// functions so it can be driven in isolation by the field-name contract test
+// (`tests/obs_field_contract.rs`) without the full JMAP/Firefly pipeline. The
+// field identifiers and values are byte-identical to the previous inline sites
+// (a pure refactor — the emitted JSON is unchanged). The names of the field
+// identifiers are pinned in [`obs_fields`]; the contract test asserts the two
+// agree, so a rename here fails CI.
+
+/// Emit the `run complete` event. One per successful run.
+pub fn log_run_complete(summary: &Summary) {
+    info!(
+        processed = summary.processed,
+        booked = summary.booked,
+        duplicates = summary.duplicates,
+        review = summary.review,
+        skipped = summary.skipped,
+        statements = summary.statements,
+        corrected = summary.corrected,
+        deferred = summary.deferred,
+        "run complete"
+    );
+}
+
+/// Emit the per-message `message outcome` event. `review_reason_category` is
+/// `None` for every disposition except `review` (and, per `tracing`'s
+/// `Option` impl, a `None` records nothing — so the field is simply absent from
+/// the JSON on a non-review outcome, exactly as before).
+pub fn log_message_outcome(
+    id: &str,
+    source: &str,
+    disposition: &str,
+    review_reason_category: Option<&str>,
+) {
+    info!(
+        id = %id,
+        source,
+        disposition,
+        review_reason_category,
+        "message outcome"
+    );
+}
+
+/// Emit the `model selection failed` event. Carries the fixed
+/// `stage = "model_selection"` discriminant so a log-derived alert can key on it,
+/// plus the (upstream-redacted) error via `Debug`.
+pub fn log_model_selection_failed(error: &anyhow::Error) {
+    error!(stage = "model_selection", error = ?error, "model selection failed");
 }
 
 /// The deterministic-core + I/O pipeline for one message.
