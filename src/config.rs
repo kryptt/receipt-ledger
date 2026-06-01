@@ -120,6 +120,11 @@ pub struct Config {
     pub state_path: String,
     /// Path to the persistent FX-rate cache file (see [`DEFAULT_FX_CACHE_PATH`]).
     pub fx_cache_path: String,
+    /// `RECEIPT_LOG_PII` (default off): when off, per-row financial detail
+    /// (merchant / amount) is suppressed from logs **regardless of `RUST_LOG` or
+    /// dry-run** — so a misconfigured `debug`/dry-run prod run cannot ship PII to
+    /// Loki for the retention window. Set to `true` to observe a cycle's plan.
+    pub log_pii: bool,
 
     pub ollama_url: String,
     /// Allowlisted extraction models, highest priority first.
@@ -247,6 +252,7 @@ impl Config {
             jmap_password: required("RECEIPT_JMAP_PASSWORD")?,
             state_path: env_or("RECEIPT_STATE_PATH", DEFAULT_STATE_PATH),
             fx_cache_path: env_or("RECEIPT_FX_CACHE_PATH", DEFAULT_FX_CACHE_PATH),
+            log_pii: env_bool("RECEIPT_LOG_PII"),
 
             ollama_url: env_or("RECEIPT_OLLAMA_URL", DEFAULT_OLLAMA_URL),
             model_allowlist,

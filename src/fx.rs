@@ -569,6 +569,10 @@ impl<'a> DopRate<'a> {
                     .header(reqwest::header::ACCEPT, "application/json")
                     .body(form),
                 "DOP token endpoint",
+                // The token endpoint's error body can echo client-credentials
+                // detail — never embed it in a logged error (it surfaces via
+                // `warn!(error = %e)`). Status only.
+                false,
             )
             .await?;
         parse_token(&body)
@@ -585,6 +589,8 @@ impl<'a> DopRate<'a> {
                 .header("X-IBM-Client-Id", self.client_id.as_str())
                 .header(reqwest::header::ACCEPT, "application/json"),
             "DOP rates endpoint",
+            // Rates error body is just rate JSON (no secret) — safe to include.
+            true,
         )
         .await
     }
@@ -595,6 +601,7 @@ impl<'a> DopRate<'a> {
         &self,
         req: reqwest::RequestBuilder,
         what: &str,
+        include_body_in_error: bool,
     ) -> std::result::Result<String, RateError> {
         let resp = req
             .send()
@@ -605,10 +612,15 @@ impl<'a> DopRate<'a> {
         if status.is_success() {
             return Ok(body);
         }
-        Err(classify_status(
-            status,
-            format!("{what} returned {status}: {}", body.trim()),
-        ))
+        // The body is omitted for endpoints whose error response could echo a
+        // secret (the OAuth token endpoint) — these errors are logged verbatim
+        // via `warn!(error = %e)`, so a leaked body would reach Loki.
+        let msg = if include_body_in_error {
+            format!("{what} returned {status}: {}", body.trim())
+        } else {
+            format!("{what} returned {status}")
+        };
+        Err(classify_status(status, msg))
     }
 }
 

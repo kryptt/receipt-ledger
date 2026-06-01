@@ -201,19 +201,39 @@ pub async fn process_statement(
 
         // recon.charges is positional with `charges`.
         for ((_, outcome), charge) in recon.charges.iter().zip(&charges) {
-            // In dry-run, surface the per-row plan (merchant/amount is the point
-            // of observing); in production it stays at debug (financial PII).
-            let line = format!(
-                "{} | {} {} | {:?}",
-                charge.reference.as_str(),
-                charge.money.amount.value().normalize(),
-                charge.money.currency.as_str(),
-                outcome
-            );
-            if cfg.dry_run {
-                info!(merchant = charge.merchant, plan = %line, "charge plan");
+            // Per-row financial detail (merchant + amount) is PII — emit it only
+            // when RECEIPT_LOG_PII is on (independent of dry-run / RUST_LOG), so a
+            // misconfigured prod run can't ship it to Loki. Off → reference + the
+            // bare outcome kind only (no merchant, no amount). The dry-run/`info!`
+            // path is gated too (the operator opts into PII to observe a cycle).
+            if cfg.log_pii {
+                let line = format!(
+                    "{} | {} {} | {:?}",
+                    charge.reference.as_str(),
+                    charge.money.amount.value().normalize(),
+                    charge.money.currency.as_str(),
+                    outcome
+                );
+                if cfg.dry_run {
+                    info!(merchant = charge.merchant, plan = %line, "charge plan");
+                } else {
+                    debug!(merchant = charge.merchant, plan = %line, "charge");
+                }
             } else {
-                debug!(merchant = charge.merchant, plan = %line, "charge");
+                let kind = charge_outcome_kind(outcome);
+                if cfg.dry_run {
+                    info!(
+                        reference = charge.reference.as_str(),
+                        outcome = kind,
+                        "charge plan"
+                    );
+                } else {
+                    debug!(
+                        reference = charge.reference.as_str(),
+                        outcome = kind,
+                        "charge"
+                    );
+                }
             }
 
             match outcome {
@@ -314,6 +334,17 @@ fn check_balance(
             delta = %delta,
             "closing balance does not reconcile (missed rows, or unmodeled fees/interest) → review"
         );
+    }
+}
+
+/// A PII-free label for a charge's reconcile outcome (no journal amounts / reason
+/// strings) — used in the non-PII charge log path.
+fn charge_outcome_kind(o: &ChargeOutcome) -> &'static str {
+    match o {
+        ChargeOutcome::Confirmed { .. } => "confirmed",
+        ChargeOutcome::AmountMismatch { .. } => "amount_mismatch",
+        ChargeOutcome::BookNew => "book_new",
+        ChargeOutcome::Review { .. } => "review",
     }
 }
 
