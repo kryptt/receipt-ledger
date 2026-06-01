@@ -192,11 +192,17 @@ pub async fn process_statement(
         let recon = reconcile(&charges, &journals, &params, &aliases);
         report.unmatched_booked += recon.unmatched_journals.len();
         for j in &recon.unmatched_journals {
-            info!(
-                journal = j.id,
-                merchant = j.merchant,
-                "unmatched Firefly journal (audit) → review"
-            );
+            // `merchant` is PII — gate it on RECEIPT_LOG_PII (the journal id is a
+            // non-PII Firefly handle, always safe).
+            if cfg.log_pii {
+                info!(
+                    journal = j.id,
+                    merchant = j.merchant,
+                    "unmatched Firefly journal (audit) → review"
+                );
+            } else {
+                info!(journal = j.id, "unmatched Firefly journal (audit) → review");
+            }
         }
 
         // recon.charges is positional with `charges`.

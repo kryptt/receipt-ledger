@@ -187,6 +187,16 @@ pub async fn run() -> Result<Summary> {
                             "statement has deferred rows (rate provider down); kept in INBOX for retry");
                     } else {
                         let clean = report.is_clean();
+                        // Per-message outcome event for statements too (source is
+                        // statically `banco_popular`), so the source×disposition
+                        // LogQL metric isn't blind to the statement path. `?report`
+                        // is numeric-only (no PII), safe to log unguarded.
+                        info!(
+                            id = %msg.id,
+                            source = "banco_popular",
+                            disposition = if clean { "booked" } else { "review" },
+                            "message outcome"
+                        );
                         if clean {
                             info!(id = %msg.id, ?report, "statement clean → processed");
                         } else {
@@ -253,13 +263,27 @@ pub async fn run() -> Result<Summary> {
                     }
                     Disposition::Skipped(reason) => {
                         // Not a transaction at all — a clean skip, NOT a review.
+                        // The reason can name the source/merchant, so gate it on
+                        // RECEIPT_LOG_PII (the bounded category went out above).
                         summary.skipped += 1;
-                        info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
+                        if cfg.log_pii {
+                            info!(id = %msg.id, %reason, "not a transaction; skipping to processed");
+                        } else {
+                            info!(id = %msg.id, "not a transaction; skipping to processed");
+                        }
                         route(&mailbox, &msg.id, true, cfg.dry_run).await;
                     }
                     Disposition::Review(reason) => {
+                        // The free-form reason can carry PII (merchant / amount /
+                        // last-4 / sender email), so gate it on RECEIPT_LOG_PII; the
+                        // bounded `review_reason_category` already went out on the
+                        // outcome event above and is always safe to log.
                         summary.review += 1;
-                        warn!(id = %msg.id, %reason, "routing to review");
+                        if cfg.log_pii {
+                            warn!(id = %msg.id, %reason, "routing to review");
+                        } else {
+                            warn!(id = %msg.id, review_reason_category = review_category, "routing to review");
+                        }
                         route(&mailbox, &msg.id, false, cfg.dry_run).await;
                     }
                 }
