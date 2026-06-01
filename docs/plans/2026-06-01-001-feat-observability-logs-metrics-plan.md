@@ -1,10 +1,10 @@
 ---
 title: "feat: Observability — structured logs + log-derived metrics (Phase 1), traces (Phase 2, gated)"
 type: feat
-status: phase-1-shipped
+status: shipped
 date: 2026-06-01
 deepened: 2026-06-01
-shipped: 2026-06-01  # Phase 1 (Units 1–6) released as 0.15.0; deployed via hr-fleet
+shipped: 2026-06-01  # Phase 1 (Units 1–6) → 0.15.0; Phase 2 (Unit 7 traces) + Unit-6 follow-ons (field constants/contract test, dashboard) → 0.16.0. Both deployed via hr-fleet.
 origin: docs/brainstorms/2026-06-01-observability-requirements.md
 ---
 
@@ -391,14 +391,17 @@ secret/raw-body leakage.
 `RUST_LOG` (incl. dry-run); `redact()` provably strips secrets from error logs; the
 new info events are PII-free by construction.
 
-- [x] **Unit 6: Recording + alert rules, dashboard, and a field-name contract test** _(partial — shipped; two sub-items deferred)_
-  - Shipped in `docs/observability/README.md`: the field contract + example LogQL
-    recording rules + Prometheus alert rules (ReceiptLedgerNoProgress, ReviewPileup,
-    BalanceMismatch, RunFailing).
-  - **Deferred:** (a) the in-app stable field-name **constants module + automated
-    contract test** (field names are currently inline at the emission sites — a
-    rename would not fail CI); (b) the **Grafana dashboard JSON**. Both are
-    cluster-side / hardening follow-ons, not blockers for the alertable-fields goal.
+- [x] **Unit 6: Recording + alert rules, dashboard, and a field-name contract test** _(complete — 0.15.0 + 0.16.0)_
+  - 0.15.0: the field contract + example LogQL recording rules + Prometheus alert
+    rules (ReceiptLedgerNoProgress, ReviewPileup, BalanceMismatch, RunFailing) in
+    `docs/observability/README.md`.
+  - 0.16.0: the in-app field-name **constants module** (`src/obs_fields.rs`) + an
+    automated **contract test** (`tests/obs_field_contract.rs`, exact-equality — a
+    rename/stray field now fails CI) + the **Grafana dashboard JSON**
+    (`docs/observability/dashboard.json`).
+  - Still cluster-side (operator): applying the recording/alert rules to Mimir +
+    Alertmanager and importing the dashboard — until then the fields are queryable
+    but nothing pages.
 
 **Goal:** Close the loop to a *working* alert (not just emitted fields), and prevent
 silent field-name drift from breaking alerts. Promoted from optional → **required**:
@@ -437,7 +440,19 @@ defer.
 
 ### Phase 2 — traces (value-gated; deferred)
 
-- [ ] **Unit 7 (Phase 2, gated): OTLP traces to Tempo + `trace_id` in logs**
+- [x] **Unit 7 (Phase 2, gated): OTLP traces to Tempo + `trace_id` in logs** _(shipped 0.16.0)_
+  - Per-run span tree (`run` → `fetch`/`model_selection`/`process`→`extract`,
+    `statement`→`decrypt`/`parse`/`reconcile_book`) over OTLP/HTTP (JSON), reusing
+    the existing reqwest/rustls stack (no tonic/gRPC, no new C deps; binary +~335 KB).
+  - **Runtime-gated OFF** by default — exports only when `OTEL_EXPORTER_OTLP_ENDPOINT`
+    is set. `trace_id` recorded on the root span (renders under `spans[]` in the JSON
+    log → Loki `spans_0_trace_id`; documented). No-PII span allowlist + contract test.
+  - Flush-on-exit is bounded (3s) and **`main` hard-exits via `std::process::exit`**
+    so a half-open collector can't delay termination (ce:review P1 fix).
+  - **Not enabled in the fleet manifest** — the operator sets the OTLP endpoint when
+    Tempo ingest is verified. The original value-gate ("don't build until a real
+    incident") was overridden by explicit user request; it ships off-by-default so the
+    gate effectively moves to runtime-enable.
 
 **Goal:** Per-run span tree exported to Tempo, with Loki↔Tempo correlation.
 
