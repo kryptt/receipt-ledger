@@ -91,6 +91,12 @@ pub struct StatementReport {
     /// whole message in INBOX so the next run retries it (already-booked rows
     /// dedup via their `bpstmt:` external_id).
     pub deferred: usize,
+    /// Correctness signal: the worst-case closing-balance delta across the
+    /// statement's sections (`|BALANCE ANTERIOR + Σcharges − Σpayments − BALANCE
+    /// TOTAL|`). `None` means the check did not run (a section lacked the balances)
+    /// — distinct from `Some(0)` (checked and reconciled), so a "booked but doesn't
+    /// reconcile" alert never mistakes "not checked" for "fine".
+    pub balance_delta: Option<Decimal>,
 }
 
 impl StatementReport {
@@ -241,7 +247,27 @@ pub async fn process_statement(
         check_balance(section, &charges, &payments, &mut report);
     }
 
-    info!(?report, "statement reconciliation complete");
+    // Canonical structured statement event — explicit named fields (NOT `?report`,
+    // which under JSON logging serializes as one opaque Debug string LogQL can't
+    // field-query). `balance_checked` distinguishes Some(0) from "not checked".
+    let balance_delta_str = report
+        .balance_delta
+        .map(|d| d.normalize().to_string())
+        .unwrap_or_else(|| "absent".to_string());
+    info!(
+        reconciled = report.reconciled,
+        booked_new = report.booked_new,
+        payments_booked = report.payments_booked,
+        amount_mismatch = report.amount_mismatch,
+        corrected = report.corrected,
+        unmatched_booked = report.unmatched_booked,
+        balance_mismatch = report.balance_mismatch,
+        deferred = report.deferred,
+        review = report.review,
+        balance_checked = report.balance_delta.is_some(),
+        balance_delta = %balance_delta_str,
+        "statement reconciliation complete"
+    );
     Ok(report)
 }
 
@@ -265,6 +291,9 @@ fn check_balance(
     let sum_payments: Decimal = payments.iter().map(|p| p.money.amount.value()).sum();
     let computed = anterior + sum_charges - sum_payments;
     let delta = (computed - stated).abs();
+    // Record the worst-case delta across sections (None → Some(delta), else max),
+    // so the correctness signal reflects the least-reconciled section.
+    report.balance_delta = Some(report.balance_delta.map_or(delta, |d| d.max(delta)));
     // Tight tolerance: surface any real discrepancy (missed row / unmodeled
     // fee or interest) for a human to read, especially during dry-run.
     let tolerance = Decimal::new(1, 2); // 0.01
@@ -588,5 +617,40 @@ mod tests {
             }
             .is_clean()
         );
+    }
+
+    #[test]
+    fn check_balance_records_delta_and_distinguishes_absent() {
+        use crate::statement::{Last4, Section};
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        fn section(anterior: Option<&str>, total: Option<&str>) -> Section {
+            Section {
+                currency: SectionCurrency::Usd,
+                primary_last4: Last4::parse("7524").unwrap(),
+                cut_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 22).unwrap(),
+                balance_anterior: anterior.map(|s| Decimal::from_str(s).unwrap()),
+                balance_total: total.map(|s| Decimal::from_str(s).unwrap()),
+            }
+        }
+
+        // Reconciling (anterior == total, no charges) → Some(0), no mismatch flag.
+        let mut r = StatementReport::default();
+        check_balance(&section(Some("100.00"), Some("100.00")), &[], &[], &mut r);
+        assert_eq!(r.balance_delta, Some(Decimal::ZERO));
+        assert_eq!(r.balance_mismatch, 0);
+
+        // Not reconciling (100 → stated 130) → Some(30) + the mismatch flag fires.
+        let mut r2 = StatementReport::default();
+        check_balance(&section(Some("100.00"), Some("130.00")), &[], &[], &mut r2);
+        assert_eq!(r2.balance_delta, Some(Decimal::from(30)));
+        assert_eq!(r2.balance_mismatch, 1);
+
+        // Balances absent → delta stays None (checked ≠ reconciled).
+        let mut r3 = StatementReport::default();
+        check_balance(&section(None, None), &[], &[], &mut r3);
+        assert_eq!(r3.balance_delta, None);
+        assert_eq!(r3.balance_mismatch, 0);
     }
 }
