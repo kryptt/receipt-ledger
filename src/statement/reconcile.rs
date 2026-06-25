@@ -232,7 +232,16 @@ pub fn reconcile(
     let charges_out = charges
         .iter()
         .zip(outcome)
-        .map(|(c, o)| (c.reference.clone(), o.expect("every charge decided")))
+        // Passes 1–2c are expected to decide every charge; a leftover `None`
+        // would be a reconciler logic bug. Rather than panic and sink the whole
+        // statement, route the undecided charge to Review so the run continues
+        // and a human sees it.
+        .map(|(c, o)| {
+            let decided = o.unwrap_or_else(|| ChargeOutcome::Review {
+                reason: "reconciler left charge undecided (internal invariant violated)".to_string(),
+            });
+            (c.reference.clone(), decided)
+        })
         .collect();
     let unmatched_journals = journals
         .iter()

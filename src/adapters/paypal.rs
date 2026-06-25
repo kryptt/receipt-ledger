@@ -215,8 +215,7 @@ PayPal email:
         let Some(usd) = usd_transaction_total(body) else {
             return Ok(Outcome::Transaction(records));
         };
-        let usd_currency =
-            crate::schema::Currency::parse("USD").expect("USD is a valid 3-letter ISO code");
+        let usd_currency = crate::schema::Currency::from_static("USD");
         // Transform-and-return: rebuild each record with the USD money rather
         // than mutating in place.
         let refined = records

@@ -49,10 +49,13 @@ pub fn composite_hash(record: &Extracted) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
-        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap());
+        // Each nibble is in 0..=15, so indexing HEX is always in bounds —
+        // no fallible step to unwrap.
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
     }
     s
 }

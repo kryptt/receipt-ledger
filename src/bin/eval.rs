@@ -19,6 +19,8 @@
 //!   (default `gemma4:e2b,gemma4:e4b,qwen3.6-low,qwen3.6-medium`).
 //! Ollama URL: `RECEIPT_OLLAMA_URL` (default the in-cluster router).
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

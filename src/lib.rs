@@ -4,6 +4,8 @@
 //! lives here so integration tests in `tests/` can exercise the deterministic
 //! core (schema, unwrap, adapters, validate, dedup) directly.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 pub mod adapters;
 pub mod config;
 pub mod dedup;

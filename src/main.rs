@@ -12,6 +12,8 @@
 //! logic lives in the library crate ([`receipt_ledger::run`]); this binary is a
 //! thin shell that wires logging, the crypto provider, and the exit code.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use tracing::error;
 use tracing_subscriber::EnvFilter;
 
