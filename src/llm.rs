@@ -73,7 +73,7 @@ fn classify_status(status: reqwest::StatusCode, msg: String) -> LlmError {
 /// A thin wrapper over the chat-completions endpoint.
 pub struct LlmClient<'a> {
     http: &'a Client,
-    /// OpenAI-compatible base, e.g. `http://ollama-router.ai:11434/v1`.
+    /// OpenAI-compatible base, e.g. `http://localhost:11434/v1`.
     base_url: String,
     model: String,
     /// Per-request timeout, applied only to the chat-completions call so a slow

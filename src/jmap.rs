@@ -358,8 +358,8 @@ mod tests {
     #[test]
     fn host_extraction() {
         assert_eq!(
-            host_of("http://stalwart.system.svc.cluster.local:8080"),
-            vec!["stalwart.system.svc.cluster.local".to_string()]
+            host_of("http://jmap.internal.example:8080"),
+            vec!["jmap.internal.example".to_string()]
         );
         assert_eq!(
             host_of("https://mail.example.com/jmap"),

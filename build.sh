@@ -1,14 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-REGISTRY=registry.hr-home.xyz
+REGISTRY="${REGISTRY:-ghcr.io}"
 OWNER=kryptt
 APP=receipt-ledger
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-# Local-dev push target. Namespaced under $OWNER to mirror the GHCR path
-# (ghcr.io/$OWNER/$APP) and the pull-through cache path
-# (ghcr.hr-home.xyz/$OWNER/$APP) used for production deploys.
+# Push target, namespaced under $OWNER (e.g. ghcr.io/$OWNER/$APP).
+# Override $REGISTRY to push to a different registry.
 IMG=$REGISTRY/$OWNER/$APP:$VERSION
 
 if docker manifest inspect "$IMG" &>/dev/null; then

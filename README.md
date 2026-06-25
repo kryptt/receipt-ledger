@@ -157,7 +157,7 @@ and a missing required value fails loudly.
 
 | Variable | Default | Notes |
 |---|---|---|
-| `RECEIPT_JMAP_URL` | `http://stalwart.system.svc.cluster.local:8080` | JMAP base; session discovered at `/.well-known/jmap`. |
+| `RECEIPT_JMAP_URL` | `http://localhost:8080` | JMAP base; session discovered at `/.well-known/jmap`. |
 | `RECEIPT_JMAP_USER` | `ledger@example.test` | Basic-auth user. |
 | `RECEIPT_JMAP_PASSWORD` | — (required) | Basic-auth password. |
 | `RECEIPT_STATE_PATH` | `/state/jmap.state` | Persisted `Email/changes` cursor (mount a volume so runs are incremental). |
@@ -165,7 +165,7 @@ and a missing required value fails loudly.
 | `RECEIPT_LOG_FORMAT` | `json` | Log output format: `json` (Loki/LogQL-friendly, the default) or `text`/`plain`/`compact` (readable local dev). See [`docs/observability/`](docs/observability/) for the log-derived metrics + alerts. |
 | `RECEIPT_LOG_PII` | `false` | When off (default), per-row financial detail (merchant/amount) is suppressed from logs **regardless of `RUST_LOG`/dry-run**, so a misconfig can't ship PII to Loki. Set `true` to observe a statement cycle's full plan. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — (unset → off) | Unset/blank (default) → logs only: no trace export, no exporter/provider, no per-run cost. Set to an OTLP/HTTP endpoint (e.g. `http://<tempo-distributor>.<ns>:4318`, the binary appends `/v1/traces`) → a per-run span tree is exported to Tempo so a Loki line links to its trace. Export is bounded (3s) and strictly additive — it never delays or fails the run, nor flips the exit code. See [`docs/observability/README.md#traces`](docs/observability/README.md#traces). |
-| `RECEIPT_OLLAMA_URL` | `http://ollama-router.ai:11434/v1` | OpenAI-compatible base. |
+| `RECEIPT_OLLAMA_URL` | `http://localhost:11434/v1` | OpenAI-compatible base. |
 | `RECEIPT_MODEL_ALLOWLIST` | `gemma4:e2b` | Comma-separated, priority order. The highest-priority *loaded* model is used (avoids cold-loads); the first is loaded on demand as a fallback. |
 | `RECEIPT_LLM_TIMEOUT_SECS` | `600` | Per-request timeout for the extraction call. |
 | `RECEIPT_FIREFLY_URL` | `http://firefly:8080` | Firefly III base. |
@@ -267,20 +267,17 @@ git tag X.Y.Z                      # bare semver, no 'v' prefix
 git push origin <branch> X.Y.Z     # the tag push triggers release.yml
 ```
 
-**Deploy (roll the image onto the cluster).** The service runs as the hourly
-`receipt-ledger` CronJob in the `home` namespace, managed by Fleet from the
-`hr-fleet` repo. Bump the image tag in `fleet/home/receipt-ledger.yaml`, validate,
-and push — Fleet reconciles it onto the cluster.
+**Deploy.** The image is designed to run as a scheduled one-shot (e.g. a
+Kubernetes CronJob or a cron-driven `docker run`) that fetches new mail, books
+transactions, and exits. Pull the released image and run it with the environment
+variables above; mount a volume at `RECEIPT_STATE_PATH` so runs are incremental.
 
 ```bash
-# in the hr-fleet checkout
-#   edit fleet/home/receipt-ledger.yaml: image: ghcr.io/kryptt/receipt-ledger:X.Y.Z
-scripts/validate-manifests.sh
-git commit -am "receipt-ledger: X.Y.Z" && git push
+docker pull ghcr.io/kryptt/receipt-ledger:X.Y.Z
 ```
 
 New behavior takes effect on the next scheduled run. A bad image is rolled back by
-reverting the manifest bump (the prior tag's image is immutable in ghcr).
+pinning back to the prior tag (released image tags are immutable).
 
 ## License
 

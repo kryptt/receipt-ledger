@@ -615,7 +615,7 @@ mod tests {
     fn pdf_with_cuenta_subject_is_statement() {
         let m = msg(
             "Fwd: Cuenta: ****-****-****-7524 | Fecha: 22/05/2026",
-            "rhansen@kitsd.com",
+            "sender@example.com",
             vec![pdf_att()],
         );
         assert_eq!(classify_message(&m, None), Ingest::Statement);
@@ -623,24 +623,27 @@ mod tests {
 
     #[test]
     fn pdf_from_configured_sender_is_statement() {
-        let m = msg("monthly", "rhansen@kitsd.com", vec![pdf_att()]);
-        assert_eq!(classify_message(&m, Some("kitsd.com")), Ingest::Statement);
+        let m = msg("monthly", "sender@bank.example.com", vec![pdf_att()]);
+        assert_eq!(
+            classify_message(&m, Some("bank.example.com")),
+            Ingest::Statement
+        );
     }
 
     #[test]
     fn pdf_without_marker_is_notification() {
         let m = msg("here is a receipt", "someone@example.com", vec![pdf_att()]);
         assert_eq!(
-            classify_message(&m, Some("kitsd.com")),
+            classify_message(&m, Some("bank.example.com")),
             Ingest::Notification
         );
     }
 
     #[test]
     fn no_pdf_is_notification_even_with_cuenta_subject() {
-        let m = msg("Cuenta: 123", "rhansen@kitsd.com", vec![other_att()]);
+        let m = msg("Cuenta: 123", "sender@bank.example.com", vec![other_att()]);
         assert_eq!(
-            classify_message(&m, Some("kitsd.com")),
+            classify_message(&m, Some("bank.example.com")),
             Ingest::Notification
         );
     }

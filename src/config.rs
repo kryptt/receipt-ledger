@@ -17,9 +17,9 @@ use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
-/// Default JMAP base URL — the in-cluster Stalwart ClusterIP service. The
-/// macvlan `mail.hr-home.xyz` is not reachable from ordinary pods.
-const DEFAULT_JMAP_URL: &str = "http://stalwart.system.svc.cluster.local:8080";
+/// Default JMAP base URL. Override `RECEIPT_JMAP_URL` to point at your own
+/// JMAP server (e.g. an in-cluster ClusterIP service).
+const DEFAULT_JMAP_URL: &str = "http://localhost:8080";
 const DEFAULT_JMAP_USER: &str = "ledger@example.test";
 const DEFAULT_STATE_PATH: &str = "/state/jmap.state";
 /// Persistent FX-rate cache, on the same `/state` volume as the JMAP cursor so
@@ -27,7 +27,7 @@ const DEFAULT_STATE_PATH: &str = "/state/jmap.state";
 /// the INBOX for many cycles reuse already-fetched rates instead of re-hitting
 /// Frankfurter / the rate-limited Banco Popular `consultaTasa` every run.
 const DEFAULT_FX_CACHE_PATH: &str = "/state/fx-cache.json";
-const DEFAULT_OLLAMA_URL: &str = "http://ollama-router.ai:11434/v1";
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_MODEL_ALLOWLIST: &str = "gemma4:e2b";
 /// LLM chat-completions request timeout, in seconds. Generous because a cold
 /// reasoning model on slow hardware (e.g. ternary-bonsai-8b on Strix Halo) can

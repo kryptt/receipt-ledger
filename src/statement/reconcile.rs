@@ -238,7 +238,8 @@ pub fn reconcile(
         // and a human sees it.
         .map(|(c, o)| {
             let decided = o.unwrap_or_else(|| ChargeOutcome::Review {
-                reason: "reconciler left charge undecided (internal invariant violated)".to_string(),
+                reason: "reconciler left charge undecided (internal invariant violated)"
+                    .to_string(),
             });
             (c.reference.clone(), decided)
         })

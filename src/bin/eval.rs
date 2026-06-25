@@ -34,7 +34,7 @@ use receipt_ledger::unwrap;
 use receipt_ledger::validate::{Verdict, validate};
 
 const DEFAULT_MODELS: &str = "gemma4:e2b,gemma4:e4b,qwen3.6-low,qwen3.6-medium";
-const DEFAULT_OLLAMA_URL: &str = "http://ollama-router.ai:11434/v1";
+const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/v1";
 /// Per-request timeout for an extraction call. Generous: a cold model on slow
 /// hardware can take a while for the first request of a run.
 const EVAL_TIMEOUT: Duration = Duration::from_secs(600);
