@@ -13,7 +13,6 @@
 //! (auth, redirect-following to `/jmap/session`) are handled by the crate.
 
 use std::fs;
-use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use jmap_client::client::{Client, Credentials};
@@ -86,15 +85,18 @@ impl Mailbox {
             .await
             .context("connecting to JMAP session")?;
 
-        let inbox_id = mailbox_id_by_role(&client, Role::Inbox)
-            .await?
-            .ok_or_else(|| anyhow!("no INBOX mailbox found"))?;
-        let processed_id = mailbox_id_by_name(&client, &cfg.processed_mailbox)
-            .await?
-            .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.processed_mailbox))?;
-        let review_id = mailbox_id_by_name(&client, &cfg.review_mailbox)
-            .await?
-            .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.review_mailbox))?;
+        let inbox_id =
+            first_mailbox(&client, mailbox::query::Filter::role(Role::Inbox), "role")
+                .await?
+                .ok_or_else(|| anyhow!("no INBOX mailbox found"))?;
+        let processed_id =
+            first_mailbox(&client, mailbox::query::Filter::name(&cfg.processed_mailbox), "name")
+                .await?
+                .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.processed_mailbox))?;
+        let review_id =
+            first_mailbox(&client, mailbox::query::Filter::name(&cfg.review_mailbox), "name")
+                .await?
+                .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.review_mailbox))?;
 
         info!(%inbox_id, %processed_id, %review_id, "resolved mailboxes");
         Ok(Self {
@@ -300,19 +302,15 @@ fn decoded_text(email: &jmap_client::email::Email) -> String {
     out
 }
 
-async fn mailbox_id_by_role(client: &Client, role: Role) -> Result<Option<String>> {
+async fn first_mailbox(
+    client: &Client,
+    filter: mailbox::query::Filter,
+    label: &str,
+) -> Result<Option<String>> {
     let mut q = client
-        .mailbox_query(mailbox::query::Filter::role(role).into(), None::<Vec<_>>)
+        .mailbox_query(filter.into(), None::<Vec<_>>)
         .await
-        .context("Mailbox/query by role")?;
-    Ok(q.take_ids().into_iter().next())
-}
-
-async fn mailbox_id_by_name(client: &Client, name: &str) -> Result<Option<String>> {
-    let mut q = client
-        .mailbox_query(mailbox::query::Filter::name(name).into(), None::<Vec<_>>)
-        .await
-        .context("Mailbox/query by name")?;
+        .with_context(|| format!("Mailbox/query by {label}"))?;
     Ok(q.take_ids().into_iter().next())
 }
 
@@ -333,20 +331,15 @@ fn host_of(url: &str) -> Vec<String> {
 
 /// Load the persisted JMAP state cursor, if the file exists and is non-empty.
 pub fn load_state(path: &str) -> Option<String> {
-    match fs::read_to_string(path) {
-        Ok(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        _ => None,
-    }
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Persist the JMAP state cursor, creating the parent directory if needed.
 pub fn save_state(path: &str, state: &str) -> Result<()> {
-    if let Some(parent) = Path::new(path).parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating state dir {}", parent.display()))?;
-    }
+    crate::config::ensure_parent_dir(path, "state")?;
     fs::write(path, state).with_context(|| format!("writing state file {path}"))?;
     Ok(())
 }

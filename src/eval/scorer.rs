@@ -329,14 +329,21 @@ fn canon_currency(s: &str) -> String {
     s.trim().to_ascii_uppercase()
 }
 
-/// Canonicalize a merchant for comparison: trim + lower-case + collapse internal
-/// whitespace runs. Models vary on casing and spacing of the same name; the
+/// Collapse runs of whitespace into single spaces and trim leading/trailing.
+///
+/// Shared primitive for merchant canonicalization: both [`canon_merchant`]
+/// (eval scoring) and the statement parser's cell-join step use this so the
+/// whitespace-collapse logic has exactly one implementation.
+pub(crate) fn collapse_whitespace(s: &str) -> String {
+    let parts: Vec<_> = s.split_whitespace().collect();
+    parts.join(" ")
+}
+
+/// Canonicalize a merchant for comparison: collapse internal whitespace runs +
+/// ASCII lower-case. Models vary on casing and spacing of the same name; the
 /// extraction is "correct" if it names the same merchant.
 pub(crate) fn canon_merchant(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_ascii_lowercase()
+    collapse_whitespace(s).to_ascii_lowercase()
 }
 
 /// Parse an expected/produced amount string into a [`Decimal`] for value
@@ -354,14 +361,11 @@ pub(crate) fn parse_amount(s: &str) -> anyhow::Result<Decimal> {
         .map_err(|e| anyhow::anyhow!("amount {s:?} not a decimal: {e}"))
 }
 
+// -- field-level scoring + projection unit tests --
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{dec, money};
     use super::*;
-    use std::str::FromStr;
-
-    fn dec(s: &str) -> Decimal {
-        Decimal::from_str(s).unwrap()
-    }
 
     /// A fully-correct transaction projection.
     fn tx() -> Produced {
@@ -377,12 +381,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn identical_projections_score_all_correct() {
-        let s = score(&tx(), &tx());
+    /// Score `tx()` against a modified copy where one field has been replaced.
+    /// Returns the full [`FieldScores`] so the caller can assert on any field.
+    fn score_with_override(mutate: impl FnOnce(&mut Produced)) -> FieldScores {
+        let expected = tx();
+        let mut produced = tx();
+        mutate(&mut produced);
+        score(&expected, &produced)
+    }
+
+    /// Assert every field in a [`FieldScores`] is [`FieldScore::Correct`].
+    fn assert_all_correct(s: &FieldScores) {
         for (name, fs) in s.iter() {
             assert_eq!(fs, FieldScore::Correct, "{name} should be Correct");
         }
+    }
+
+    #[test]
+    fn identical_projections_score_all_correct() {
+        assert_all_correct(&score(&tx(), &tx()));
     }
 
     #[test]
@@ -397,10 +414,7 @@ mod tests {
 
     #[test]
     fn wrong_currency_scores_wrong_but_others_correct() {
-        let expected = tx();
-        let mut produced = tx();
-        produced.currency = Some("USD".to_string());
-        let s = score(&expected, &produced);
+        let s = score_with_override(|p| p.currency = Some("USD".to_string()));
         assert_eq!(s.currency, FieldScore::Wrong);
         assert_eq!(s.amount, FieldScore::Correct);
         assert_eq!(s.kind, FieldScore::Correct);
@@ -408,17 +422,18 @@ mod tests {
 
     #[test]
     fn missing_produced_field_is_wrong() {
-        let expected = tx();
-        let mut produced = tx();
-        produced.merchant = None;
-        assert_eq!(score(&expected, &produced).merchant, FieldScore::Wrong);
+        assert_eq!(
+            score_with_override(|p| p.merchant = None).merchant,
+            FieldScore::Wrong
+        );
     }
 
     #[test]
     fn non_transaction_expected_makes_tx_fields_not_applicable() {
-        let expected = Produced::not_a_transaction();
-        let produced = Produced::not_a_transaction();
-        let s = score(&expected, &produced);
+        let s = score(
+            &Produced::not_a_transaction(),
+            &Produced::not_a_transaction(),
+        );
         assert_eq!(s.kind, FieldScore::Correct);
         for (name, fs) in s.iter() {
             if name != "kind" {
@@ -430,9 +445,7 @@ mod tests {
     #[test]
     fn pipeline_hallucinated_a_transaction_fails_kind_only() {
         // Expected: not a transaction. Produced: extracted one anyway.
-        let expected = Produced::not_a_transaction();
-        let produced = tx();
-        let s = score(&expected, &produced);
+        let s = score(&Produced::not_a_transaction(), &tx());
         assert_eq!(
             s.kind,
             FieldScore::Wrong,
@@ -445,9 +458,7 @@ mod tests {
     #[test]
     fn pipeline_missed_a_transaction_fails_kind() {
         // Expected: a transaction. Produced: classified as non-transaction.
-        let expected = tx();
-        let produced = Produced::not_a_transaction();
-        let s = score(&expected, &produced);
+        let s = score(&tx(), &Produced::not_a_transaction());
         assert_eq!(s.kind, FieldScore::Wrong);
         // The expected transaction fields are present, produced are None → Wrong.
         assert_eq!(s.amount, FieldScore::Wrong);
@@ -458,20 +469,17 @@ mod tests {
     fn routed_account_not_applicable_when_label_omits_it() {
         let mut expected = tx();
         expected.routed_account = None;
-        let produced = tx();
         assert_eq!(
-            score(&expected, &produced).routed_account,
+            score(&expected, &tx()).routed_account,
             FieldScore::NotApplicable
         );
     }
 
     #[test]
     fn wrong_routed_account_scores_wrong() {
-        let expected = tx();
-        let mut produced = tx();
-        produced.routed_account = Some(RoutedAccount::PaypalCredit);
         assert_eq!(
-            score(&expected, &produced).routed_account,
+            score_with_override(|p| p.routed_account = Some(RoutedAccount::PaypalCredit))
+                .routed_account,
             FieldScore::Wrong
         );
     }
@@ -499,37 +507,34 @@ mod tests {
         assert_eq!(parse_amount("  149.99 ").unwrap(), dec("149.99"));
     }
 
-    use crate::schema::{Amount, Currency, Money};
-
     fn paypal_record(hint: Option<&str>, currency: &str) -> Extracted {
+        // Eval scorer test fixture: a synthetic PayPal purchase record.
+        let paypal_money = money("10.00", currency);
         Extracted {
             source: Source::Paypal,
             external_id: Some("X".to_string()),
-            money: Money::new(
-                Amount::parse("10.00").unwrap(),
-                Currency::parse(currency).unwrap(),
-            ),
+            money: paypal_money,
             direction: Direction::Out,
             date: NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
             merchant: "Shop".to_string(),
             account_hint: hint.map(str::to_string),
-            status: "approved".to_string(),
+            status: "approved".into(),
             raw_ref: "X".to_string(),
         }
     }
 
     fn banco_record(currency: &str) -> Extracted {
+        // Eval scorer test fixture: a synthetic BPD consumo record.
+        let banco_date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
+        let banco_money = money("25.00", currency);
         Extracted {
             source: Source::BancoPopular,
+            money: banco_money,
             external_id: None,
-            money: Money::new(
-                Amount::parse("10.00").unwrap(),
-                Currency::parse(currency).unwrap(),
-            ),
             direction: Direction::Out,
-            date: NaiveDate::from_ymd_opt(2026, 5, 27).unwrap(),
+            date: banco_date,
             merchant: "Tienda".to_string(),
-            account_hint: Some("4417".to_string()),
+            account_hint: Some("4417".into()),
             status: "Aprobada".to_string(),
             raw_ref: String::new(),
         }
@@ -541,10 +546,8 @@ mod tests {
             routed_account_of(&paypal_record(Some("Balance"), "USD")),
             RoutedAccount::PaypalBalance
         );
-        assert_eq!(
-            routed_account_of(&paypal_record(None, "EUR")),
-            RoutedAccount::PaypalBalance
-        );
+        let no_hint_eur = routed_account_of(&paypal_record(None, "EUR"));
+        assert_eq!(no_hint_eur, RoutedAccount::PaypalBalance);
         assert_eq!(
             routed_account_of(&paypal_record(Some("Pay in 4"), "USD")),
             RoutedAccount::PaypalCredit
@@ -576,42 +579,46 @@ mod tests {
         assert_eq!(p.merchant.as_deref(), Some("tienda"));
     }
 
-    #[test]
-    fn from_record_then_score_against_matching_label_is_all_correct() {
-        let rec = paypal_record(Some("Pay in 4"), "USD");
-        let produced = Produced::from_record(&rec);
-        let expected = Expected {
+    /// Build a transaction [`Expected`] with the given overrides. Fields not
+    /// overridden default to the paypal_record fixture's values.
+    fn expected_tx(
+        amount: &str,
+        currency: &str,
+        merchant: &str,
+        routed: RoutedAccount,
+    ) -> Expected {
+        Expected {
             from: "x".to_string(),
             kind: Kind::Transaction,
-            amount: Some("10.00".to_string()),
-            currency: Some("USD".to_string()),
+            amount: Some(amount.to_string()),
+            currency: Some(currency.to_string()),
             direction: Some(Direction::Out),
             date: NaiveDate::from_ymd_opt(2026, 5, 11),
-            merchant: Some("Shop".to_string()),
+            merchant: Some(merchant.to_string()),
             status: Some(StatusClass::Approved),
-            routed_account: Some(RoutedAccount::PaypalCredit),
-        };
-        let expected = Produced::from_expected(&expected).unwrap();
-        let s = score(&expected, &produced);
-        for (name, fs) in s.iter() {
-            assert_eq!(fs, FieldScore::Correct, "{name} should be Correct");
+            routed_account: Some(routed),
         }
     }
 
     #[test]
+    fn from_record_then_score_against_matching_label_is_all_correct() {
+        let rec = paypal_record(Some("Pay in 4"), "USD");
+        let produced = Produced::from_record(&rec);
+        let expected =
+            Produced::from_expected(&expected_tx("10.00", "USD", "Shop", RoutedAccount::PaypalCredit))
+                .unwrap();
+        assert_all_correct(&score(&expected, &produced));
+    }
+
+    #[test]
     fn from_expected_canonicalizes() {
-        let e = Expected {
-            from: "x".to_string(),
-            kind: Kind::Transaction,
-            amount: Some("1.50".to_string()),
-            currency: Some("eur".to_string()),
-            direction: Some(Direction::Out),
-            date: NaiveDate::from_ymd_opt(2026, 5, 11),
-            merchant: Some("  Shop  Name ".to_string()),
-            status: Some(StatusClass::Approved),
-            routed_account: Some(RoutedAccount::PaypalBalance),
-        };
-        let p = Produced::from_expected(&e).unwrap();
+        let p = Produced::from_expected(&expected_tx(
+            "1.50",
+            "eur",
+            "  Shop  Name ",
+            RoutedAccount::PaypalBalance,
+        ))
+        .unwrap();
         assert_eq!(p.amount, Some(dec("1.5")));
         assert_eq!(p.currency.as_deref(), Some("EUR"));
         assert_eq!(p.merchant.as_deref(), Some("shop name"));

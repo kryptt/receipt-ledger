@@ -89,16 +89,19 @@ async fn probe(
     Ok(parse(&body))
 }
 
-/// Parse `{"models":[{"name":"gemma4:e2b", ...}]}` (ollama `/api/ps`).
-fn parse_ollama_ps(body: &Value) -> HashSet<String> {
-    body.get("models")
+/// Extract model names from a JSON array nested under `key`.
+///
+/// `fields` is a list of field names tried in order on each element; the first
+/// one that resolves to a string wins.
+fn collect_model_names(body: &Value, key: &str, fields: &[&str]) -> HashSet<String> {
+    body.get(key)
         .and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
                 .filter_map(|m| {
-                    m.get("name")
-                        .or_else(|| m.get("model"))
-                        .and_then(Value::as_str)
+                    fields
+                        .iter()
+                        .find_map(|f| m.get(*f).and_then(Value::as_str))
                         .map(str::to_string)
                 })
                 .collect()
@@ -106,16 +109,14 @@ fn parse_ollama_ps(body: &Value) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+/// Parse `{"models":[{"name":"gemma4:e2b", ...}]}` (ollama `/api/ps`).
+fn parse_ollama_ps(body: &Value) -> HashSet<String> {
+    collect_model_names(body, "models", &["name", "model"])
+}
+
 /// Parse `{"data":[{"id":"gemma4:e2b"}]}` (OpenAI `/models`).
 fn parse_openai_models(body: &Value) -> HashSet<String> {
-    body.get("data")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
+    collect_model_names(body, "data", &["id"])
 }
 
 #[cfg(test)]

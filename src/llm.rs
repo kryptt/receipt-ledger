@@ -6,7 +6,6 @@
 //! `postprocess`. The client itself does no validation of the *contents* —
 //! that is the validation gate's job.
 
-use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -15,60 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
-/// An extraction-call failure, classified by whether retrying could help.
-///
-/// `Transient` (the router unreachable — a connect/timeout/network error — or a
-/// 5xx / 408 / 429 response) means ollama-router is momentarily down, typically
-/// mid-restart: the caller should *defer* (leave the message in the INBOX and
-/// retry on the next run) rather than burning a real receipt to Review. This is
-/// the fix for the Review pile-up where an ollama-router restart routed in-flight
-/// charges to Review instead of retrying them. `Permanent` (a 4xx other than
-/// 408/429, or a response the extractor cannot turn into JSON) will not improve
-/// on retry, so it routes to Review as before — a human should look at a model
-/// that answered but produced no usable object.
-///
-/// Mirrors [`crate::fx::RateError`] so both transient-provider paths behave
-/// identically: classify, then defer-or-review.
-#[derive(Debug, Clone)]
-pub enum LlmError {
-    Transient(String),
-    Permanent(String),
-}
-
-impl fmt::Display for LlmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LlmError::Transient(m) => write!(f, "transient LLM failure: {m}"),
-            LlmError::Permanent(m) => write!(f, "permanent LLM failure: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for LlmError {}
-
-/// Whether `err`'s chain carries an [`LlmError::Transient`] — i.e. the failure is
-/// a momentary ollama-router outage and the message should be deferred (kept in
-/// INBOX for the next run) rather than routed to Review. Walks the full `anyhow`
-/// chain so it survives `.context(...)` wrapping.
-#[must_use]
-pub fn is_transient(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|e| matches!(e.downcast_ref::<LlmError>(), Some(LlmError::Transient(_))))
-}
-
-/// Classify an HTTP status into an [`LlmError`] variant: server errors plus the
-/// retryable 408/429 are transient; every other non-success is permanent. Mirrors
-/// [`crate::fx`]'s status classification.
-fn classify_status(status: reqwest::StatusCode, msg: String) -> LlmError {
-    if status.is_server_error()
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-    {
-        LlmError::Transient(msg)
-    } else {
-        LlmError::Permanent(msg)
-    }
-}
+// An extraction-call failure, classified by whether retrying could help.
+// Transient = router unreachable / 5xx / 408 / 429 (defer + retry next run).
+// Permanent = other 4xx or non-JSON response (route to Review).
+// Mirrors crate::fx::RateError so both transient-provider paths behave identically.
+crate::transient::define_provider_error!(LlmError, "LLM");
 
 /// A thin wrapper over the chat-completions endpoint.
 pub struct LlmClient<'a> {
@@ -172,7 +122,7 @@ impl<'a> LlmClient<'a> {
             // Per-request override of the shared client's timeout: extraction on
             // a cold reasoning model can run for minutes.
             .timeout(self.timeout)
-            .send()
+            .send() // chat-completions POST
             .await
             .map_err(|e| {
                 anyhow::Error::new(LlmError::Transient(format!(
@@ -337,8 +287,11 @@ fn balanced_object_span(s: &str) -> Option<&str> {
     None
 }
 
+// -- llm unit tests (extraction + JSON parsing) --
 #[cfg(test)]
 mod tests {
+    use reqwest::StatusCode;
+
     use super::*;
     use crate::schema::Extracted;
 
@@ -346,15 +299,15 @@ mod tests {
     /// the extracted span actually deserializes into the typed schema.
     const RECEIPT_OBJECT: &str = r#"{
         "source": "paypal",
+        "date": "2026-05-11",
         "external_id": "8XY12345AB678901C",
+        "merchant": "Example Merchant B.V.",
         "amount": "1.00",
         "currency": "EUR",
         "direction": "out",
-        "date": "2026-05-11",
-        "merchant": "Example Merchant B.V.",
         "account_hint": "Pay in 4",
-        "status": "approved",
-        "raw_ref": "TESTORDER0123456"
+        "raw_ref": "TESTORDER0123456",
+        "status": "approved"
     }"#;
 
     fn assert_extracts_receipt(content: &str) {
@@ -413,19 +366,23 @@ mod tests {
         assert_eq!(balanced_object_span(s), Some(r#"{"a":{"b":1},"c":2}"#));
     }
 
+    /// Assert that the balanced-brace scanner returns the entire input
+    /// (i.e. recognises it as a single complete JSON object).
+    fn assert_span_is_identity(s: &str) {
+        assert_eq!(balanced_object_span(s), Some(s));
+    }
+
     // M2: a `}` inside a JSON string value must not truncate the object.
     #[test]
     fn balanced_scan_ignores_brace_inside_string() {
-        let s = r#"{"merchant":"Tasty } Burgers","amount":"1.00"}"#;
-        assert_eq!(balanced_object_span(s), Some(s));
+        assert_span_is_identity(r#"{"merchant":"Tasty } Burgers","amount":"1.00"}"#);
     }
 
     #[test]
     fn balanced_scan_honours_escaped_quote_in_string() {
         // An escaped quote must not end the string early, so the `}` after it
         // (still inside the string) does not truncate.
-        let s = r#"{"merchant":"He said \"hi} there\"","amount":"1.00"}"#;
-        assert_eq!(balanced_object_span(s), Some(s));
+        assert_span_is_identity(r#"{"merchant":"He said \"hi} there\"","amount":"1.00"}"#);
     }
 
     // M2: the string-brace case end-to-end through the extractor (with prose).
@@ -458,55 +415,28 @@ Done."#;
 
     // --- transient/permanent classification (defer vs Review) ------------
 
-    use reqwest::StatusCode;
+    crate::transient::define_classify_assertions!(classify_status, LlmError);
 
     #[test]
     fn classify_status_transient_vs_permanent() {
         // 5xx (router restarting / overloaded), 502/503/504, 429, 408 → transient.
         for code in [502u16, 503, 504, 500] {
-            assert!(
-                matches!(
-                    classify_status(StatusCode::from_u16(code).unwrap(), "x".into()),
-                    LlmError::Transient(_)
-                ),
-                "{code} should be transient"
-            );
+            assert_transient(StatusCode::from_u16(code).unwrap());
         }
-        assert!(matches!(
-            classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()),
-            LlmError::Transient(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()),
-            LlmError::Transient(_)
-        ));
+        assert_transient(StatusCode::TOO_MANY_REQUESTS);
+        assert_transient(StatusCode::REQUEST_TIMEOUT);
         // 404 (model not found), 401/403 (auth), 400 (bad request) → permanent → Review.
-        assert!(matches!(
-            classify_status(StatusCode::NOT_FOUND, "x".into()),
-            LlmError::Permanent(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::UNAUTHORIZED, "x".into()),
-            LlmError::Permanent(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::BAD_REQUEST, "x".into()),
-            LlmError::Permanent(_)
-        ));
+        assert_permanent(StatusCode::NOT_FOUND);
+        assert_permanent(StatusCode::UNAUTHORIZED);
+        assert_permanent(StatusCode::BAD_REQUEST); // llm endpoint classification
     }
 
     #[test]
     fn is_transient_walks_the_context_chain() {
-        // Survives `.context(...)` wrapping (the pipeline adds context).
-        let transient = anyhow!(LlmError::Transient("503".into())).context("LLM extraction");
-        assert!(is_transient(&transient));
-        let permanent = anyhow!(LlmError::Permanent("404".into())).context("LLM extraction");
-        assert!(!is_transient(&permanent));
-        // An unrelated error (e.g. a JSON-parse failure) is not transient → Review.
-        assert!(!is_transient(&anyhow!("could not locate a JSON object")));
+        crate::transient::assert_transient_chain!(is_transient, LlmError);
     }
 
-    // --- property tests --------------------------------------------------
+    // --- JSON span extraction properties -----------------------------------
 
     use proptest::prelude::*;
 

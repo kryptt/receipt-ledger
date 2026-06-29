@@ -28,69 +28,68 @@ use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{Layer, Registry};
 
-/// Per-event capture: maps a `tracing` message string to the set of field names
-/// observed on events carrying that message. Shared behind a `Mutex` so the
-/// layer (held by the subscriber) and the test body can both reach it.
-type Captured = Arc<Mutex<HashMap<String, HashSet<String>>>>;
-
-/// A `tracing` layer that records, for each event, the field names it emits —
-/// keyed by the event's `message` field. `tracing` records an event's message as
-/// a field literally named `message`, so we capture every field, pull `message`
-/// out as the key, and store the remaining field names as the contract set.
-struct CaptureLayer {
-    captured: Captured,
-}
-
 /// Visits an event's fields, collecting the message separately from the rest.
+/// Every field's stringified value is captured, so tests can assert both the
+/// field-name SET (via `field_names_for`) and specific serialized VALUES.
 #[derive(Default)]
-struct FieldVisitor {
+struct EventVisitor {
     message: Option<String>,
-    fields: HashSet<String>,
+    values: HashMap<String, String>,
 }
 
-impl Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+/// Generate `Visit::record_*` methods that store `value.to_string()` into
+/// `self.values`. All typed record methods (u64, i64, u128, i128, f64, bool)
+/// share this identical body — the macro avoids six clones.
+macro_rules! record_typed {
+    ($($method:ident($ty:ty)),* $(,)?) => {
+        $(fn $method(&mut self, field: &Field, value: $ty) {
+            self.values.insert(field.name().to_string(), value.to_string());
+        })*
+    };
+}
+
+impl EventVisitor {
+    /// Route a stringified value: if the field is `message`, stash it as the
+    /// event key; otherwise insert into the field-name→value map.
+    fn insert_or_message(&mut self, field: &Field, value: String) {
         if field.name() == "message" {
-            self.message = Some(format!("{value:?}"));
+            self.message = Some(value);
         } else {
-            self.fields.insert(field.name().to_string());
+            self.values.insert(field.name().to_string(), value);
         }
+    }
+}
+
+impl Visit for EventVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.insert_or_message(field, format!("{value:?}"));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
-        } else {
-            self.fields.insert(field.name().to_string());
-        }
+        self.insert_or_message(field, value.to_string());
     }
 
-    // The numeric/bool primitives bypass `record_debug`, so capture them too —
-    // otherwise the `run complete` / statement tallies (all `usize`/`bool`)
-    // would be silently dropped from the field set.
-    fn record_u64(&mut self, field: &Field, _value: u64) {
-        self.fields.insert(field.name().to_string());
+    record_typed! {
+        record_u64(u64),
+        record_i64(i64),
+        record_u128(u128),
+        record_i128(i128),
+        record_f64(f64),
+        record_bool(bool),
     }
+}
 
-    fn record_i64(&mut self, field: &Field, _value: i64) {
-        self.fields.insert(field.name().to_string());
-    }
+/// Per-event capture: maps a `tracing` message string to its field name→value
+/// map. Shared behind a `Mutex` so the layer (held by the subscriber) and the
+/// test body can both reach it.
+type Captured = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
 
-    fn record_u128(&mut self, field: &Field, _value: u128) {
-        self.fields.insert(field.name().to_string());
-    }
-
-    fn record_i128(&mut self, field: &Field, _value: i128) {
-        self.fields.insert(field.name().to_string());
-    }
-
-    fn record_f64(&mut self, field: &Field, _value: f64) {
-        self.fields.insert(field.name().to_string());
-    }
-
-    fn record_bool(&mut self, field: &Field, _value: bool) {
-        self.fields.insert(field.name().to_string());
-    }
+/// A `tracing` layer that records, for each event, the field names and values —
+/// keyed by the event's `message` field. `tracing` records an event's message as
+/// a field literally named `message`, so we capture every field, pull `message`
+/// out as the key, and store the remaining fields as the contract set.
+struct CaptureLayer {
+    captured: Captured,
 }
 
 impl<S> Layer<S> for CaptureLayer
@@ -98,7 +97,7 @@ where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut visitor = FieldVisitor::default();
+        let mut visitor = EventVisitor::default();
         event.record(&mut visitor);
         if let Some(message) = visitor.message {
             // A `None` Option field records nothing, so a non-review
@@ -109,14 +108,15 @@ where
                 .expect("capture mutex poisoned")
                 .entry(message)
                 .or_default()
-                .extend(visitor.fields);
+                .extend(visitor.values);
         }
     }
 }
 
 /// Run `body` with the capture layer installed as the (scoped) default
-/// subscriber, then return what it captured, keyed by event message.
-fn capture<F: FnOnce()>(body: F) -> HashMap<String, HashSet<String>> {
+/// subscriber, then return what it captured — field name→value maps keyed by
+/// event message.
+fn capture<F: FnOnce()>(body: F) -> HashMap<String, HashMap<String, String>> {
     let captured: Captured = Arc::new(Mutex::new(HashMap::new()));
     let subscriber = Registry::default().with(CaptureLayer {
         captured: Arc::clone(&captured),
@@ -128,15 +128,18 @@ fn capture<F: FnOnce()>(body: F) -> HashMap<String, HashSet<String>> {
         .expect("capture mutex poisoned")
 }
 
-/// The field-name set captured for `message`, or a clear failure if the event
-/// was never emitted.
-fn fields_for<'a>(
-    captured: &'a HashMap<String, HashSet<String>>,
+/// Extract the field-name set captured for `message`, or panic if the event was
+/// never emitted.
+fn field_names_for(
+    captured: &HashMap<String, HashMap<String, String>>,
     message: &str,
-) -> &'a HashSet<String> {
+) -> HashSet<String> {
     captured
         .get(message)
         .unwrap_or_else(|| panic!("event {message:?} was never emitted under the capture layer"))
+        .keys()
+        .cloned()
+        .collect()
 }
 
 /// `&[&str]` → owned `HashSet<String>` for set comparison.
@@ -148,8 +151,8 @@ fn expected(names: &[&str]) -> HashSet<String> {
 fn run_complete_emits_exactly_the_contract_fields() {
     let captured = capture(|| log_run_complete(&Summary::default()));
     assert_eq!(
-        fields_for(&captured, run_complete::MSG),
-        &expected(run_complete::ALL),
+        field_names_for(&captured, run_complete::MSG),
+        expected(run_complete::ALL),
         "run complete field set drifted from obs_fields::run_complete::ALL"
     );
 }
@@ -157,33 +160,39 @@ fn run_complete_emits_exactly_the_contract_fields() {
 #[test]
 fn message_outcome_non_review_omits_review_category() {
     let captured = capture(|| log_message_outcome("msg-1", "paypal", "booked", None));
-    let fields = fields_for(&captured, message_outcome::MSG);
+    let fields = field_names_for(&captured, message_outcome::MSG);
     // EXACT field-set equality: the always-present contract fields PLUS `id`
     // (always emitted for correlation; intentionally not in the queried contract).
     // A non-review outcome carries NO review category (a `None` Option records
     // nothing — the documented contract). Equality (not subset) means a stray
     // field — e.g. an accidental PII field — added to `log_message_outcome` now
     // fails CI instead of slipping through.
-    let mut want = expected(message_outcome::ALWAYS);
-    want.insert("id".to_string());
     assert_eq!(
-        fields, &want,
+        fields,
+        expected_with_id(message_outcome::ALWAYS, &[]),
         "non-review message outcome field set drifted; want exactly ALWAYS+id"
     );
+}
+
+/// Build the expected field set from `base` contract fields plus any `extra`
+/// slices, always including the `id` correlation field.
+fn expected_with_id(base: &[&str], extra: &[&str]) -> HashSet<String> {
+    let mut want = expected(base);
+    want.extend(extra.iter().map(|s| (*s).to_string()));
+    want.insert("id".to_string());
+    want
 }
 
 #[test]
 fn message_outcome_review_includes_review_category() {
     let captured =
         capture(|| log_message_outcome("msg-2", "paypal", "review", Some("over_ceiling")));
-    let fields = fields_for(&captured, message_outcome::MSG);
+    let fields = field_names_for(&captured, message_outcome::MSG);
     // EXACT field-set equality: ALWAYS + ON_REVIEW (review_reason_category) + `id`.
     // Any unlisted field added to `log_message_outcome` now fails CI.
-    let mut want = expected(message_outcome::ALWAYS);
-    want.extend(expected(message_outcome::ON_REVIEW));
-    want.insert("id".to_string());
     assert_eq!(
-        fields, &want,
+        fields,
+        expected_with_id(message_outcome::ALWAYS, message_outcome::ON_REVIEW),
         "review message outcome field set drifted; want exactly ALWAYS+ON_REVIEW+id"
     );
 }
@@ -192,85 +201,10 @@ fn message_outcome_review_includes_review_category() {
 fn statement_reconcile_emits_exactly_the_contract_fields() {
     let captured = capture(|| log_statement_reconcile(&StatementReport::default()));
     assert_eq!(
-        fields_for(&captured, statement_reconcile::MSG),
-        &expected(statement_reconcile::ALL),
+        field_names_for(&captured, statement_reconcile::MSG),
+        expected(statement_reconcile::ALL),
         "statement reconciliation field set drifted from obs_fields::statement_reconcile::ALL"
     );
-}
-
-/// Per-event value capture: maps a message to its field name→stringified value
-/// map. Used to assert not just the field SET but specific serialized values.
-type CapturedValues = Arc<Mutex<HashMap<String, HashMap<String, String>>>>;
-
-/// A field visitor that records every field's stringified value (and pulls out
-/// `message` as the event key).
-#[derive(Default)]
-struct ValueVisitor {
-    message: Option<String>,
-    values: HashMap<String, String>,
-}
-
-impl Visit for ValueVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let v = format!("{value:?}");
-        if field.name() == "message" {
-            self.message = Some(v);
-        } else {
-            self.values.insert(field.name().to_string(), v);
-        }
-    }
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = Some(value.to_string());
-        } else {
-            self.values
-                .insert(field.name().to_string(), value.to_string());
-        }
-    }
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.values
-            .insert(field.name().to_string(), value.to_string());
-    }
-}
-
-struct ValueCaptureLayer {
-    captured: CapturedValues,
-}
-
-impl<S> Layer<S> for ValueCaptureLayer
-where
-    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let mut visitor = ValueVisitor::default();
-        event.record(&mut visitor);
-        if let Some(message) = visitor.message {
-            self.captured
-                .lock()
-                .expect("capture mutex poisoned")
-                .insert(message, visitor.values);
-        }
-    }
-}
-
-fn capture_values<F: FnOnce()>(body: F) -> HashMap<String, HashMap<String, String>> {
-    let captured: CapturedValues = Arc::new(Mutex::new(HashMap::new()));
-    let subscriber = Registry::default().with(ValueCaptureLayer {
-        captured: Arc::clone(&captured),
-    });
-    with_default(subscriber, body);
-    Arc::try_unwrap(captured)
-        .expect("layer outlived capture scope")
-        .into_inner()
-        .expect("capture mutex poisoned")
 }
 
 #[test]
@@ -284,7 +218,7 @@ fn statement_reconcile_with_balance_delta_present_emits_contract_and_values() {
         balance_delta: Some(Decimal::new(1234, 2)), // 12.34
         ..Default::default()
     };
-    let captured = capture_values(|| log_statement_reconcile(&report));
+    let captured = capture(|| log_statement_reconcile(&report));
     let values = captured
         .get(statement_reconcile::MSG)
         .expect("statement reconciliation event was emitted");
@@ -316,8 +250,8 @@ fn statement_reconcile_with_balance_delta_present_emits_contract_and_values() {
 fn model_selection_failed_emits_exactly_the_contract_fields() {
     let captured = capture(|| log_model_selection_failed(&anyhow::anyhow!("boom")));
     assert_eq!(
-        fields_for(&captured, model_selection_failed::MSG),
-        &expected(model_selection_failed::ALL),
+        field_names_for(&captured, model_selection_failed::MSG),
+        expected(model_selection_failed::ALL),
         "model selection failed field set drifted from obs_fields::model_selection_failed::ALL"
     );
 }

@@ -50,44 +50,54 @@ pub fn check(amount: Decimal, rate: Decimal, ceiling: Option<Decimal>) -> Ceilin
     }
 }
 
+// -- ceiling-verdict unit tests --
 #[cfg(test)]
 mod tests {
+    use crate::test_support::{dec, test_runtime};
     use super::*;
-    use std::str::FromStr;
 
-    fn dec(s: &str) -> Decimal {
-        Decimal::from_str(s).unwrap()
+    /// Assert that a verdict is [`CeilingVerdict::Within`].
+    fn assert_within(v: &CeilingVerdict) {
+        assert!(
+            matches!(v, CeilingVerdict::Within { .. }),
+            "expected Within, got {v:?}"
+        );
+    }
+
+    /// Assert that a verdict is [`CeilingVerdict::Over`] and return the
+    /// `usd_equivalent` for further assertions.
+    fn assert_over(v: &CeilingVerdict) -> Decimal {
+        match v {
+            CeilingVerdict::Over {
+                usd_equivalent, ..
+            } => *usd_equivalent,
+            CeilingVerdict::Within { .. } => panic!("expected Over, got {v:?}"),
+        }
     }
 
     /// No ceiling configured → always Within, regardless of magnitude.
     #[test]
     fn no_ceiling_is_always_within() {
         // A USD charge of ten million, no ceiling → Within.
-        let v = check(dec("10000000"), Decimal::ONE, None);
-        assert!(matches!(v, CeilingVerdict::Within { .. }));
+        assert_within(&check(dec("10000000"), Decimal::ONE, None));
     }
 
     /// A USD charge ($1 → USD rate is 1) just over the ceiling routes to Over.
     #[test]
     fn usd_charge_just_over_ceiling_is_over() {
         let v = check(dec("100001"), Decimal::ONE, Some(dec("100000")));
+        let usd = assert_over(&v);
+        assert_eq!(usd, dec("100001"));
         match v {
-            CeilingVerdict::Over {
-                usd_equivalent,
-                ceiling,
-            } => {
-                assert_eq!(usd_equivalent, dec("100001"));
-                assert_eq!(ceiling, dec("100000"));
-            }
-            CeilingVerdict::Within { .. } => panic!("expected Over"),
+            CeilingVerdict::Over { ceiling, .. } => assert_eq!(ceiling, dec("100000")),
+            CeilingVerdict::Within { .. } => unreachable!(),
         }
     }
 
     /// A charge exactly at the ceiling books (strictly-greater comparison).
     #[test]
     fn exactly_at_ceiling_is_within() {
-        let v = check(dec("100000"), Decimal::ONE, Some(dec("100000")));
-        assert!(matches!(v, CeilingVerdict::Within { .. }));
+        assert_within(&check(dec("100000"), Decimal::ONE, Some(dec("100000"))));
     }
 
     /// The motivating case: a EUR charge whose EUR figure is over the ceiling
@@ -97,16 +107,10 @@ mod tests {
     #[test]
     fn eur_charge_judged_in_usd_not_raw() {
         // EUR 95,000 @ 1.08 → $102,600 > $100,000 → Over.
-        let over = check(dec("95000"), dec("1.08"), Some(dec("100000")));
-        match over {
-            CeilingVerdict::Over { usd_equivalent, .. } => {
-                assert_eq!(usd_equivalent, dec("102600.00"));
-            }
-            CeilingVerdict::Within { .. } => panic!("EUR 95k @1.08 should be Over"),
-        }
+        let usd = assert_over(&check(dec("95000"), dec("1.08"), Some(dec("100000"))));
+        assert_eq!(usd, dec("102600.00"));
         // EUR 95,000 @ 0.99 → $94,050 < $100,000 → Within.
-        let within = check(dec("95000"), dec("0.99"), Some(dec("100000")));
-        assert!(matches!(within, CeilingVerdict::Within { .. }));
+        assert_within(&check(dec("95000"), dec("0.99"), Some(dec("100000"))));
     }
 
     /// The false-positive the raw check used to produce: ₩100,000 (raw figure ==
@@ -126,20 +130,24 @@ mod tests {
         }
     }
 
+    /// Helper: check a JPY amount against the standard $100k ceiling at the
+    /// test-canonical ¥→USD rate of 0.0064.
+    fn check_jpy(amount: &str) -> CeilingVerdict {
+        check(dec(amount), dec("0.0064"), Some(dec("100000")))
+    }
+
     /// A JPY charge just over the ceiling in USD terms routes to Over.
     /// ¥16,000,000 @ 0.0064 = $102,400 > $100,000.
     #[test]
     fn jpy_charge_over_in_usd_is_over() {
-        let v = check(dec("16000000"), dec("0.0064"), Some(dec("100000")));
-        assert!(matches!(v, CeilingVerdict::Over { .. }));
+        assert_over(&check_jpy("16000000"));
     }
 
     /// And a JPY charge just under the ceiling in USD terms books.
     /// ¥15,000,000 @ 0.0064 = $96,000 < $100,000.
     #[test]
     fn jpy_charge_under_in_usd_is_within() {
-        let v = check(dec("15000000"), dec("0.0064"), Some(dec("100000")));
-        assert!(matches!(v, CeilingVerdict::Within { .. }));
+        assert_within(&check_jpy("15000000"));
     }
 
     // --- threaded through the FX client seam ------------------------------
@@ -164,9 +172,7 @@ mod tests {
         let http = Client::new();
         let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
         let fx = FxClient::with_seeded_rate(&http, from, "USD", date, dec(seeded_rate));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+        let rt = test_runtime();
         let rate = rt
             .block_on(fx.rate(from, "USD", date))
             .expect("seeded rate resolves without network");
@@ -176,33 +182,25 @@ mod tests {
     /// EUR charge JUST OVER the $100,000 ceiling: EUR 93,000 @ 1.10 = $102,300.
     #[test]
     fn eur_just_over_ceiling_via_seeded_fx_is_over() {
-        let v = check_via_seeded_fx("EUR", "93000", "1.10", "100000");
-        match v {
-            CeilingVerdict::Over { usd_equivalent, .. } => {
-                assert_eq!(usd_equivalent, dec("102300.00"));
-            }
-            CeilingVerdict::Within { .. } => panic!("EUR 93k @1.10 → $102,300 should be Over"),
-        }
+        let usd = assert_over(&check_via_seeded_fx("EUR", "93000", "1.10", "100000"));
+        assert_eq!(usd, dec("102300.00"));
     }
 
     /// EUR charge JUST UNDER the ceiling: EUR 89,000 @ 1.10 = $97,900.
     #[test]
     fn eur_just_under_ceiling_via_seeded_fx_is_within() {
-        let v = check_via_seeded_fx("EUR", "89000", "1.10", "100000");
-        assert!(matches!(v, CeilingVerdict::Within { .. }));
+        assert_within(&check_via_seeded_fx("EUR", "89000", "1.10", "100000"));
     }
 
     /// JPY charge JUST OVER the ceiling: ¥16,000,000 @ 0.0064 = $102,400.
     #[test]
     fn jpy_just_over_ceiling_via_seeded_fx_is_over() {
-        let v = check_via_seeded_fx("JPY", "16000000", "0.0064", "100000");
-        assert!(matches!(v, CeilingVerdict::Over { .. }));
+        assert_over(&check_via_seeded_fx("JPY", "16000000", "0.0064", "100000"));
     }
 
     /// JPY charge JUST UNDER the ceiling: ¥15,000,000 @ 0.0064 = $96,000.
     #[test]
     fn jpy_just_under_ceiling_via_seeded_fx_is_within() {
-        let v = check_via_seeded_fx("JPY", "15000000", "0.0064", "100000");
-        assert!(matches!(v, CeilingVerdict::Within { .. }));
+        assert_within(&check_via_seeded_fx("JPY", "15000000", "0.0064", "100000"));
     }
 }

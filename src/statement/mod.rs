@@ -63,12 +63,18 @@ impl TextRow {
     /// The row's cells joined by single spaces — for header/marker detection.
     #[must_use]
     pub fn joined(&self) -> String {
-        self.cells
-            .iter()
-            .map(|c| c.text.trim())
-            .collect::<Vec<_>>()
-            .join(" ")
+        join_cells(&self.cells)
     }
+}
+
+/// Join cell text values with single spaces. Shared by [`TextRow::joined`]
+/// and the parser's subslice merchant extraction.
+pub(crate) fn join_cells(cells: &[Cell]) -> String {
+    cells
+        .iter()
+        .map(|c| c.text.trim())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Define a digit-string newtype: trimmed, all ASCII digits, with a length
@@ -217,9 +223,10 @@ impl StatementTxn {
     /// this projection.
     #[must_use]
     pub fn to_extracted(&self, primary_last4: &Last4) -> Extracted {
+        let dedup_ref = format!("bpstmt:{}", self.reference.as_str());
         Extracted {
             source: Source::BancoPopular,
-            external_id: Some(format!("bpstmt:{}", self.reference.as_str())),
+            external_id: Some(dedup_ref),
             money: self.money.clone(),
             direction: self.direction,
             date: self.auth_date,
@@ -238,6 +245,7 @@ pub struct ParsedStatement {
     pub txns: Vec<StatementTxn>,
 }
 
+// -- statement-mod unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,22 +288,23 @@ mod tests {
             mcc: Mcc::parse("5499"),
             auth_code: AuthCode::parse("020509"),
         };
-        let e = txn.to_extracted(&Last4::parse("7524").unwrap());
+        let projected = txn.to_extracted(&Last4::parse("7524").unwrap());
         assert_eq!(
-            e.external_id.as_deref(),
+            projected.external_id.as_deref(),
             Some("bpstmt:74987506133002256024229")
         );
         assert_eq!(
-            e.date,
+            projected.date,
             NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
             "anchor = auth date"
         );
-        assert_eq!(e.status, "posted");
-        assert_eq!(e.account_hint.as_deref(), Some("7524"));
-        assert_eq!(e.source, Source::BancoPopular);
+        assert_eq!(projected.status, "posted");
+        // Statement projection preserves card last-4 and BPD source tag.
+        assert_eq!(projected.account_hint.as_deref(), Some("7524"));
+        assert_eq!(projected.source, Source::BancoPopular);
         // The dedup key is the verbatim external_id (no composite hash).
         assert_eq!(
-            crate::dedup::external_id(&e),
+            crate::dedup::external_id(&projected),
             "bpstmt:74987506133002256024229"
         );
     }

@@ -56,6 +56,25 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// Attach the `fmt` layer (JSON or human-readable) to a subscriber registry and
+/// install it process-wide. A macro because `registry.with(json_layer)` and
+/// `registry.with(text_layer)` produce different types — a function cannot return
+/// both without boxing, and boxing would impose runtime cost on every log event
+/// for no value. The macro is private to this module and used exactly twice.
+macro_rules! init_with_fmt {
+    ($registry:expr, $json:expr) => {
+        if $json {
+            $registry
+                .with(tracing_subscriber::fmt::layer().json())
+                .init();
+        } else {
+            $registry
+                .with(tracing_subscriber::fmt::layer().with_target(false))
+                .init();
+        }
+    };
+}
+
 /// The standard OTLP endpoint env var. Setting it (e.g. to the cluster Tempo
 /// distributor's OTLP/HTTP ingest, `http://<tempo-distributor>.<ns>:4318`) turns
 /// trace export on; unset/blank keeps it off (the default).
@@ -124,10 +143,7 @@ impl Telemetry {
 /// Returns `Some(Telemetry)` only when export is on, so `main` knows whether a
 /// flush is owed.
 pub fn init(json: bool, env_filter: tracing_subscriber::EnvFilter) -> Option<Telemetry> {
-    let endpoint = std::env::var(OTEL_ENDPOINT_ENV)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+    let endpoint = crate::config::optional(OTEL_ENDPOINT_ENV);
 
     // OFF PATH: no endpoint → install the fmt-only subscriber and return None.
     // This is the default and must match the pre-traces behaviour exactly.
@@ -164,15 +180,7 @@ pub fn init(json: bool, env_filter: tracing_subscriber::EnvFilter) -> Option<Tel
     let registry = tracing_subscriber::registry()
         .with(env_filter)
         .with(otel_layer);
-    if json {
-        registry
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
-        registry
-            .with(tracing_subscriber::fmt::layer().with_target(false))
-            .init();
-    }
+    init_with_fmt!(registry, json);
     Some(Telemetry { provider })
 }
 
@@ -180,15 +188,7 @@ pub fn init(json: bool, env_filter: tracing_subscriber::EnvFilter) -> Option<Tel
 /// shape to the historical `init_tracing` so the default run is unchanged.
 fn install_fmt_only(json: bool, env_filter: tracing_subscriber::EnvFilter) {
     let registry = tracing_subscriber::registry().with(env_filter);
-    if json {
-        registry
-            .with(tracing_subscriber::fmt::layer().json())
-            .init();
-    } else {
-        registry
-            .with(tracing_subscriber::fmt::layer().with_target(false))
-            .init();
-    }
+    init_with_fmt!(registry, json);
 }
 
 /// Build the batch tracer provider with an OTLP/HTTP-JSON span exporter.
@@ -275,6 +275,7 @@ fn current_trace_id(span: &tracing::Span) -> Option<String> {
     Some(format!("{:032x}", u128::from_be_bytes(trace_id.to_bytes())))
 }
 
+// -- telemetry unit tests --
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -354,6 +355,7 @@ mod tests {
         span_fields: SpanFieldLog,
     }
 
+    #[derive(Default)]
     struct FieldGrab(Vec<(String, String)>);
     impl tracing::field::Visit for FieldGrab {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -369,29 +371,19 @@ mod tests {
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
-        fn on_new_span(
-            &self,
-            attrs: &tracing::span::Attributes<'_>,
-            id: &tracing::span::Id,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let span = ctx.span(id).unwrap();
-            let mut grab = FieldGrab(Vec::new());
-            attrs.record(&mut grab);
+        // Capture: persist new span's fields into its extensions.
+        fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let grab = grab_fields(attrs);
+            let span_ref = ctx.span(id).unwrap();
             // Persist the (possibly later-recorded) fields in the span extension
             // so on_record updates land too.
-            span.extensions_mut().insert(SpanFields(grab.0));
+            span_ref.extensions_mut().insert(SpanFields(grab.0));
         }
 
-        fn on_record(
-            &self,
-            id: &tracing::span::Id,
-            values: &tracing::span::Record<'_>,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+        // Capture: merge dynamically-recorded values into the existing span field set.
+        fn on_record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
             let span = ctx.span(id).unwrap();
-            let mut grab = FieldGrab(Vec::new());
-            values.record(&mut grab);
+            let grab = grab_fields(values);
             let mut ext = span.extensions_mut();
             if let Some(SpanFields(f)) = ext.get_mut::<SpanFields>() {
                 for (k, v) in grab.0 {
@@ -404,11 +396,9 @@ mod tests {
             }
         }
 
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
+        // Capture: snapshot the enclosing span's name, trace_id, and field names
+        // for each event that fires within an instrumented scope.
+        fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
             if let Some(span) = ctx.event_span(event) {
                 // The JSON fmt layer renders ALL enclosing spans' fields on each
                 // event (its `spans[]` array), so a `trace_id` recorded on the
@@ -440,19 +430,50 @@ mod tests {
     }
     struct SpanFields(Vec<(String, String)>);
 
-    /// Build a real `tracing-opentelemetry` layer over an in-memory exporter so
-    /// spans get genuine (non-zero) trace_ids without any network.
-    fn otel_layer_in_memory<S>() -> impl Layer<S>
-    where
-        S: Subscriber + for<'a> LookupSpan<'a>,
-    {
+    /// Collect all fields from a span's attributes or recorded values into a
+    /// `FieldGrab`. Shared between `on_new_span` (attributes) and `on_record`
+    /// (dynamic values) since both do the same grab-and-collect.
+    fn grab_fields(recordable: &impl RecordFields) -> FieldGrab {
+        let mut grab = FieldGrab::default();
+        recordable.record_to(&mut grab);
+        grab
+    }
+
+    /// Trait abstracting the `record(&mut Visit)` call shared by
+    /// `tracing::span::Attributes` and `tracing::span::Record`.
+    trait RecordFields {
+        fn record_to(&self, visitor: &mut FieldGrab);
+    }
+    impl RecordFields for tracing::span::Attributes<'_> {
+        fn record_to(&self, grab: &mut FieldGrab) { self.record(grab); }
+    }
+    impl RecordFields for tracing::span::Record<'_> {
+        fn record_to(&self, visitor: &mut FieldGrab) { self.record(visitor); }
+    }
+
+    /// Build a provider + OTel layer over a given in-memory exporter. Returns
+    /// both so the caller can assert on exported spans while the layer feeds them
+    /// genuine (non-zero) trace_ids with no network. The provider is leaked so it
+    /// outlives the test subscriber (dropped at test exit).
+    fn otel_layer_from_exporter<S: Subscriber + for<'a> LookupSpan<'a>>(
+        exporter: opentelemetry_sdk::trace::InMemorySpanExporter,
+    ) -> (SdkTracerProvider, impl Layer<S>) {
         let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(opentelemetry_sdk::trace::InMemorySpanExporter::default())
+            .with_simple_exporter(exporter)
             .build();
         let tracer = provider.tracer("test");
+        let layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        (provider, layer)
+    }
+
+    /// Build a real `tracing-opentelemetry` layer over an in-memory exporter so
+    /// spans get genuine (non-zero) trace_ids without any network.
+    fn otel_layer_in_memory<S: Subscriber + for<'a> LookupSpan<'a>>() -> impl Layer<S> {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let (provider, layer) = otel_layer_from_exporter(exporter);
         // Leak the provider so it outlives the test subscriber (dropped at exit).
         Box::leak(Box::new(provider));
-        tracing_opentelemetry::layer().with_tracer(tracer)
+        layer
     }
 
     #[test]
@@ -462,11 +483,7 @@ mod tests {
         // shape (run → {fetch, process → extract, statement}) and assert against
         // the spans the in-memory exporter received.
         let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
-        let provider = SdkTracerProvider::builder()
-            .with_simple_exporter(exporter.clone())
-            .build();
-        let tracer = provider.tracer("test");
-        let otel = tracing_opentelemetry::layer().with_tracer(tracer);
+        let (provider, otel) = otel_layer_from_exporter(exporter.clone());
         let subscriber = tracing_subscriber::registry().with(otel);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -504,20 +521,36 @@ mod tests {
         );
     }
 
+    /// Install a capture layer + in-memory OTel, run `body`, return the capture.
+    fn run_with_otel_capture(body: impl FnOnce()) -> Capture {
+        let cap = Capture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(otel_layer_in_memory())
+            .with(cap.clone());
+        tracing::subscriber::with_default(subscriber, body);
+        cap
+    }
+
+    /// Like [`run_with_otel_capture`] but pre-creates and enters a root `"run"`
+    /// span with `trace_id = Empty`, then calls [`record_trace_id`] — the
+    /// boilerplate shared by every test that needs a real trace_id. The closure
+    /// receives the capture *after* the body returns (same as `run_with_otel_capture`).
+    fn capture_under_root(body: impl FnOnce()) -> Capture {
+        // Shared root-span boilerplate: create "run" span, enter, record trace_id.
+        run_with_otel_capture(|| {
+            let run_span = tracing::info_span!("run", trace_id = Empty);
+            let _guard = run_span.enter();
+            record_trace_id();
+            body();
+        })
+    }
+
     #[test]
     fn event_within_span_carries_the_span_trace_id() {
         // req 4 (Loki↔Tempo): a log line inside a stage carries the SAME trace_id
         // recorded on the run's span — proven against an in-memory OTel exporter,
         // no live collector.
-        let cap = Capture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(otel_layer_in_memory())
-            .with(cap.clone());
-
-        tracing::subscriber::with_default(subscriber, || {
-            let root = tracing::info_span!("run", trace_id = Empty);
-            let _g = root.enter();
-            record_trace_id();
+        let cap = capture_under_root(|| {
             // A child stage + an event inside it.
             let stage = tracing::info_span!("stage_extract");
             let _sg = stage.enter();
@@ -549,14 +582,7 @@ mod tests {
         // ALLOWLIST — exactly `{stage}`. An allowlist (not a denylist) means ANY
         // added field of ANY name now fails this test, not just the handful of
         // known-PII names we'd have to remember to enumerate.
-        let cap = Capture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(otel_layer_in_memory())
-            .with(cap.clone());
-
-        tracing::subscriber::with_default(subscriber, || {
-            let root = tracing::info_span!("run", trace_id = Empty);
-            let _g = root.enter();
+        let cap = capture_under_root(|| {
             // The extract span as the instrumentation builds it: stage label only.
             let extract = tracing::info_span!("extract", stage = "extract");
             let _eg = extract.enter();

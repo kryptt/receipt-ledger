@@ -15,6 +15,7 @@ use std::env;
 
 use anyhow::{Context, Result};
 use rust_decimal::Decimal;
+// Decimal::from_str requires this trait in scope.
 use std::str::FromStr;
 
 /// Default JMAP base URL. Override `RECEIPT_JMAP_URL` to point at your own
@@ -78,19 +79,9 @@ impl AccountId {
             anyhow::bail!("account id {raw:?} is not numeric (expected a Firefly account id)")
         }
     }
-
-    /// The id as it appears in Firefly API paths and `source_id`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
-impl std::fmt::Display for AccountId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+impl_newtype_display!(AccountId);
 
 /// Deterministic validation policy, derived from configuration. Carries only
 /// the knobs that gate booking.
@@ -240,11 +231,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let model_allowlist = env_or("RECEIPT_MODEL_ALLOWLIST", DEFAULT_MODEL_ALLOWLIST)
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>();
+        let model_allowlist =
+            parse_csv(&env_or("RECEIPT_MODEL_ALLOWLIST", DEFAULT_MODEL_ALLOWLIST));
 
         Ok(Config {
             jmap_url: env_or("RECEIPT_JMAP_URL", DEFAULT_JMAP_URL),
@@ -363,11 +351,32 @@ fn env_bool(key: &str) -> bool {
 }
 
 /// Read an optional env var, returning `None` when unset or blank.
-fn optional(key: &str) -> Option<String> {
+pub(crate) fn optional(key: &str) -> Option<String> {
     env::var(key)
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Split a comma-separated string into a trimmed, non-empty `Vec<String>`.
+pub fn parse_csv(val: &str) -> Vec<String> {
+    val.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Create the parent directory of `path` if it does not yet exist.
+/// No-op when `path` has no parent (e.g. a bare filename).
+pub(crate) fn ensure_parent_dir(path: &str, label: &str) -> Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {label} dir {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn required(key: &str) -> Result<String> {
@@ -387,11 +396,22 @@ fn account_required(key: &str) -> Result<AccountId> {
 /// non-numeric → hard error (a stale account name must not silently disable a
 /// route).
 fn account_optional(key: &str) -> Result<Option<AccountId>> {
+    optional_parsed(key, || None, |v| AccountId::parse(v).map(Some))
+}
+
+/// Read an optional env var, parse when present, else return `default`. The
+/// `parse` closure receives the trimmed non-empty value; its error is
+/// contextualised with the env var name. Consolidates the repeated
+/// `match optional(key) { None => Ok(default), Some(v) => parse(v).context(key) }`
+/// pattern used by map, account, and decimal env parsers.
+fn optional_parsed<T>(
+    key: &str,
+    default: impl FnOnce() -> T,
+    parse: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
     match optional(key) {
-        None => Ok(None),
-        Some(v) => AccountId::parse(&v)
-            .map(Some)
-            .with_context(|| format!("env var {key}")),
+        None => Ok(default()),
+        Some(v) => parse(&v).with_context(|| format!("env var {key}")),
     }
 }
 
@@ -402,10 +422,7 @@ fn account_optional(key: &str) -> Result<Option<AccountId>> {
 /// failures, so a typo fails the CronJob loudly rather than silently dropping a
 /// funding-source route.
 fn account_map_by_last4(key: &str) -> Result<HashMap<String, AccountId>> {
-    match optional(key) {
-        None => Ok(HashMap::new()),
-        Some(raw) => parse_account_map_by_last4(&raw).with_context(|| format!("env var {key}")),
-    }
+    optional_parsed(key, HashMap::new, parse_account_map_by_last4)
 }
 
 /// Read and parse a `BIC:accountid`-pair map env var (e.g.
@@ -414,10 +431,7 @@ fn account_map_by_last4(key: &str) -> Result<HashMap<String, AccountId>> {
 /// each BIC key so lookups against the normalized creditor BIC are
 /// case-insensitive. A malformed entry is a hard startup error.
 fn account_map_by_bic(key: &str) -> Result<HashMap<String, AccountId>> {
-    match optional(key) {
-        None => Ok(HashMap::new()),
-        Some(raw) => parse_account_map_by_bic(&raw).with_context(|| format!("env var {key}")),
-    }
+    optional_parsed(key, HashMap::new, parse_account_map_by_bic)
 }
 
 /// Parse a `last4:accountid`-pair map from a comma-separated string. Pure — the
@@ -481,10 +495,7 @@ fn parse_kv_map<V>(
 /// value). Absent/blank → empty map (charges book uncategorized). A malformed
 /// entry (no `:`, empty key, or empty category) is a hard startup error.
 fn mcc_category_map(key: &str) -> Result<HashMap<String, String>> {
-    match optional(key) {
-        None => Ok(HashMap::new()),
-        Some(raw) => parse_mcc_category_map(&raw).with_context(|| format!("env var {key}")),
-    }
+    optional_parsed(key, HashMap::new, parse_mcc_category_map)
 }
 
 /// Parse comma-separated `mcc:category` pairs into a map. The value is free text
@@ -508,12 +519,11 @@ fn parse_mcc_category_map(raw: &str) -> Result<HashMap<String, String>> {
 /// Parse an optional [`Decimal`] env var. Absent → `None`; present but
 /// unparseable → hard error.
 fn decimal_optional(key: &str) -> Result<Option<Decimal>> {
-    match optional(key) {
-        None => Ok(None),
-        Some(v) => Decimal::from_str(&v)
+    optional_parsed(key, || None, |v| {
+        Decimal::from_str(v)
             .map(Some)
-            .with_context(|| format!("env var {key}={v:?} is not a decimal")),
-    }
+            .with_context(|| format!("{v:?} is not a decimal"))
+    })
 }
 
 /// Parse an optional `u64` env var, falling back to `default` when unset/blank.
@@ -529,6 +539,7 @@ fn env_u64(key: &str, default: u64) -> Result<u64> {
     }
 }
 
+// -- config unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,14 +583,17 @@ mod tests {
         assert!(parse_account_map_by_last4("").unwrap().is_empty());
     }
 
+    /// Assert that a `key:accountid` parser rejects the three standard
+    /// malformed shapes: no colon, non-numeric value, empty key.
+    fn assert_rejects_malformed(parse: impl Fn(&str) -> Result<HashMap<String, AccountId>>, bare_key: &str) {
+        assert!(parse(bare_key).is_err(), "no colon separator");
+        assert!(parse(&format!("{bare_key}:abc")).is_err(), "non-numeric account id");
+        assert!(parse(":1").is_err(), "empty key");
+    }
+
     #[test]
     fn paying_account_map_rejects_malformed() {
-        // No colon separator.
-        assert!(parse_account_map_by_last4("0130").is_err());
-        // Non-numeric account id.
-        assert!(parse_account_map_by_last4("0130:abc").is_err());
-        // Empty last-4 key.
-        assert!(parse_account_map_by_last4(":1").is_err());
+        assert_rejects_malformed(parse_account_map_by_last4, "0130");
     }
 
     #[test]
@@ -598,12 +612,7 @@ mod tests {
 
     #[test]
     fn swift_dest_by_bic_rejects_malformed() {
-        // No colon separator.
-        assert!(parse_account_map_by_bic("CHASUS33").is_err());
-        // Non-numeric account id.
-        assert!(parse_account_map_by_bic("CHASUS33:abc").is_err());
-        // Empty BIC key.
-        assert!(parse_account_map_by_bic(":1").is_err());
+        assert_rejects_malformed(parse_account_map_by_bic, "CHASUS33");
     }
 
     #[test]

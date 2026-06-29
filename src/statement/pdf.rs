@@ -55,13 +55,10 @@ impl Affine {
     }
 
     fn translate(x: f32, y: f32) -> Self {
-        Affine {
-            a: 1.0,
-            b: 0.0,
-            c: 0.0,
-            d: 1.0,
+        Self {
             e: x,
             f: y,
+            ..Self::identity()
         }
     }
 
@@ -153,6 +150,14 @@ fn collect_runs<R: Resolve>(
     let mut tm = Affine::identity(); // text matrix
     let mut leading = 0f32;
 
+    // ponytail: macro avoids double-&mut borrow that a closure would need
+    macro_rules! advance_text_line {
+        ($x:expr, $y:expr) => {{
+            tlm = Affine::translate($x, $y).then(&tlm);
+            tm = tlm;
+        }};
+    }
+
     for op in ops {
         match op {
             Op::Save => ctm_stack.push(ctm),
@@ -173,14 +178,8 @@ fn collect_runs<R: Resolve>(
             }
             Op::MoveTextPosition {
                 translation: Point { x, y },
-            } => {
-                tlm = Affine::translate(*x, *y).then(&tlm);
-                tm = tlm;
-            }
-            Op::TextNewline => {
-                tlm = Affine::translate(0.0, -leading).then(&tlm);
-                tm = tlm;
-            }
+            } => advance_text_line!(*x, *y),
+            Op::TextNewline => advance_text_line!(0.0, -leading),
             Op::TextDraw { text } => {
                 push_run(runs, &ctm, &tm, &decode_win1252(text.as_bytes()));
             }
@@ -217,13 +216,13 @@ fn collect_runs<R: Resolve>(
 /// failures are silently ignored — we only want text.
 fn recurse_xobject<R: Resolve>(
     name: &pdf::primitive::Name,
-    ctm: Affine,
+    parent_ctm: Affine,
     resolve: &R,
-    resources: Option<&Resources>,
-    runs: &mut Vec<Run>,
-    depth: u8,
+    page_resources: Option<&Resources>,
+    out: &mut Vec<Run>,
+    form_depth: u8,
 ) {
-    let Some(res) = resources else { return };
+    let Some(res) = page_resources else { return };
     let Some(xref) = res.xobjects.get(name) else {
         return;
     };
@@ -233,10 +232,10 @@ fn recurse_xobject<R: Resolve>(
         return;
     };
     let dict = form.dict();
-    let form_ctm = form_matrix(&dict.matrix).then(&ctm);
+    let form_ctm = form_matrix(&dict.matrix).then(&parent_ctm);
     // The form may carry its own resource dictionary; fall back to the parent's.
-    let form_res = dict.resources.as_deref().or(resources);
-    collect_runs(&form_ops, form_ctm, resolve, form_res, runs, depth + 1);
+    let form_res = dict.resources.as_deref().or(page_resources);
+    collect_runs(&form_ops, form_ctm, resolve, form_res, out, form_depth + 1);
 }
 
 /// Parse a Form XObject `/Matrix` (a 6-number array) into an [`Affine`];

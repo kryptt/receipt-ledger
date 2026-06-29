@@ -28,6 +28,23 @@ use crate::jmap::{FetchedMessage, Mailbox};
 use crate::schema::Direction;
 use crate::validate::{TransferVerdict, Verdict, validate, validate_transfer};
 
+/// Shared context for the booking helpers (`book_charge`, `book_payment`,
+/// `correct_amount_mismatch`).  Bundles the read-only service handles so
+/// every helper doesn't repeat the same four-parameter preamble.
+struct PipelineCtx<'a> {
+    firefly: &'a FireflyClient<'a>,
+    fx: &'a FxClient<'a>,
+    cfg: &'a Config,
+}
+
+/// Identifies a row for logging (reference + human label like "BookNew" or
+/// "payment").  Extracted so `apply_ceiling` and `tally_submit` share one
+/// parameter instead of two independent `&str`s.
+struct RowTag<'a> {
+    reference: &'a str,
+    label: &'a str,
+}
+
 /// How a message should be ingested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ingest {
@@ -163,6 +180,7 @@ pub async fn process_statement(
 
     let mut report = StatementReport::default();
     let params = ReconcileParams::default();
+    let ctx = PipelineCtx { firefly, fx, cfg };
 
     // Merchant alias map from a Firefly rule-group (canonicalizes both sides
     // before fuzzy matching). Missing/failed lookup degrades to no aliases.
@@ -180,15 +198,15 @@ pub async fn process_statement(
     // fatal Firefly error out to the caller (→ Review) exactly as before.
     async {
     for section in &parsed.sections {
+        // Predicate shared by the no-account count, the charge filter, and the
+        // payment filter — keeps the section-scoping logic in one place.
+        let in_section = |t: &&StatementTxn| t.section == section.currency;
+
         let Some(account) = (match section.currency {
             SectionCurrency::Usd => cfg.banco_popular_usd_account.as_ref(),
             SectionCurrency::Dop => cfg.banco_popular_dop_account.as_ref(),
         }) else {
-            let rows = parsed
-                .txns
-                .iter()
-                .filter(|t| t.section == section.currency)
-                .count();
+            let rows = parsed.txns.iter().filter(in_section).count();
             warn!(currency = ?section.currency, rows, "no card account configured; section → review");
             report.review += rows;
             continue;
@@ -200,17 +218,11 @@ pub async fn process_statement(
         let end = section.cut_date + Duration::days(5);
         let journals = firefly.list_transactions(account, start, end).await?;
 
-        let charges: Vec<StatementTxn> = parsed
-            .txns
-            .iter()
-            .filter(|t| t.section == section.currency && t.direction == Direction::Out)
-            .cloned()
-            .collect();
-        let payments: Vec<&StatementTxn> = parsed
-            .txns
-            .iter()
-            .filter(|t| t.section == section.currency && t.direction == Direction::In)
-            .collect();
+        let section_txns = |dir| {
+            parsed.txns.iter().filter(move |t| in_section(t) && t.direction == dir)
+        };
+        let charges: Vec<StatementTxn> = section_txns(Direction::Out).cloned().collect();
+        let payments: Vec<&StatementTxn> = section_txns(Direction::In).collect();
 
         let recon = reconcile(&charges, &journals, &params, &aliases);
         report.unmatched_booked += recon.unmatched_journals.len();
@@ -250,18 +262,11 @@ pub async fn process_statement(
                 }
             } else {
                 let kind = charge_outcome_kind(outcome);
+                let ref_str = charge.reference.as_str();
                 if cfg.dry_run {
-                    info!(
-                        reference = charge.reference.as_str(),
-                        outcome = kind,
-                        "charge plan"
-                    );
+                    info!(reference = ref_str, outcome = kind, "charge plan");
                 } else {
-                    debug!(
-                        reference = charge.reference.as_str(),
-                        outcome = kind,
-                        "charge"
-                    );
+                    debug!(reference = ref_str, outcome = kind, "charge");
                 }
             }
 
@@ -276,21 +281,21 @@ pub async fn process_statement(
                         journal_id,
                         *booked,
                         *statement,
-                        firefly,
-                        cfg,
                         &mut report,
+                        ctx.firefly,
+                        ctx.cfg,
                     )
                     .await;
                 }
                 ChargeOutcome::Review { .. } => report.review += 1,
                 ChargeOutcome::BookNew => {
-                    book_charge(charge, section, firefly, fx, cfg, &mut report).await;
+                    book_charge(charge, section, &ctx, &mut report).await;
                 }
             }
         }
 
         for &payment in &payments {
-            book_payment(payment, firefly, fx, cfg, &mut report).await;
+            book_payment(payment, &mut report, &ctx).await;
         }
 
         check_balance(section, &charges, &payments, &mut report);
@@ -378,6 +383,73 @@ fn check_balance(
     }
 }
 
+/// Run the USD-ceiling plausibility check, apply the result to `report`, and
+/// return `true` when the caller should proceed to booking (`false` means the
+/// row was consumed — review or deferred).  Merges the former `check_ceiling`
+/// + `apply_ceiling` pair so callers write one call instead of two.
+async fn check_and_apply_ceiling(
+    ctx: &PipelineCtx<'_>,
+    currency: &str,
+    amount: Decimal,
+    date: chrono::NaiveDate,
+    tag: &RowTag<'_>,
+    report: &mut StatementReport,
+) -> bool {
+    let RowTag { reference, label } = *tag;
+    match crate::usd_ceiling_review(ctx.fx, &ctx.cfg.validation, currency, amount, date).await {
+        Ok(None) => true,
+        Ok(Some(reason)) => {
+            info!(reference, %reason, "{label} over ceiling -> review");
+            report.review += 1;
+            false
+        }
+        Err(e) if crate::fx::is_transient(&e) => {
+            info!(reference, error = ?e, "{label} ceiling rate unavailable -> deferred (retry next run)");
+            report.deferred += 1;
+            false
+        }
+        Err(e) => {
+            warn!(reference, error = ?e, "{label} ceiling FX failed -> review");
+            report.review += 1;
+            false
+        }
+    }
+}
+
+/// Outcome of a Firefly submit dispatched by [`tally_submit`].
+enum SubmitTally {
+    /// New transaction created — caller increments the appropriate booked counter.
+    Created,
+    /// Duplicate detected — already counted as reconciled.
+    Reconciled,
+    /// Submit failed — already counted as review.
+    Failed,
+}
+
+/// Tally a Firefly submit result, logging errors via the [`RowTag`].
+/// `Duplicate` increments `reconciled`; `Err` increments `review`. Returns a
+/// [`SubmitTally`] so the caller can increment its own booked counter on
+/// `Created` without a double-borrow.
+fn tally_submit(
+    result: Result<SubmitOutcome>,
+    report: &mut StatementReport,
+    tag: &RowTag<'_>,
+) -> SubmitTally {
+    let RowTag { reference, label } = *tag;
+    match result {
+        Ok(SubmitOutcome::Created) => SubmitTally::Created,
+        Ok(SubmitOutcome::Duplicate) => {
+            report.reconciled += 1;
+            SubmitTally::Reconciled
+        }
+        Err(e) => {
+            warn!(reference, error = ?e, "{label} submit failed -> review");
+            report.review += 1;
+            SubmitTally::Failed
+        }
+    }
+}
+
 /// A PII-free label for a charge's reconcile outcome (no journal amounts / reason
 /// strings) — used in the non-PII charge log path.
 fn charge_outcome_kind(o: &ChargeOutcome) -> &'static str {
@@ -399,9 +471,9 @@ async fn correct_amount_mismatch(
     journal_id: &str,
     booked: Decimal,
     billed: Decimal,
+    report: &mut StatementReport,
     firefly: &FireflyClient<'_>,
     cfg: &Config,
-    report: &mut StatementReport,
 ) {
     if !cfg.bp_autocorrect_amounts {
         report.amount_mismatch += 1;
@@ -443,52 +515,30 @@ async fn correct_amount_mismatch(
 async fn book_charge(
     charge: &StatementTxn,
     section: &super::Section,
-    firefly: &FireflyClient<'_>,
-    fx: &FxClient<'_>,
-    cfg: &Config,
+    ctx: &PipelineCtx<'_>,
     report: &mut StatementReport,
 ) {
+    let tag = RowTag { reference: charge.reference.as_str(), label: "BookNew" };
     let extracted = charge.to_extracted(&section.primary_last4);
     let validated = match validate(extracted) {
         Verdict::Booked(v) => v,
         Verdict::Review { reason } => {
-            info!(reference = charge.reference.as_str(), %reason, "BookNew failed validate → review");
+            info!(reference = tag.reference, %reason, "BookNew failed validate → review");
             report.review += 1;
             return;
         }
     };
     let ext = validated.as_extracted();
-    match crate::usd_ceiling_review(
-        fx,
-        &cfg.validation,
-        ext.currency().as_str(),
-        ext.amount().value(),
-        ext.date,
+    if !check_and_apply_ceiling(
+        ctx, ext.currency().as_str(), ext.amount().value(), ext.date, &tag, report,
     )
     .await
     {
-        Ok(Some(reason)) => {
-            info!(reference = charge.reference.as_str(), %reason, "BookNew over ceiling → review");
-            report.review += 1;
-            return;
-        }
-        Ok(None) => {}
-        Err(e) if crate::fx::is_transient(&e) => {
-            // Rate provider down — defer this row (keep the statement in INBOX,
-            // retry next run). Don't book, don't review.
-            info!(reference = charge.reference.as_str(), error = ?e, "ceiling rate unavailable → deferred (retry next run)");
-            report.deferred += 1;
-            return;
-        }
-        Err(e) => {
-            warn!(reference = charge.reference.as_str(), error = ?e, "ceiling FX failed → review");
-            report.review += 1;
-            return;
-        }
+        return;
     }
     let external_id = crate::dedup::external_id(validated.as_extracted());
-    if cfg.dry_run {
-        info!(reference = charge.reference.as_str(), %external_id, "DRY RUN: would book new charge");
+    if ctx.cfg.dry_run {
+        info!(reference = tag.reference, %external_id, "DRY RUN: would book new charge");
         report.booked_new += 1;
         return;
     }
@@ -496,18 +546,14 @@ async fn book_charge(
     let category = charge
         .mcc
         .as_ref()
-        .and_then(|m| cfg.bp_mcc_category.get(m.as_str()))
+        .and_then(|m| ctx.cfg.bp_mcc_category.get(m.as_str()))
         .map(String::as_str);
-    match firefly
+    let result = ctx
+        .firefly
         .submit_with_category(&validated, &external_id, category)
-        .await
-    {
-        Ok(SubmitOutcome::Created) => report.booked_new += 1,
-        Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
-        Err(e) => {
-            warn!(reference = charge.reference.as_str(), error = ?e, "BookNew submit failed → review");
-            report.review += 1;
-        }
+        .await;
+    if matches!(tally_submit(result, report, &tag), SubmitTally::Created) {
+        report.booked_new += 1;
     }
 }
 
@@ -515,39 +561,20 @@ async fn book_charge(
 /// outcome. Per-row failures are counted as review, never abort the statement.
 async fn book_payment(
     payment: &StatementTxn,
-    firefly: &FireflyClient<'_>,
-    fx: &FxClient<'_>,
-    cfg: &Config,
     report: &mut StatementReport,
+    ctx: &PipelineCtx<'_>,
 ) {
-    let external_id = format!("bpstmt:{}", payment.reference.as_str());
+    let tag = RowTag { reference: payment.reference.as_str(), label: "payment" };
+    let external_id = format!("bpstmt:{}", tag.reference);
     // Plausibility ceiling applies to transfers too (a crafted huge payment must
     // not silently move money out of the savings account).
-    match crate::usd_ceiling_review(
-        fx,
-        &cfg.validation,
-        payment.money.currency.as_str(),
-        payment.money.amount.value(),
-        payment.auth_date,
+    if !check_and_apply_ceiling(
+        ctx, payment.money.currency.as_str(),
+        payment.money.amount.value(), payment.auth_date, &tag, report,
     )
     .await
     {
-        Ok(Some(reason)) => {
-            info!(reference = payment.reference.as_str(), %reason, "payment over ceiling → review");
-            report.review += 1;
-            return;
-        }
-        Ok(None) => {}
-        Err(e) if crate::fx::is_transient(&e) => {
-            info!(reference = payment.reference.as_str(), error = ?e, "payment ceiling rate unavailable → deferred (retry next run)");
-            report.deferred += 1;
-            return;
-        }
-        Err(e) => {
-            warn!(reference = payment.reference.as_str(), error = ?e, "payment ceiling FX failed → review");
-            report.review += 1;
-            return;
-        }
+        return;
     }
     let transfer = match validate_transfer(
         payment.money.clone(),
@@ -557,29 +584,23 @@ async fn book_payment(
     ) {
         TransferVerdict::Booked(t) => t,
         TransferVerdict::Review { reason } => {
-            info!(reference = payment.reference.as_str(), %reason, "payment failed transfer gate → review");
+            info!(reference = tag.reference, %reason, "payment failed transfer gate -> review");
             report.review += 1;
             return;
         }
     };
-    if cfg.dry_run {
-        info!(
-            reference = payment.reference.as_str(),
-            "DRY RUN: would book payment transfer"
-        );
+    if ctx.cfg.dry_run {
+        info!(reference = tag.reference, "DRY RUN: would book payment transfer");
         report.payments_booked += 1;
         return;
     }
-    match firefly.submit_transfer(&transfer).await {
-        Ok(SubmitOutcome::Created) => report.payments_booked += 1,
-        Ok(SubmitOutcome::Duplicate) => report.reconciled += 1,
-        Err(e) => {
-            warn!(reference = payment.reference.as_str(), error = ?e, "payment submit failed → review");
-            report.review += 1;
-        }
+    let result = ctx.firefly.submit_transfer(&transfer).await;
+    if matches!(tally_submit(result, report, &tag), SubmitTally::Created) {
+        report.payments_booked += 1;
     }
 }
 
+// -- statement-pipeline unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -594,21 +615,19 @@ mod tests {
             attachments,
         }
     }
-    fn pdf_att() -> Attachment {
+    fn att(content_type: &str, name: &str, size: usize) -> Attachment {
         Attachment {
             blob_id: "b".into(),
-            content_type: Some("application/pdf".into()),
-            name: Some("4173-XXXX-XXXX-7524.pdf".into()),
-            size: 42715,
+            content_type: Some(content_type.into()),
+            name: Some(name.into()),
+            size,
         }
     }
+    fn pdf_att() -> Attachment {
+        att("application/pdf", "4173-XXXX-XXXX-7524.pdf", 42715)
+    }
     fn other_att() -> Attachment {
-        Attachment {
-            blob_id: "b".into(),
-            content_type: Some("image/png".into()),
-            name: Some("logo.png".into()),
-            size: 10,
-        }
+        att("image/png", "logo.png", 10)
     }
 
     #[test]
@@ -621,31 +640,30 @@ mod tests {
         assert_eq!(classify_message(&m, None), Ingest::Statement);
     }
 
+    /// Classify `msg` with the bank sender hint and assert the expected outcome.
+    #[track_caller]
+    fn assert_classify(msg: &FetchedMessage, expected: Ingest) {
+        assert_eq!(classify_message(msg, Some("bank.example.com")), expected);
+    }
+
     #[test]
     fn pdf_from_configured_sender_is_statement() {
         let m = msg("monthly", "sender@bank.example.com", vec![pdf_att()]);
-        assert_eq!(
-            classify_message(&m, Some("bank.example.com")),
-            Ingest::Statement
-        );
+        assert_classify(&m, Ingest::Statement);
     }
 
+    /// Messages that lack a statement signal should classify as Notification.
     #[test]
-    fn pdf_without_marker_is_notification() {
-        let m = msg("here is a receipt", "someone@example.com", vec![pdf_att()]);
-        assert_eq!(
-            classify_message(&m, Some("bank.example.com")),
-            Ingest::Notification
-        );
-    }
-
-    #[test]
-    fn no_pdf_is_notification_even_with_cuenta_subject() {
-        let m = msg("Cuenta: 123", "sender@bank.example.com", vec![other_att()]);
-        assert_eq!(
-            classify_message(&m, Some("bank.example.com")),
-            Ingest::Notification
-        );
+    fn non_statement_messages_are_notification() {
+        let cases: &[(&str, &str, fn() -> Attachment)] = &[
+            // PDF present but no cuenta subject and no matching sender
+            ("here is a receipt", "someone@example.com", pdf_att),
+            // cuenta subject present but no PDF attachment
+            ("Cuenta: 123", "sender@bank.example.com", other_att),
+        ];
+        for &(subject, from, make_att) in cases {
+            assert_classify(&msg(subject, from, vec![make_att()]), Ingest::Notification);
+        }
     }
 
     #[test]
@@ -657,69 +675,46 @@ mod tests {
             ..Default::default()
         };
         assert!(clean.is_clean());
-        assert!(
-            !StatementReport {
-                amount_mismatch: 1,
-                ..Default::default()
-            }
-            .is_clean()
-        );
-        assert!(
-            !StatementReport {
-                unmatched_booked: 1,
-                ..Default::default()
-            }
-            .is_clean()
-        );
-        assert!(
-            !StatementReport {
-                balance_mismatch: 1,
-                ..Default::default()
-            }
-            .is_clean()
-        );
-        assert!(
-            !StatementReport {
-                review: 1,
-                ..Default::default()
-            }
-            .is_clean()
-        );
-        assert!(
-            !StatementReport {
-                deferred: 1,
-                ..Default::default()
-            }
-            .is_clean()
-        );
+
+        /// Build a default report, set one field to 1, assert it is NOT clean.
+        fn assert_not_clean(set_field: fn(&mut StatementReport)) {
+            let mut r = StatementReport::default();
+            set_field(&mut r);
+            assert!(!r.is_clean(), "expected not clean after: {r:?}");
+        }
+
+        assert_not_clean(|r| r.amount_mismatch = 1);
+        assert_not_clean(|r| r.unmatched_booked = 1);
+        assert_not_clean(|r| r.balance_mismatch = 1);
+        assert_not_clean(|r| r.review = 1);
+        assert_not_clean(|r| r.deferred = 1);
     }
 
     #[test]
     fn check_balance_records_delta_and_distinguishes_absent() {
         use crate::statement::{Last4, Section};
-        use rust_decimal::Decimal;
-        use std::str::FromStr;
+        use crate::test_support::dec;
 
         fn section(anterior: Option<&str>, total: Option<&str>) -> Section {
             Section {
                 currency: SectionCurrency::Usd,
                 primary_last4: Last4::parse("7524").unwrap(),
                 cut_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 22).unwrap(),
-                balance_anterior: anterior.map(|s| Decimal::from_str(s).unwrap()),
-                balance_total: total.map(|s| Decimal::from_str(s).unwrap()),
+                balance_anterior: anterior.map(|s| dec(s)),
+                balance_total: total.map(|s| dec(s)),
             }
         }
 
         // Reconciling (anterior == total, no charges) → Some(0), no mismatch flag.
         let mut r = StatementReport::default();
         check_balance(&section(Some("100.00"), Some("100.00")), &[], &[], &mut r);
-        assert_eq!(r.balance_delta, Some(Decimal::ZERO));
+        assert_eq!(r.balance_delta, Some(dec("0")));
         assert_eq!(r.balance_mismatch, 0);
 
         // Not reconciling (100 → stated 130) → Some(30) + the mismatch flag fires.
         let mut r2 = StatementReport::default();
         check_balance(&section(Some("100.00"), Some("130.00")), &[], &[], &mut r2);
-        assert_eq!(r2.balance_delta, Some(Decimal::from(30)));
+        assert_eq!(r2.balance_delta, Some(dec("30")));
         assert_eq!(r2.balance_mismatch, 1);
 
         // Balances absent → delta stays None (checked ≠ reconciled).

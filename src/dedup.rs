@@ -60,33 +60,29 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
+// -- dedup unit tests (external_id + composite hash) --
 #[cfg(test)]
 mod tests {
+    use crate::schema::Source;
+    use crate::test_support::money;
     use super::*;
-    use crate::schema::{Amount, Currency, Direction, Money, Source};
-    use chrono::NaiveDate;
 
-    fn record() -> Extracted {
-        Extracted {
-            source: Source::Paypal,
-            external_id: Some("8XY12345AB678901C".to_string()),
-            money: Money::new(
-                Amount::parse("149.99").unwrap(),
-                Currency::parse("EUR").unwrap(),
-            ),
-            direction: Direction::Out,
-            date: NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
-            merchant: "Example Merchant B.V.".to_string(),
-            account_hint: None,
-            status: "approved".to_string(),
-            raw_ref: "TESTORDER0123456".to_string(),
-        }
-    }
+    /// Base dedup fixture: PayPal record with transaction id (has external_id).
+    fn record() -> Extracted { crate::test_support::paypal_record() }
 
     fn idless() -> Extracted {
         let mut r = record();
         r.external_id = None;
         r
+    }
+
+    /// Assert that mutating one field of an id-less record changes the composite
+    /// hash (i.e. that field is discriminating).
+    fn assert_field_discriminates(mutate: impl FnOnce(&mut Extracted)) {
+        let a = idless();
+        let mut b = a.clone();
+        mutate(&mut b);
+        assert_ne!(composite_hash(&a), composite_hash(&b));
     }
 
     #[test]
@@ -96,9 +92,12 @@ mod tests {
 
     #[test]
     fn falls_back_to_composite_when_no_id() {
-        let id = external_id(&idless());
-        assert_eq!(id.len(), 64, "sha256 hex is 64 chars");
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        let hash_id = external_id(&idless()); // composite fallback
+        assert_eq!(hash_id.len(), 64, "sha256 hex = 64 chars");
+        assert!(
+            hash_id.chars().all(|c| c.is_ascii_hexdigit()),
+            "composite hash must be pure hex: {hash_id}"
+        );
     }
 
     #[test]
@@ -109,36 +108,21 @@ mod tests {
 
     #[test]
     fn composite_changes_with_amount() {
-        let a = idless();
-        let mut b = a.clone();
-        b.money = Money::new(
-            Amount::parse("202.00").unwrap(),
-            Currency::parse("EUR").unwrap(),
-        );
-        assert_ne!(composite_hash(&a), composite_hash(&b));
+        assert_field_discriminates(|r| r.money = money("202.00", "EUR"));
     }
 
-    /// H3: currency is part of the hash material — same date/amount/merchant in
+    /// H3: currency is part of the hash material -- same date/amount/merchant in
     /// a different currency must not collide.
     #[test]
     fn composite_changes_with_currency() {
-        let a = idless();
-        let mut b = a.clone();
-        b.money = Money::new(
-            Amount::parse("149.99").unwrap(),
-            Currency::parse("USD").unwrap(),
-        );
-        assert_ne!(composite_hash(&a), composite_hash(&b));
+        assert_field_discriminates(|r| r.money = money("149.99", "USD"));
     }
 
-    /// H3: source is part of the hash material — same fields from a different
+    /// H3: source is part of the hash material -- same fields from a different
     /// source must not collide.
     #[test]
     fn composite_changes_with_source() {
-        let a = idless();
-        let mut b = a.clone();
-        b.source = Source::BancoPopular;
-        assert_ne!(composite_hash(&a), composite_hash(&b));
+        assert_field_discriminates(|r| r.source = Source::BancoPopular);
     }
 
     // --- property tests --------------------------------------------------
@@ -147,19 +131,14 @@ mod tests {
 
     /// Build an id-less record from salient fields, for hashing-invariant props.
     fn idless_with(
-        source: Source,
-        amount: &str,
-        currency: &str,
-        merchant: &str,
+        source: Source, // dedup hash source discriminant
+        amount: &str, currency: &str, merchant: &str,
         last4: &str,
         status: &str,
     ) -> Extracted {
         let mut r = idless();
         r.source = source;
-        r.money = Money::new(
-            Amount::parse(amount).unwrap(),
-            Currency::parse(currency).unwrap(),
-        );
+        r.money = money(amount, currency);
         r.merchant = merchant.to_string();
         r.account_hint = Some(last4.to_string());
         r.status = status.to_string();
@@ -192,7 +171,7 @@ mod tests {
         ) {
             let a = idless_with(Source::Paypal, &amount, "USD", &merchant, "1234", "approved");
             let b = idless_with(Source::Paypal, &amount, "EUR", &merchant, "1234", "approved");
-            prop_assert_ne!(composite_hash(&a), composite_hash(&b));
+            prop_assert_ne!(composite_hash(&a), composite_hash(&b)); // H3: currency discriminates
         }
 
         /// Status normalization: case and surrounding whitespace do not change

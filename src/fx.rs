@@ -28,7 +28,6 @@
 //! (e.g. `firefly`) get a deterministic rate with no live call.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -51,52 +50,10 @@ const FX_CACHE_TTL_SECS: i64 = 15 * 60;
 /// required. Mirrors [`crate::config`]'s `DEFAULT_FX_URL`.
 pub const DEFAULT_FX_URL: &str = "https://api.frankfurter.dev/v1";
 
-/// A rate-lookup failure, classified by whether retrying could help.
-///
-/// `Transient` (5xx / 408 / 429 / network / timeout) means the provider is
-/// momentarily unreachable — the caller should *defer* (leave the message in the
-/// INBOX and retry on the next run) rather than burning it to Review. `Permanent`
-/// (4xx auth/bad-request, a parse failure, or an unsupported currency) will not
-/// improve on retry, so it routes to Review as before.
-#[derive(Debug, Clone)]
-pub enum RateError {
-    Transient(String),
-    Permanent(String),
-}
-
-impl fmt::Display for RateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RateError::Transient(m) => write!(f, "transient rate failure: {m}"),
-            RateError::Permanent(m) => write!(f, "permanent rate failure: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for RateError {}
-
-/// Whether `err`'s chain carries a [`RateError::Transient`] — i.e. the failure is
-/// a momentary provider outage and the message should be deferred (kept in INBOX
-/// for the next run) rather than routed to Review. Walks the full `anyhow` chain
-/// so it survives `.context(...)` wrapping.
-#[must_use]
-pub fn is_transient(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|e| matches!(e.downcast_ref::<RateError>(), Some(RateError::Transient(_))))
-}
-
-/// Classify an HTTP status into a [`RateError`] variant: server errors plus the
-/// retryable 408/429 are transient; every other non-success is permanent.
-fn classify_status(status: reqwest::StatusCode, msg: String) -> RateError {
-    if status.is_server_error()
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-    {
-        RateError::Transient(msg)
-    } else {
-        RateError::Permanent(msg)
-    }
-}
+// A rate-lookup failure, classified by whether retrying could help.
+// Transient = 5xx/408/429/network/timeout (defer + retry next run).
+// Permanent = 4xx/parse/unsupported-currency (route to Review).
+crate::transient::define_provider_error!(RateError, "rate");
 
 /// Cache key: the (from, to, date) triple a rate is requested for. `from`/`to`
 /// are stored upper-cased so lookups are case-insensitive.
@@ -227,12 +184,7 @@ impl<'a> FxClient<'a> {
                 })
                 .collect()
         };
-        if let Some(parent) = std::path::Path::new(path).parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating FX cache dir {}", parent.display()))?;
-        }
+        crate::config::ensure_parent_dir(path, "FX cache")?;
         let json = serde_json::to_string(&entries).context("serializing FX cache")?;
         std::fs::write(path, json).with_context(|| format!("writing FX cache {path}"))?;
         Ok(())
@@ -328,7 +280,7 @@ impl<'a> FxClient<'a> {
             .http
             .get(&url)
             .header(reqwest::header::ACCEPT, "application/json")
-            .send()
+            .send() // frankfurter rate fetch
             .await
             .map_err(|e| {
                 anyhow::Error::new(RateError::Transient(format!(
@@ -607,20 +559,20 @@ impl<'a> DopRate<'a> {
             .send()
             .await
             .map_err(|e| RateError::Transient(format!("{what}: {e}")))?;
-        let status = resp.status();
+        let http_status = resp.status(); // classified-send status
         let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
+        if http_status.is_success() {
             return Ok(body);
         }
         // The body is omitted for endpoints whose error response could echo a
         // secret (the OAuth token endpoint) — these errors are logged verbatim
         // via `warn!(error = %e)`, so a leaked body would reach Loki.
         let msg = if include_body_in_error {
-            format!("{what} returned {status}: {}", body.trim())
+            format!("{what} returned {http_status}: {}", body.trim())
         } else {
-            format!("{what} returned {status}")
+            format!("{what} returned {http_status}")
         };
-        Err(classify_status(status, msg))
+        Err(classify_status(http_status, msg))
     }
 }
 
@@ -712,9 +664,11 @@ impl<'a> DopRate<'a> {
     }
 }
 
+// -- fx unit tests (rate lookup, cache, DOP provider) --
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{dec, test_runtime};
 
     #[test]
     fn identity_is_case_and_whitespace_insensitive() {
@@ -732,27 +686,20 @@ mod tests {
         let http = Client::new();
         let fx = FxClient::new(&http, "http://fx.invalid");
         let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let r = rt.block_on(fx.rate("USD", "usd", date)).unwrap();
+        let r = test_runtime().block_on(fx.rate("USD", "usd", date)).unwrap();
         assert_eq!(r, Decimal::ONE);
     }
 
     #[test]
     fn parses_rate_from_frankfurter_body() {
         let body = r#"{"amount":1.0,"base":"USD","date":"2026-05-27","rates":{"EUR":0.92}}"#;
-        let rate = parse_rate(body, "EUR").unwrap();
-        assert_eq!(rate, Decimal::from_str("0.92").unwrap());
+        assert_eq!(parse_rate(body, "EUR").unwrap(), dec("0.92"));
     }
 
     #[test]
     fn parse_rate_is_case_insensitive_on_target() {
         let body = r#"{"amount":1.0,"base":"USD","date":"2026-05-27","rates":{"JPY":143.5}}"#;
-        assert_eq!(
-            parse_rate(body, "jpy").unwrap(),
-            Decimal::from_str("143.5").unwrap()
-        );
+        assert_eq!(parse_rate(body, "jpy").unwrap(), dec("143.5"));
     }
 
     #[test]
@@ -777,8 +724,8 @@ mod tests {
             {"descripcion":"EUR","compra":60,"venta":62.5}
         ]}}"#;
         let t = parse_rate_table(body).unwrap();
-        assert_eq!(t.get("USD").unwrap(), &Decimal::from_str("56.95").unwrap());
-        assert_eq!(t.get("EUR").unwrap(), &Decimal::from_str("62.5").unwrap());
+        assert_eq!(t.get("USD"), Some(&dec("56.95")));
+        assert_eq!(t.get("EUR"), Some(&dec("62.5")));
     }
 
     #[test]
@@ -787,9 +734,9 @@ mod tests {
             {"descripcion":"USD","compra":"55","venta":"56.95"},
             {"descripcion":"BAD","compra":0,"venta":0}
         ]}}"#;
-        let t = parse_rate_table(body).unwrap();
-        assert_eq!(t.get("USD").unwrap(), &Decimal::from_str("56.95").unwrap());
-        assert!(!t.contains_key("BAD"), "non-positive rate row is skipped");
+        let tbl = parse_rate_table(body).unwrap(); // string-number tolerance
+        assert_eq!(tbl.get("USD"), Some(&dec("56.95")));
+        assert!(!tbl.contains_key("BAD"), "non-positive rate row is skipped");
     }
 
     #[test]
@@ -810,13 +757,11 @@ mod tests {
     fn dop_rate_inverts_by_direction() {
         // `venta` is DOP per 1 USD. USD→DOP is venta; DOP→USD is its reciprocal.
         let http = Client::new();
-        let venta = Decimal::from_str("56.95").unwrap();
+        let venta = dec("56.95");
         let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
         let fx = FxClient::new(&http, "http://fx.invalid")
             .with_dop(DopRate::with_seeded_table(&http, "USD", venta));
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
+        let rt = test_runtime();
         assert_eq!(rt.block_on(fx.rate("USD", "DOP", date)).unwrap(), venta);
         assert_eq!(
             rt.block_on(fx.rate("DOP", "usd", date)).unwrap(),
@@ -826,69 +771,37 @@ mod tests {
         assert!(rt.block_on(fx.rate("DOP", "JPY", date)).is_err());
     }
 
+    crate::transient::define_classify_assertions!(classify_status, RateError);
+
     #[test]
     fn classify_status_transient_vs_permanent() {
         use reqwest::StatusCode;
         // 521 (Cloudflare origin down), 500, 429, 408 → transient (retry).
-        assert!(matches!(
-            classify_status(StatusCode::from_u16(521).unwrap(), "x".into()),
-            RateError::Transient(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::INTERNAL_SERVER_ERROR, "x".into()),
-            RateError::Transient(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::TOO_MANY_REQUESTS, "x".into()),
-            RateError::Transient(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::REQUEST_TIMEOUT, "x".into()),
-            RateError::Transient(_)
-        ));
-        // 401/403/400 → permanent (don't retry; route to Review).
-        assert!(matches!(
-            classify_status(StatusCode::UNAUTHORIZED, "x".into()),
-            RateError::Permanent(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::FORBIDDEN, "x".into()),
-            RateError::Permanent(_)
-        ));
-        assert!(matches!(
-            classify_status(StatusCode::BAD_REQUEST, "x".into()),
-            RateError::Permanent(_)
-        ));
+        assert_transient(StatusCode::from_u16(521).unwrap());
+        assert_transient(StatusCode::INTERNAL_SERVER_ERROR);
+        assert_transient(StatusCode::TOO_MANY_REQUESTS);
+        assert_transient(StatusCode::REQUEST_TIMEOUT);
+        // Auth, client, and forbidden errors are permanent (route to Review).
+        assert_permanent(StatusCode::BAD_REQUEST);
+        assert_permanent(StatusCode::UNAUTHORIZED);
+        assert_permanent(StatusCode::FORBIDDEN);
     }
 
     #[test]
-    fn is_transient_walks_the_context_chain() {
-        // Survives `.context(...)` wrapping (how the pipeline sees it).
-        let transient = anyhow::Error::new(RateError::Transient("521".into()))
-            .context("resolving DOP rate for DOP->USD on 2026-04-24");
-        assert!(is_transient(&transient));
-        let permanent =
-            anyhow::Error::new(RateError::Permanent("401".into())).context("resolving DOP rate");
-        assert!(!is_transient(&permanent));
-        assert!(!is_transient(&anyhow!("an unrelated error")));
+    fn transient_chain_propagation() {
+        crate::transient::assert_transient_chain!(is_transient, RateError);
     }
 
     #[test]
     fn seeded_rate_returns_without_network() {
         let http = Client::new();
-        let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
-        let fx = FxClient::with_seeded_rate(
-            &http,
-            "JPY",
-            "USD",
-            date,
-            Decimal::from_str("0.0064").unwrap(),
+        let may_27 = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
+        let fx = FxClient::with_seeded_rate(&http, "JPY", "USD", may_27, dec("0.0064"));
+        // Case-insensitive lookup and seeded value round-trip.
+        assert_eq!(
+            test_runtime().block_on(fx.rate("jpy", "USD", may_27)).unwrap(),
+            dec("0.0064"),
         );
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let r = rt.block_on(fx.rate("jpy", "USD", date)).unwrap();
-        assert_eq!(r, Decimal::from_str("0.0064").unwrap());
     }
 
     // --- persistent cache + TTL ------------------------------------------
@@ -931,13 +844,13 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 5, 12).unwrap(),
         );
         let fx = FxClient::new(&http, DEFAULT_FX_URL).with_cache_file(&path);
-        fx.cache_put(key.clone(), Decimal::from_str("0.92").unwrap());
+        fx.cache_put(key.clone(), dec("0.92"));
         fx.persist().expect("persist writes the cache file");
 
         let loaded = load_cache(&path);
         assert_eq!(
             loaded.get(&key).map(|e| e.rate),
-            Some(Decimal::from_str("0.92").unwrap()),
+            Some(dec("0.92")),
             "persisted rate reloads under the same key"
         );
         let _ = std::fs::remove_file(&path);

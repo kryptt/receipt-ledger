@@ -132,6 +132,45 @@ enum Intent {
     Claim { journal: usize, score: f64 },
 }
 
+/// Shared matching context: the journals, tuning parameters, and alias map that
+/// every matching helper needs. Bundled to avoid threading three references
+/// through every internal call.
+struct MatchCtx<'a> {
+    journals: &'a [ExistingJournal],
+    params: &'a ReconcileParams,
+    alias_map: &'a [(String, String)],
+}
+
+impl<'a> MatchCtx<'a> {
+    /// Build context from the common `(journals, params, aliases)` triple that
+    /// both public entry-points receive.
+    fn build(
+        existing: &'a [ExistingJournal],
+        cfg: &'a ReconcileParams,
+        merchant_aliases: &'a [(String, String)],
+    ) -> Self {
+        Self {
+            journals: existing,
+            params: cfg,
+            alias_map: merchant_aliases,
+        }
+    }
+
+    /// Whether `merchant` on `date` is a plausible match for journal `j`:
+    /// within the date window **and** merchant similarity at or above the
+    /// gray-zone threshold.
+    fn plausible(&self, merchant: &str, date: NaiveDate, j: &ExistingJournal) -> bool {
+        within_window(date, j.date, self.params.date_window_days)
+            && merchant_similarity(merchant, &j.merchant, self.alias_map)
+                >= self.params.merchant_gray
+    }
+
+    /// Merchant similarity score for two names under the context's alias map.
+    fn similarity(&self, a: &str, b: &str) -> f64 {
+        merchant_similarity(a, b, self.alias_map)
+    }
+}
+
 /// Reconcile one section's **charges** (callers pass `Direction::Out` rows;
 /// payments book via the transfer path) against that account's existing
 /// journals. Pure, deterministic, and order-independent.
@@ -147,6 +186,8 @@ pub fn reconcile(
         "merchant_gray must not exceed merchant_threshold"
     );
     debug_assert!(p.score_epsilon >= 0.0, "score_epsilon must be non-negative");
+
+    let ctx = MatchCtx::build(journals, p, aliases);
 
     let n = charges.len();
     let m = journals.len();
@@ -173,7 +214,7 @@ pub fn reconcile(
         if outcome[ci].is_some() {
             continue;
         }
-        intents.push((ci, intent_for(charge, journals, &taken, p, aliases)));
+        intents.push((ci, intent_for(charge, &taken, &ctx)));
     }
 
     // --- 2b. resolve Claims globally: group by journal, pick a winner -------
@@ -199,9 +240,7 @@ pub fn reconcile(
             ji,
             &claimants,
             charges,
-            journals,
-            p,
-            aliases,
+            &ctx,
             &mut winner,
             &mut conflict,
             &mut book,
@@ -258,55 +297,45 @@ pub fn reconcile(
 }
 
 /// Decide one charge's intent against the currently-free journals (pass 1).
-fn intent_for(
-    charge: &StatementTxn,
-    journals: &[ExistingJournal],
-    taken: &[bool],
-    p: &ReconcileParams,
-    aliases: &[(String, String)],
-) -> Intent {
-    let mut cands: Vec<(usize, f64)> = journals
+fn intent_for(charge: &StatementTxn, taken: &[bool], ctx: &MatchCtx<'_>) -> Intent {
+    let mut cands: Vec<(usize, f64)> = ctx
+        .journals
         .iter()
         .enumerate()
         .filter(|&(i, j)| {
             !taken[i]
                 && same_currency(charge, j)
-                && within_window(charge.auth_date, j.date, p.date_window_days)
+                && within_window(charge.auth_date, j.date, ctx.params.date_window_days)
         })
-        .map(|(i, j)| {
-            (
-                i,
-                merchant_similarity(&charge.merchant, &j.merchant, aliases),
-            )
-        })
-        .filter(|&(_, s)| s >= p.merchant_gray)
+        .map(|(i, j)| (i, ctx.similarity(&charge.merchant, &j.merchant)))
+        .filter(|&(_, s)| s >= ctx.params.merchant_gray)
         .collect();
     // Deterministic order: score desc, then journal id asc (so equal-score ties
     // resolve the same way across runs regardless of pagination order).
     cands.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| journals[a.0].id.cmp(&journals[b.0].id))
+            .then_with(|| ctx.journals[a.0].id.cmp(&ctx.journals[b.0].id))
     });
 
     let Some(&(best_j, best_s)) = cands.first() else {
         return Intent::Book; // no journal even close → genuinely missing
     };
-    if best_s < p.merchant_threshold {
+    if best_s < ctx.params.merchant_threshold {
         // Gray-zone near-match: could be the same charge described differently —
         // forbid booking a duplicate.
         return Intent::Review(format!(
             "possible duplicate of journal {} (merchant similarity {:.2} below {:.2}); not booked",
-            journals[best_j].id, best_s, p.merchant_threshold
+            ctx.journals[best_j].id, best_s, ctx.params.merchant_threshold
         ));
     }
     if let Some(&(_, second_s)) = cands.get(1)
-        && second_s >= p.merchant_threshold
-        && (best_s - second_s) < p.score_epsilon
+        && second_s >= ctx.params.merchant_threshold
+        && (best_s - second_s) < ctx.params.score_epsilon
     {
         return Intent::Review(format!(
             "ambiguous: multiple journals match within {:.2} (top {best_s:.2}/{second_s:.2})",
-            p.score_epsilon
+            ctx.params.score_epsilon
         ));
     }
     Intent::Claim {
@@ -321,19 +350,16 @@ fn intent_for(
 /// separate purchases at the same merchant — booked as new when they have no
 /// other plausible journal, else routed to review (the double-book guard). If no
 /// claimant is clearly nearest, the whole cluster routes to review.
-#[allow(clippy::too_many_arguments)]
 fn resolve_cluster(
     journal: usize,
     claimants: &[(usize, f64)],
     charges: &[StatementTxn],
-    journals: &[ExistingJournal],
-    p: &ReconcileParams,
-    aliases: &[(String, String)],
+    ctx: &MatchCtx<'_>,
     winner: &mut HashMap<usize, usize>,
     conflict: &mut HashMap<usize, String>,
     book: &mut HashSet<usize>,
 ) {
-    let jamt = journals[journal].amount.amount.value();
+    let jamt = ctx.journals[journal].amount.amount.value();
     let mut by_dist: Vec<(usize, Decimal)> = claimants
         .iter()
         .map(|&(ci, _)| (ci, (charges[ci].money.amount.value() - jamt).abs()))
@@ -352,12 +378,12 @@ fn resolve_cluster(
     if clearly_nearest && within_sanity {
         winner.insert(near_ci, journal);
         for &(ci, _) in claimants.iter().filter(|&&(c, _)| c != near_ci) {
-            if has_other_candidate(&charges[ci], journals, journal, p, aliases) {
+            if has_other_candidate(&charges[ci], journal, ctx) {
                 conflict.insert(
                     ci,
                     format!(
                         "same-merchant cluster loser with another plausible journal {}; not booked",
-                        journals[journal].id
+                        ctx.journals[journal].id
                     ),
                 );
             } else {
@@ -370,7 +396,7 @@ fn resolve_cluster(
                 ci,
                 format!(
                     "multiple charges contend for journal {} (amount-ambiguous); not booked",
-                    journals[journal].id
+                    ctx.journals[journal].id
                 ),
             );
         }
@@ -380,18 +406,9 @@ fn resolve_cluster(
 /// Whether `charge` has *another* plausible journal besides `exclude` (same
 /// currency, within the date window, merchant similarity ≥ gray) — so a cluster
 /// loser is only booked-new when nothing else could be its duplicate.
-fn has_other_candidate(
-    charge: &StatementTxn,
-    journals: &[ExistingJournal],
-    exclude: usize,
-    p: &ReconcileParams,
-    aliases: &[(String, String)],
-) -> bool {
-    journals.iter().enumerate().any(|(i, j)| {
-        i != exclude
-            && same_currency(charge, j)
-            && within_window(charge.auth_date, j.date, p.date_window_days)
-            && merchant_similarity(&charge.merchant, &j.merchant, aliases) >= p.merchant_gray
+fn has_other_candidate(charge: &StatementTxn, exclude: usize, ctx: &MatchCtx<'_>) -> bool {
+    ctx.journals.iter().enumerate().any(|(i, j)| {
+        i != exclude && same_currency(charge, j) && ctx.plausible(&charge.merchant, charge.auth_date, j)
     })
 }
 
@@ -421,15 +438,15 @@ pub fn statement_already_booked<'j>(
     merchant: &str,
     date: NaiveDate,
     journals: &'j [ExistingJournal],
-    p: &ReconcileParams,
-    aliases: &[(String, String)],
+    params: &ReconcileParams,
+    merchant_aliases: &[(String, String)],
 ) -> Option<&'j ExistingJournal> {
+    let ctx = MatchCtx::build(journals, params, merchant_aliases);
     journals.iter().find(|j| {
         j.external_id
             .as_deref()
             .is_some_and(|e| e.starts_with("bpstmt:"))
-            && within_window(date, j.date, p.date_window_days)
-            && merchant_similarity(merchant, &j.merchant, aliases) >= p.merchant_gray
+            && ctx.plausible(merchant, date, j)
     })
 }
 
@@ -515,25 +532,26 @@ fn tokens(s: &str) -> Vec<String> {
         .collect()
 }
 
-/// Normalise a merchant string for comparison. Distinct from
-/// [`crate::validate`]'s status normaliser (which also collapses punctuation);
-/// kept separate on purpose — different domain, different rules.
+/// Normalise a merchant string for comparison: collapse whitespace + lowercase.
+///
+/// Delegates to [`crate::eval::scorer::canon_merchant`] (the single
+/// implementation of the collapse-whitespace-then-lowercase pattern) so the
+/// two callsites cannot drift apart.
 fn normalize_merchant(s: &str) -> String {
-    s.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    crate::eval::scorer::canon_merchant(s)
 }
 
 fn within_window(a: NaiveDate, b: NaiveDate, days: i64) -> bool {
     (a - b).num_days().abs() <= days
 }
 
+// -- statement-reconcile unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Amount, Currency, Direction, Money};
+    use crate::schema::{Direction, Money};
     use crate::statement::SectionCurrency;
+    use crate::test_support::{dec, money};
 
     fn charge(reference: &str, merchant: &str, amount: &str, day: u32) -> StatementTxn {
         let d = NaiveDate::from_ymd_opt(2026, 4, day).unwrap();
@@ -543,10 +561,7 @@ mod tests {
             auth_date: d,
             reference: Reference::parse(reference).unwrap(),
             merchant: merchant.to_string(),
-            money: Money::new(
-                Amount::parse(amount).unwrap(),
-                SectionCurrency::Usd.currency(),
-            ),
+            money: money(amount, "USD"),
             direction: Direction::Out,
             mcc: None,
             auth_code: None,
@@ -554,10 +569,7 @@ mod tests {
     }
 
     fn usd(amount: &str) -> Money {
-        Money::new(
-            Amount::parse(amount).unwrap(),
-            Currency::parse("USD").unwrap(),
-        )
+        money(amount, "USD")
     }
 
     fn journal(id: &str, merchant: &str, amount: &str, day: u32) -> ExistingJournal {
@@ -570,11 +582,34 @@ mod tests {
         }
     }
 
+    /// Reconcile with default params and no aliases (the common-case shorthand).
+    fn run_default(charges: &[StatementTxn], journals: &[ExistingJournal]) -> Reconciliation {
+        reconcile(charges, journals, &ReconcileParams::default(), &[])
+    }
+
+    /// Double-book probe against a single journal (the repeated pattern in the
+    /// probe test).
+    fn probe_one(
+        merchant: &str,
+        date: NaiveDate,
+        j: &ExistingJournal,
+    ) -> Option<ExistingJournal> {
+        let p = ReconcileParams::default();
+        statement_already_booked(merchant, date, std::slice::from_ref(j), &p, &[]).cloned()
+    }
+
+    /// Clone a journal with a different `external_id`.
+    fn with_ext_id(base: &ExistingJournal, ext: Option<&str>) -> ExistingJournal {
+        ExistingJournal {
+            external_id: ext.map(str::to_string),
+            ..base.clone()
+        }
+    }
+
     // --- Phase-2 (d): symmetric double-book probe (consumo side) -----------
 
     #[test]
     fn double_book_probe_flags_only_statement_bookings_in_window() {
-        let p = ReconcileParams::default();
         let day = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
         let stmt = ExistingJournal {
             external_id: Some("bpstmt:74542016112077674827117".to_string()),
@@ -582,43 +617,20 @@ mod tests {
         };
 
         // A consumo "JR EAST" on the same day matches the statement booking
-        // (token containment) → flagged (would double-book).
-        assert!(
-            statement_already_booked("JR EAST", day, std::slice::from_ref(&stmt), &p, &[])
-                .is_some()
-        );
+        // (token containment) -> flagged (would double-book).
+        assert!(probe_one("JR EAST", day, &stmt).is_some());
 
         // A CONSUMO-booked journal (non-`bpstmt:` external_id, or none) is NOT a
-        // double-book risk — the probe ignores it.
-        let consumo = ExistingJournal {
-            external_id: Some("8XY12345AB".to_string()),
-            ..stmt.clone()
-        };
-        assert!(
-            statement_already_booked("JR EAST", day, std::slice::from_ref(&consumo), &p, &[])
-                .is_none()
-        );
-        let untagged = ExistingJournal {
-            external_id: None,
-            ..stmt.clone()
-        };
-        assert!(
-            statement_already_booked("JR EAST", day, std::slice::from_ref(&untagged), &p, &[])
-                .is_none()
-        );
+        // double-book risk -- the probe ignores it.
+        assert!(probe_one("JR EAST", day, &with_ext_id(&stmt, Some("8XY12345AB"))).is_none());
+        assert!(probe_one("JR EAST", day, &with_ext_id(&stmt, None)).is_none());
 
-        // Outside the date window (9 days > W=5) → no match.
+        // Outside the date window (9 days > W=5) -> no match.
         let far = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
-        assert!(
-            statement_already_booked("JR EAST", far, std::slice::from_ref(&stmt), &p, &[])
-                .is_none()
-        );
+        assert!(probe_one("JR EAST", far, &stmt).is_none());
 
-        // A different merchant → no match.
-        assert!(
-            statement_already_booked("STARBUCKS TOKYO", day, std::slice::from_ref(&stmt), &p, &[])
-                .is_none()
-        );
+        // A different merchant -> no match.
+        assert!(probe_one("STARBUCKS TOKYO", day, &stmt).is_none());
     }
 
     /// Ids of the outcomes, in order, as a coarse fingerprint for permutation tests.
@@ -634,20 +646,133 @@ mod tests {
             .collect()
     }
 
+    /// Sorted multiset of outcome kinds (order-independent comparison).
+    fn sorted_kinds(r: &Reconciliation) -> Vec<&'static str> {
+        let mut k = kinds(r);
+        k.sort_unstable();
+        k
+    }
+
+    /// Assert no charge in the reconciliation was BookNew.
+    #[track_caller]
+    fn assert_no_book(r: &Reconciliation) {
+        assert!(
+            !kinds(r).contains(&"book"),
+            "no charge may BookNew: {:?}",
+            kinds(r)
+        );
+    }
+
+    /// Assert that `r.charges[idx]` is `Confirmed`.
+    #[track_caller]
+    fn assert_confirmed(r: &Reconciliation, idx: usize) {
+        assert!(
+            matches!(r.charges[idx].1, ChargeOutcome::Confirmed { .. }),
+            "charges[{idx}] should be Confirmed, got {:?}",
+            r.charges[idx].1
+        );
+    }
+
+    /// Assert that `r.charges[idx]` is `Review`.
+    #[track_caller]
+    fn assert_review(r: &Reconciliation, idx: usize) {
+        assert!(
+            matches!(r.charges[idx].1, ChargeOutcome::Review { .. }),
+            "charges[{idx}] should be Review, got {:?}",
+            r.charges[idx].1
+        );
+    }
+
+    /// Assert that `r.charges[idx]` is `AmountMismatch`.
+    #[track_caller]
+    fn assert_mismatch(r: &Reconciliation, idx: usize) {
+        assert!(
+            matches!(r.charges[idx].1, ChargeOutcome::AmountMismatch { .. }),
+            "charges[{idx}] should be AmountMismatch, got {:?}",
+            r.charges[idx].1
+        );
+    }
+
+    /// Assert the single-charge happy path: `charges[0]` confirmed and every
+    /// journal consumed (no unmatched). The most-repeated pattern in the suite.
+    #[track_caller]
+    fn assert_confirmed_clean(r: &Reconciliation) {
+        assert_confirmed(r, 0);
+        assert!(r.unmatched_journals.is_empty(), "expected no unmatched journals");
+    }
+
+    /// Assert `charges[idx]` is `BookNew`.
+    #[track_caller]
+    fn assert_book_new(r: &Reconciliation, idx: usize) {
+        assert_eq!(
+            r.charges[idx].1,
+            ChargeOutcome::BookNew,
+            "charges[{idx}] should be BookNew, got {:?}",
+            r.charges[idx].1
+        );
+    }
+
+    /// Assert every charge in the reconciliation is `Review` and none is
+    /// `BookNew` (the safety invariant for contended clusters).
+    #[track_caller]
+    fn assert_all_review_no_book(r: &Reconciliation) {
+        for (idx, (_, outcome)) in r.charges.iter().enumerate() {
+            assert!(
+                matches!(outcome, ChargeOutcome::Review { .. }),
+                "charges[{idx}] should be Review, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Reconcile with a single custom param override (covers the repeated
+    /// `ReconcileParams { field: val, ..Default::default() }` + reconcile
+    /// pattern in several tests).
+    fn run_with_params(
+        txns: &[StatementTxn],
+        existing: &[ExistingJournal],
+        customize: impl FnOnce(&mut ReconcileParams),
+    ) -> Reconciliation {
+        let mut p = ReconcileParams::default();
+        customize(&mut p);
+        reconcile(txns, existing, &p, &[])
+    }
+
+    /// Run with defaults and assert the single-charge happy path.
+    #[track_caller]
+    fn expect_confirmed_clean(txns: &[StatementTxn], existing: &[ExistingJournal]) {
+        let r = run_default(txns, existing);
+        assert_confirmed_clean(&r);
+    }
+
+    /// Run with defaults and assert `charges[0]` is `BookNew`.
+    #[track_caller]
+    fn expect_book_new(txns: &[StatementTxn], existing: &[ExistingJournal]) {
+        let r = run_default(txns, existing);
+        assert_book_new(&r, 0);
+    }
+
+    /// Shared fixture: a JR EAST SIBUYAKU journal paired with a second distinct
+    /// journal, used by the contention and permutation tests.
+    fn jr_east_and_nagano_journals() -> [ExistingJournal; 2] {
+        [
+            journal("J1", "JR EAST SIBUYAKU", "50.93", 21),
+            journal("J2", "NAGANO DENTETSU", "6.66", 23),
+        ]
+    }
+
     #[test]
     fn confirms_close_merchant_same_amount() {
-        let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
-        let journals = [journal("J1", "JR EAST", "50.93", 21)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }));
-        assert!(r.unmatched_journals.is_empty());
+        expect_confirmed_clean(
+            &[charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)],
+            &[journal("J1", "JR EAST", "50.93", 21)],
+        );
     }
 
     #[test]
     fn amount_mismatch_when_estimate_differs() {
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
+        let r = run_default(&charges, &journals);
         match &r.charges[0].1 {
             ChargeOutcome::AmountMismatch {
                 journal_id,
@@ -655,8 +780,8 @@ mod tests {
                 booked,
             } => {
                 assert_eq!(journal_id, "J1");
-                assert_eq!(*statement, Decimal::from_str_exact("50.93").unwrap());
-                assert_eq!(*booked, Decimal::from_str_exact("51.10").unwrap());
+                assert_eq!(*statement, dec("50.93"));
+                assert_eq!(*booked, dec("51.10"));
             }
             other => panic!("expected AmountMismatch, got {other:?}"),
         }
@@ -667,24 +792,18 @@ mod tests {
         // H2 regression: a custom tolerance must actually change the verdict.
         let charges = [charge("0601324353", "JR EAST SIBUYAKU", "50.93", 21)];
         let journals = [journal("J1", "JR EAST SIBUYAKU", "51.10", 21)];
-        let wide = ReconcileParams {
-            amount_tolerance: Decimal::new(50, 2),
-            ..Default::default()
-        }; // 0.50
-        let r = reconcile(&charges, &journals, &wide, &[]);
-        assert!(
-            matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
-            "a 0.50 tolerance should absorb a 0.17 gap → Confirmed, got {:?}",
-            r.charges[0].1
-        );
+        let r = run_with_params(&charges, &journals, |p| {
+            p.amount_tolerance = dec("0.50");
+        });
+        assert_confirmed(&r, 0);
     }
 
     #[test]
     fn unmatched_charge_books_new() {
-        let charges = [charge("0601324353", "TOTALLY NEW MERCHANT", "9.99", 10)];
-        let journals = [journal("J1", "SOMETHING ELSE", "1.00", 28)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert_eq!(r.charges[0].1, ChargeOutcome::BookNew);
+        let txns = [charge("0601324353", "TOTALLY NEW MERCHANT", "9.99", 10)];
+        let existing = [journal("J1", "SOMETHING ELSE", "1.00", 28)];
+        let r = run_default(&txns, &existing);
+        assert_book_new(&r, 0);
         assert_eq!(r.unmatched_journals.len(), 1);
         assert_eq!(r.unmatched_journals[0].id, "J1");
     }
@@ -693,77 +812,55 @@ mod tests {
     fn gray_zone_near_match_is_reviewed_not_booked() {
         let charges = [charge("0601324353", "NAGANO DENTETSU", "6.66", 23)];
         let journals = [journal("J1", "NAGANO DENX", "6.66", 23)];
-        let p = ReconcileParams {
-            merchant_threshold: 0.99,
-            ..Default::default()
-        };
-        let r = reconcile(&charges, &journals, &p, &[]);
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
+        let r = run_with_params(&charges, &journals, |p| {
+            p.merchant_threshold = 0.99;
+        });
+        assert_review(&r, 0);
         assert_eq!(r.unmatched_journals.len(), 1);
     }
 
     #[test]
     fn ambiguous_two_equal_candidates_reviewed() {
-        let charges = [charge("0601324353", "7-ELEVEN", "7.28", 17)];
-        let journals = [
+        let txns = [charge("0601324353", "7-ELEVEN", "7.28", 17)];
+        let twins = [
             journal("J1", "7-ELEVEN", "7.28", 17),
             journal("J2", "7-ELEVEN", "7.28", 17),
         ];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
+        let r = run_default(&txns, &twins);
+        assert_review(&r, 0);
         assert_eq!(r.unmatched_journals.len(), 2);
     }
 
     #[test]
     fn prior_bpstmt_booking_confirmed_by_external_id() {
-        let charges = [charge(
-            "74987506133002256024229",
-            "7-Eleven B315 Kastrup",
-            "7.28",
-            17,
-        )];
-        let journals = [ExistingJournal {
-            id: "J9".to_string(),
-            date: NaiveDate::from_ymd_opt(2026, 4, 17).unwrap(),
-            amount: usd("7.28"),
-            merchant: "7-Eleven B315 Kastrup".to_string(),
+        let stmt_journal = ExistingJournal {
             external_id: Some("bpstmt:74987506133002256024229".to_string()),
-        }];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert_eq!(
-            r.charges[0].1,
-            ChargeOutcome::Confirmed {
-                journal_id: "J9".to_string()
-            }
+            ..journal("J9", "7-Eleven B315 Kastrup", "7.28", 17)
+        };
+        expect_confirmed_clean(
+            &[charge("74987506133002256024229", "7-Eleven B315 Kastrup", "7.28", 17)],
+            &[stmt_journal],
         );
     }
 
     #[test]
     fn date_outside_window_does_not_match() {
-        let charges = [charge("0601324353", "JR EAST", "50.93", 1)];
-        let journals = [journal("J1", "JR EAST", "50.93", 28)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert_eq!(r.charges[0].1, ChargeOutcome::BookNew);
+        expect_book_new(
+            &[charge("0601324353", "JR EAST", "50.93", 1)],
+            &[journal("J1", "JR EAST", "50.93", 28)],
+        );
     }
 
     #[test]
     fn different_currency_does_not_match() {
-        let charges = [charge("0601324353", "JR EAST", "50.93", 21)];
+        // USD charge must not match a DOP journal
         let dop = ExistingJournal {
-            id: "J1".into(),
-            date: NaiveDate::from_ymd_opt(2026, 4, 21).unwrap(),
-            amount: Money::new(
-                Amount::parse("50.93").unwrap(),
-                Currency::parse("DOP").unwrap(),
-            ),
-            merchant: "JR EAST".into(),
-            external_id: None,
+            amount: money("50.93", "DOP"),
+            ..journal("J1", "JR EAST", "50.93", 21)
         };
-        let r = reconcile(&charges, &[dop], &ReconcileParams::default(), &[]);
-        assert_eq!(
-            r.charges[0].1,
-            ChargeOutcome::BookNew,
-            "USD charge must not match a DOP journal"
+        expect_book_new(
+            &[charge("0601324353", "JR EAST", "50.93", 21)],
+            &[dop],
         );
     }
 
@@ -777,14 +874,8 @@ mod tests {
         let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21);
 
         for order in [[a.clone(), b.clone()], [b.clone(), a.clone()]] {
-            let r = reconcile(&order, &journals, &ReconcileParams::default(), &[]);
-            let books = kinds(&r).iter().filter(|k| **k == "book").count();
-            assert_eq!(
-                books,
-                0,
-                "no charge may BookNew against a contended journal: {:?}",
-                kinds(&r)
-            );
+            let r = run_default(&order, &journals);
+            assert_no_book(&r);
             // Exactly one confirmed (the winner) or both reviewed; never a dup booking.
             let confirmed = kinds(&r).iter().filter(|k| **k == "confirmed").count();
             assert!(confirmed <= 1);
@@ -793,7 +884,7 @@ mod tests {
 
     /// Contention safety: when several similar charges and journals all match
     /// each other (token-containment saturates), the matcher cannot confidently
-    /// assign, so it routes to Review — the one invariant that matters for money
+    /// assign, so it routes to Review -- the one invariant that matters for money
     /// is that **no charge BookNews** (which would double-book) and no journal is
     /// consumed twice. Pinned so it can't silently drift.
     #[test]
@@ -804,48 +895,22 @@ mod tests {
         ];
         let a = charge("0601000001", "JR EAST SIBUYAKU", "50.93", 21);
         let b = charge("0601000002", "JR EAST SIBUYAKU TOKYO", "50.93", 21);
-        let r = reconcile(&[a, b], &journals, &ReconcileParams::default(), &[]);
-
-        assert!(
-            !kinds(&r).contains(&"book"),
-            "contended charges must not BookNew: {:?}",
-            kinds(&r)
-        );
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
-        assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
+        let r = run_default(&[a, b], &journals);
+        assert_all_review_no_book(&r);
     }
 
     /// Permutation invariance: the multiset of outcomes is independent of input
     /// order (the property that makes the greedy double-book impossible).
     #[test]
     fn outcomes_are_permutation_invariant() {
-        let journals = [
-            journal("J1", "JR EAST SIBUYAKU", "50.93", 21),
-            journal("J2", "NAGANO DENTETSU", "6.66", 23),
-        ];
+        let journals = jr_east_and_nagano_journals();
         let c1 = charge("0601000001", "JR EAST SIBUYAKU", "50.93", 21);
         let c2 = charge("0601000002", "NAGANO DENTETSU", "6.66", 23);
         let c3 = charge("0601000003", "BRAND NEW CAFE", "3.00", 19);
 
-        let mut sorted_a = {
-            let r = reconcile(
-                &[c1.clone(), c2.clone(), c3.clone()],
-                &journals,
-                &ReconcileParams::default(),
-                &[],
-            );
-            let mut k = kinds(&r);
-            k.sort_unstable();
-            k
-        };
-        let sorted_b = {
-            let r = reconcile(&[c3, c1, c2], &journals, &ReconcileParams::default(), &[]);
-            let mut k = kinds(&r);
-            k.sort_unstable();
-            k
-        };
-        sorted_a.sort_unstable();
-        assert_eq!(sorted_a, sorted_b);
+        let sa = sorted_kinds(&run_default(&[c1.clone(), c2.clone(), c3.clone()], &journals));
+        let sb = sorted_kinds(&run_default(&[c3, c1, c2], &journals));
+        assert_eq!(sa, sb);
     }
 
     // --- merchant matching improvements (point 1) --------------------------
@@ -880,68 +945,46 @@ mod tests {
 
     /// The dry-run's real false-negative: a consumo `JOMPEAME` journal vs the
     /// statement's `DONACION JOMPEAME JOMPEAME.COM`. Jaro-Winkler alone scored it
-    /// too low → BookNew (a double-book). Token-containment now confirms it even
+    /// too low -> BookNew (a double-book). Token-containment now confirms it even
     /// with NO alias rule configured.
     #[test]
     fn contained_merchant_confirms_without_alias() {
-        let charges = [charge(
-            "0601324353",
-            "DONACION JOMPEAME JOMPEAME.COM",
-            "1000.00",
-            24,
-        )];
-        let journals = [journal("J1", "JOMPEAME", "1000.00", 24)];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert!(
-            matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
-            "containment should confirm, not BookNew: {:?}",
-            r.charges[0].1
+        expect_confirmed_clean(
+            &[charge("0601324353", "DONACION JOMPEAME JOMPEAME.COM", "1000.00", 24)],
+            &[journal("J1", "JOMPEAME", "1000.00", 24)],
         );
-        assert!(r.unmatched_journals.is_empty());
     }
 
     /// The real NAGANO case: 3 same-merchant statement rows claim 1 consumo
     /// journal (an ECB estimate near the 33.33 billed). Amount disambiguates:
-    /// the 33.33 row matches the journal (amount differs → mismatch, to correct),
-    /// the other two are separate purchases → booked new. Previously all 3 → Review.
+    /// the 33.33 row matches the journal (amount differs -> mismatch, to correct),
+    /// the other two are separate purchases -> booked new. Previously all 3 -> Review.
     #[test]
     fn cluster_disambiguates_by_amount() {
-        let journals = [journal("J964", "NAGANO DENTETSU", "32.27", 21)];
-        let charges = [
+        let existing = [journal("J964", "NAGANO DENTETSU", "32.27", 21)];
+        let nagano_txns = [
             charge("0601000001", "NAGANO DENTETSU NAGANO", "33.33", 21),
             charge("0601000002", "NAGANO DENTETSU NAGANO", "6.66", 23),
             charge("0601000003", "NAGANO DENTETSU NAGANO", "28.45", 22),
         ];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert!(
-            matches!(r.charges[0].1, ChargeOutcome::AmountMismatch { .. }),
-            "nearest-amount row matches the journal: {:?}",
-            r.charges[0].1
-        );
-        assert_eq!(r.charges[1].1, ChargeOutcome::BookNew);
-        assert_eq!(r.charges[2].1, ChargeOutcome::BookNew);
-        assert!(
-            r.unmatched_journals.is_empty(),
-            "journal consumed by the amount match"
-        );
+        let r = run_default(&nagano_txns, &existing);
+        assert_mismatch(&r, 0);
+        assert_book_new(&r, 1);
+        assert_book_new(&r, 2);
+        assert!(r.unmatched_journals.is_empty(), "journal consumed by the amount match");
     }
 
-    /// Cluster where two charges are equidistant from the journal — no clear
-    /// nearest → safe fallback to Review (never an arbitrary confirm/book).
+    /// Cluster where two charges are equidistant from the journal -- no clear
+    /// nearest -> safe fallback to Review (never an arbitrary confirm/book).
     #[test]
     fn cluster_amount_ambiguous_all_review() {
-        let journals = [journal("J1", "CAFE MOCHA", "10.00", 21)];
-        let charges = [
+        let existing = [journal("J1", "CAFE MOCHA", "10.00", 21)];
+        let cafe_txns = [
             charge("0601000001", "CAFE MOCHA TOKYO", "9.00", 21),
             charge("0601000002", "CAFE MOCHA TOKYO", "11.00", 21),
         ];
-        let r = reconcile(&charges, &journals, &ReconcileParams::default(), &[]);
-        assert!(matches!(r.charges[0].1, ChargeOutcome::Review { .. }));
-        assert!(matches!(r.charges[1].1, ChargeOutcome::Review { .. }));
-        assert!(
-            !kinds(&r).contains(&"book"),
-            "ambiguous cluster never books"
-        );
+        let r = run_default(&cafe_txns, &existing);
+        assert_all_review_no_book(&r);
     }
 
     /// With an alias rule, even names that share *no* tokens canonicalize to the
@@ -955,10 +998,6 @@ mod tests {
         let charges = [charge("0601324353", "GOOG*YOUTUBEPREMIUM", "11.99", 21)];
         let journals = [journal("J1", "YOUTUBE", "11.99", 21)];
         let r = reconcile(&charges, &journals, &ReconcileParams::default(), &aliases);
-        assert!(
-            matches!(r.charges[0].1, ChargeOutcome::Confirmed { .. }),
-            "alias canonicalization should confirm: {:?}",
-            r.charges[0].1
-        );
+        assert_confirmed(&r, 0);
     }
 }

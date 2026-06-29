@@ -6,6 +6,31 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+/// Generate `as_str(&self) -> &str` and `impl Display` for a newtype that
+/// wraps `String` as its first (and only) field. Usage:
+/// ```ignore
+/// impl_newtype_display!(MyType);
+/// ```
+/// The generated `as_str` is placed in a fresh `impl MyType` block; the
+/// `Display` impl writes the inner string directly with `f.write_str`.
+macro_rules! impl_newtype_display {
+    ($ty:ty) => {
+        impl $ty {
+            /// The inner string value.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $ty {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    };
+}
+
 pub mod adapters;
 pub mod config;
 pub mod dedup;
@@ -19,13 +44,25 @@ pub mod obs_fields;
 pub mod schema;
 pub mod statement;
 pub mod telemetry;
+pub mod transient;
 pub mod unwrap;
 pub mod usd_ceiling;
 pub mod validate;
 
+#[doc(hidden)]
+pub mod test_support;
+
 use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{Instrument, error, info, warn};
+
+/// Install the ring crypto provider for rustls. The `rustls-no-provider`
+/// feature keeps the default off, so a provider must be installed
+/// process-wide before any TLS.
+pub fn install_crypto_provider() {
+    // An `Err` means a provider is already installed, which is fine.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
 
 use crate::adapters::{DestHint, Outcome, SourceHint, TransferRecord};
 use crate::config::{Config, ValidationPolicy};

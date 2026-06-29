@@ -12,6 +12,11 @@ use serde::Serialize;
 
 use super::scorer::{FieldScore, FieldScores};
 
+/// Ratio of `correct / applicable`, or `None` when `applicable` is zero.
+fn ratio(correct: u32, applicable: u32) -> Option<f64> {
+    (applicable > 0).then(|| f64::from(correct) / f64::from(applicable))
+}
+
 /// The eight scored fields, in display order. Mirrors [`FieldScores::iter`].
 pub const FIELDS: [&str; 8] = [
     "kind",
@@ -51,11 +56,7 @@ impl Tally {
     /// rendered as `-` rather than a misleading 0% or 100%).
     #[must_use]
     pub fn accuracy(&self) -> Option<f64> {
-        if self.applicable == 0 {
-            None
-        } else {
-            Some(f64::from(self.correct) / f64::from(self.applicable))
-        }
+        ratio(self.correct, self.applicable)
     }
 }
 
@@ -93,11 +94,7 @@ impl ModelScores {
             correct += t.correct;
             applicable += t.applicable;
         }
-        if applicable == 0 {
-            None
-        } else {
-            Some(f64::from(correct) / f64::from(applicable))
-        }
+        ratio(correct, applicable)
     }
 }
 
@@ -186,6 +183,7 @@ fn lpad(s: &str, w: usize) -> String {
     format!("{s:>w$}")
 }
 
+// -- eval-matrix unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;

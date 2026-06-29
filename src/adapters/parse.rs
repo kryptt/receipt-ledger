@@ -7,11 +7,12 @@
 //! adapter still owns its own `parse_one` (its field set differs); only the
 //! field-level primitives live here.
 
-use anyhow::{Result, anyhow};
 use chrono::NaiveDate;
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
-use crate::schema::{Amount, Currency};
+use super::Outcome;
+use crate::schema::{Amount, Currency, Extracted};
 
 /// Normalise the various container shapes a model might emit into a flat list
 /// of candidate objects: a bare object, an array, or `{"transactions":[...]}`.
@@ -90,4 +91,71 @@ pub fn parse_date_with(v: Option<&Value>, formats: &[&str]) -> Result<NaiveDate>
         }
     }
     Err(anyhow!("unrecognised date format: {s:?}"))
+}
+
+/// The fields shared by every transaction-producing adapter's `parse_one`. Each
+/// adapter still controls *how* the amount and date are parsed (different formats
+/// and normalizers), but the surrounding ceremony — extracting the JSON map,
+/// reading merchant/status/account_hint/raw_ref — is identical and lives here.
+pub struct CommonFields<'a> {
+    /// The JSON map backing this object (borrowed from the input `Value`).
+    pub map: &'a serde_json::Map<String, Value>,
+    pub amount: Amount,
+    pub currency: Currency,
+    pub date: NaiveDate,
+    pub merchant: String,
+    pub status: String,
+    pub account_hint: Option<String>,
+    pub raw_ref: String,
+}
+
+/// Extract the fields that every adapter's `parse_one` shares: validates that
+/// the value is a JSON object, reads amount/currency/date via caller-supplied
+/// closures, and reads merchant/status/account_hint/raw_ref from fixed keys.
+///
+/// The two closures decouple the *shared* field extraction from the *source-
+/// specific* parsing: Banco Popular strips thousands commas and uses `%d/%m/%Y`;
+/// PayPal uses bare `parse_amount` and US date formats.
+pub fn extract_common_fields<'a>(
+    obj: &'a Value,
+    parse_amt: impl FnOnce(&serde_json::Map<String, Value>) -> Result<Amount>,
+    parse_dt: impl FnOnce(&serde_json::Map<String, Value>) -> Result<NaiveDate>,
+) -> Result<CommonFields<'a>> {
+    let map = obj
+        .as_object()
+        .ok_or_else(|| anyhow!("expected JSON object, got {obj}"))?;
+
+    let amount = parse_amt(map)?;
+    let currency = currency_field(map, "currency")?;
+    let date = parse_dt(map)?;
+    let merchant = string_field(map, "merchant").ok_or_else(|| anyhow!("missing `merchant`"))?;
+    let status = string_field(map, "status").unwrap_or_default();
+    let account_hint = string_field(map, "account_hint");
+    let raw_ref = string_field(map, "raw_ref").unwrap_or_default();
+
+    Ok(CommonFields {
+        map,
+        amount,
+        currency,
+        date,
+        merchant,
+        status,
+        account_hint,
+        raw_ref,
+    })
+}
+
+/// Collect JSON objects from the LLM response, parse each with `parse_one`, and
+/// wrap the results in [`Outcome::Transaction`]. The shared postprocess body for
+/// adapters whose LLM path produces transaction records.
+pub fn postprocess_transactions(
+    json: &Value,
+    parse_one: impl Fn(&Value) -> Result<Extracted>,
+) -> Result<Outcome> {
+    let objects = collect_objects(json);
+    if objects.is_empty() {
+        return Err(anyhow!("LLM JSON contained no transaction object"));
+    }
+    let records = objects.iter().map(parse_one).collect::<Result<Vec<_>>>()?;
+    Ok(Outcome::Transaction(records))
 }

@@ -28,12 +28,13 @@
 //! user's own foreign account); a normal consumo returns `None` there and falls
 //! through UNCHANGED to the LLM `prompt`/`postprocess` path below.
 
-use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
+// Banco Popular adapter imports — consumo parsing + SWIFT disambiguation.
 use super::parse::{
-    collect_objects, currency_field, parse_amount_with, parse_date_with, string_field,
+    extract_common_fields, parse_amount_with, parse_date_with, postprocess_transactions,
     strip_thousands_commas,
 };
 use super::swift;
@@ -50,8 +51,9 @@ impl Adapter for BancoPopularAdapter {
         "banco_popular"
     }
 
-    fn matches(&self, original_sender: &str) -> bool {
-        original_sender.contains(BANCO_SENDER)
+    fn matches(&self, from_addr: &str) -> bool {
+        // Banco Popular: match on the domain substring for consumo + SWIFT.
+        from_addr.contains(BANCO_SENDER)
     }
 
     /// Both a consumo notification and a SWIFT confirmation are real
@@ -62,6 +64,8 @@ impl Adapter for BancoPopularAdapter {
     /// Returning `true` for both ensures the SWIFT body is not skipped before the
     /// deterministic seam runs.
     fn is_transaction(&self, _body: &str) -> bool {
+        // Both consumo and SWIFT bodies are genuine transactions; let the
+        // deterministic seam and LLM gates decide downstream.
         true
     }
 
@@ -75,6 +79,7 @@ impl Adapter for BancoPopularAdapter {
         swift::try_parse_swift_outcome(body)
     }
 
+    // Banco Popular prompt: Spanish-language consumo extraction (DD/MM/YYYY dates).
     fn prompt(&self, email_text: &str) -> String {
         format!(
             r#"Extraes una transacción de una "Notificación de Consumo" del Banco Popular Dominicano.
@@ -147,49 +152,43 @@ Notificación:
         )
     }
 
-    fn postprocess(&self, json: &Value) -> Result<Outcome> {
-        let objects = collect_objects(json);
-        if objects.is_empty() {
-            return Err(anyhow!("LLM JSON contained no transaction object"));
-        }
-        let records = objects.iter().map(parse_one).collect::<Result<Vec<_>>>()?;
-        Ok(Outcome::Transaction(records))
+    // Consumo notifications always map 1:1 to transactions (no kind check).
+    fn postprocess(&self, llm_json: &Value) -> Result<Outcome> {
+        postprocess_transactions(llm_json, parse_one)
     }
 }
 
 /// Parse one JSON object into a typed [`Extracted`]. A consumo has no
 /// transaction id, so `external_id` is always `None` and `direction` is always
 /// `Out`.
-fn parse_one(obj: &Value) -> Result<Extracted> {
-    let map = obj
-        .as_object()
-        .ok_or_else(|| anyhow!("expected JSON object, got {obj}"))?;
+/// Parse a single Banco Popular consumo JSON object into an [`Extracted`] record.
+fn parse_one(consumo_obj: &Value) -> Result<Extracted> {
+    let c = extract_common_fields(
+        consumo_obj,
+        // Strip the thousands separator HERE, before the sanitizing amount gate,
+        // so a legitimately-grouped `5,130.00` becomes a clean `5130.00`.
+        |fields| {
+            parse_amount_with(fields.get("amount"), strip_thousands_commas)
+                .context("parsing `amount`")
+        },
+        // Day-first DD/MM/YYYY — Banco Popular's date convention.
+        |fields| parse_date(fields.get("date")).context("parsing consumo `date`"),
+    )?;
 
-    // Strip the thousands separator HERE, before the sanitizing amount gate, so
-    // a legitimately-grouped `5,130.00` becomes a clean `5130.00`.
-    let amount =
-        parse_amount_with(map.get("amount"), strip_thousands_commas).context("parsing `amount`")?;
-    let currency = currency_field(map, "currency")?;
-    let date = parse_date(map.get("date")).context("parsing `date`")?;
-    let merchant = string_field(map, "merchant").ok_or_else(|| anyhow!("missing `merchant`"))?;
-    let status = string_field(map, "status").unwrap_or_default();
-
-    let account_hint = string_field(map, "account_hint");
-    let raw_ref = string_field(map, "raw_ref").unwrap_or_default();
-
-    Ok(Extracted {
+    // Banco Popular consumo fields: fixed source + direction, no external id.
+    let consumo_money = Money::new(c.amount, c.currency);
+    let extracted = Extracted {
         source: Source::BancoPopular,
-        // No transaction id — dedup composite-hashes id-less records.
         external_id: None,
-        money: Money::new(amount, currency),
-        // A consumo is always an outgoing charge.
+        money: consumo_money,
         direction: Direction::Out,
-        date,
-        merchant,
-        account_hint,
-        status,
-        raw_ref,
-    })
+        date: c.date,
+        account_hint: c.account_hint,
+        merchant: c.merchant,
+        status: c.status,
+        raw_ref: c.raw_ref,
+    };
+    Ok(extracted)
 }
 
 /// Accept ISO `YYYY-MM-DD` first, then Banco Popular's `DD/MM/YYYY`. Crucially
@@ -199,17 +198,14 @@ fn parse_date(v: Option<&Value>) -> Result<NaiveDate> {
     parse_date_with(v, FORMATS)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::validate::{Verdict, validate};
-    use rust_decimal::Decimal;
-    use serde_json::json;
-    use std::str::FromStr;
+/// BPD-consumo fixture data for unit and integration tests.
+#[doc(hidden)]
+pub mod fixtures {
+    use serde_json::{Value, json};
 
     /// JSON a correct model returns for an APPROVED consumo (the autoforward
     /// fixture): `EUR$1.50  Euro  27/05/2026  Example Cafe Amsterdam  Aprobada`.
-    fn approved_json() -> Value {
+    pub fn approved_json() -> Value {
         json!({
             "amount": "1.50",
             "currency": "EUR",
@@ -221,20 +217,18 @@ mod tests {
             "raw_ref": ""
         })
     }
+}
 
-    /// The single record from a `Transaction` outcome, or a panic.
-    fn one(outcome: Outcome) -> Extracted {
-        match outcome {
-            Outcome::Transaction(mut v) => {
-                assert_eq!(v.len(), 1);
-                v.pop().unwrap()
-            }
-            Outcome::Transfer(_) => panic!("expected transaction, got transfer"),
-            Outcome::NotATransaction { reason } => {
-                panic!("expected transaction, got skip: {reason}")
-            }
-        }
-    }
+// -- BPD consumo adapter unit tests --
+#[cfg(test)]
+mod tests {
+    use super::fixtures::approved_json;
+    use super::*;
+    use serde_json::json;
+    use crate::adapters::test_support::{
+        assert_books_clean, assert_money, assert_reviews,
+        assert_transaction_count, single_transaction as one,
+    };
 
     #[test]
     fn matches_banco_sender() {
@@ -266,19 +260,21 @@ mod tests {
 
     #[test]
     fn deterministic_extract_takes_over_swift_body() {
-        // A SWIFT confirmation → Some(Ok(Transfer)); the consumo's LLM path is
+        // A SWIFT confirmation -> Some(Ok(Transfer)); the consumo's LLM path is
         // bypassed for it.
+        // Verify SWIFT disambiguation via the BPD adapter entry point.
         let outcome = BancoPopularAdapter
             .deterministic_extract(swift_body())
-            .expect("SWIFT body → Some")
+            .expect("SWIFT body -> Some")
             .expect("the sample parses");
         match outcome {
-            Outcome::Transfer(t) => {
+            Outcome::Transfer(transfer) => {
                 assert_eq!(
-                    t.source,
+                    transfer.source,
                     crate::adapters::SourceHint::SwiftDebtorLast4("4189".to_string())
                 );
-                assert_eq!(t.external_id, "swift:5dd60267-659f-446e-92c4-c1540b8f8253");
+                let expected_uetr = "swift:5dd60267-659f-446e-92c4-c1540b8f8253";
+                assert_eq!(transfer.external_id, expected_uetr);
             }
             other => panic!("expected transfer, got {other:?}"),
         }
@@ -286,7 +282,7 @@ mod tests {
 
     #[test]
     fn deterministic_extract_passes_through_consumo_to_llm() {
-        // A normal consumo body → None, so the pipeline uses the LLM prompt path
+        // A normal consumo body -> None, so the pipeline uses the LLM prompt path
         // (UNCHANGED). SWIFT handling never touches the consumo route.
         assert!(
             BancoPopularAdapter
@@ -298,38 +294,35 @@ mod tests {
     #[test]
     fn approved_consumo_postprocesses_and_books() {
         let e = one(BancoPopularAdapter.postprocess(&approved_json()).unwrap());
-
+        // Consumo: verify source tag and id-less dedup.
         assert_eq!(e.source, Source::BancoPopular);
         assert_eq!(e.external_id, None);
-        assert_eq!(e.amount().value(), Decimal::from_str("1.50").unwrap());
-        assert_eq!(e.currency().as_str(), "EUR");
+        assert_money(&e, "1.50", "EUR");
         assert_eq!(e.direction, Direction::Out);
         assert_eq!(e.merchant, "Example Cafe Amsterdam");
         assert_eq!(e.account_hint.as_deref(), Some("1234"));
 
-        match validate(e) {
-            Verdict::Booked(b) => {
-                assert_eq!(b.as_extracted().source, Source::BancoPopular);
-                assert_eq!(b.as_extracted().external_id, None);
-            }
-            Verdict::Review { reason } => panic!("approved consumo should book: {reason}"),
-        }
+        // Consumo booking gate: source preserved, no external id.
+        let booked = assert_books_clean(e);
+        assert_eq!(booked.as_extracted().source, Source::BancoPopular);
+        assert_eq!(booked.as_extracted().external_id, None);
     }
 
     #[test]
     fn declined_consumo_routes_to_review() {
-        let mut v = approved_json();
-        v["status"] = json!("Declinada");
-        v["amount"] = json!("49.08");
-        v["merchant"] = json!("Example Shop B.V.");
-        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
-        assert!(matches!(validate(e), Verdict::Review { .. }));
+        // Mutate the approved fixture to simulate a Declinada response.
+        let mut declined = approved_json();
+        declined["status"] = json!("Declinada");
+        declined["amount"] = json!("49.08");
+        declined["merchant"] = json!("Example Shop B.V.");
+        let record = one(BancoPopularAdapter.postprocess(&declined).unwrap());
+        assert_reviews(record);
     }
 
     #[test]
     fn date_is_day_first_not_us_month_first() {
         // 27/05/2026: day 27 > 12, so this is unambiguously DD/MM. A US m/d
-        // parser would reject it (month 27 invalid) — assert the correct day.
+        // parser would reject it (month 27 invalid) -- assert the correct day.
         let e = one(BancoPopularAdapter.postprocess(&approved_json()).unwrap());
         assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
     }
@@ -343,26 +336,30 @@ mod tests {
         assert!(BancoPopularAdapter.postprocess(&v).is_err());
     }
 
+    /// Build a variant of `approved_json()` with the given currency, amount, and
+    /// merchant, and postprocess it. Shared by the thousands-separator, JPY, and
+    /// KRW tests.
+    fn postprocess_with_currency(currency: &str, amount: &str, merchant: &str) -> Extracted {
+        let mut v = approved_json();
+        v["currency"] = json!(currency);
+        v["amount"] = json!(amount);
+        v["merchant"] = json!(merchant);
+        one(BancoPopularAdapter.postprocess(&v).unwrap())
+    }
+
     #[test]
     fn strips_thousands_separator_in_adapter() {
         // The adapter strips the thousands comma BEFORE the amount gate, so a
         // legitimately-grouped figure books cleanly even if the model leaves it.
-        let mut v = approved_json();
-        v["currency"] = json!("JPY");
-        v["amount"] = json!("5,130.00");
-        v["merchant"] = json!("Example Ramen Tokyo");
-        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
-        assert_eq!(e.amount().value(), Decimal::from_str("5130.00").unwrap());
+        let e = postprocess_with_currency("JPY", "5,130.00", "Example Ramen Tokyo");
+        assert_money(&e, "5130.00", "JPY");
     }
 
     #[test]
     fn accepts_transactions_wrapper() {
-        let v = json!({ "transactions": [approved_json()] });
-        match BancoPopularAdapter.postprocess(&v).unwrap() {
-            Outcome::Transaction(v) => assert_eq!(v.len(), 1),
-            Outcome::Transfer(_) => panic!("unexpected transfer"),
-            Outcome::NotATransaction { reason } => panic!("unexpected skip: {reason}"),
-        }
+        // BPD consumo: the {"transactions": [...]} envelope must be unwrapped.
+        let wrapped = json!({ "transactions": [approved_json()] });
+        assert_transaction_count(BancoPopularAdapter.postprocess(&wrapped).unwrap(), 1);
     }
 
     /// The model maps "Moneda" = "Yen" (rendered `JPY$5,130.00`) to ISO "JPY".
@@ -370,31 +367,21 @@ mod tests {
     /// decimal amount (the model strips the prefix + thousands separator).
     #[test]
     fn yen_row_postprocesses_with_jpy_currency() {
-        let mut v = approved_json();
-        v["currency"] = json!("JPY");
-        v["amount"] = json!("5130.00");
-        v["merchant"] = json!("Example Ramen Tokyo");
-        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
-        assert_eq!(e.currency().as_str(), "JPY");
-        assert_eq!(e.amount().value(), Decimal::from_str("5130.00").unwrap());
+        let e = postprocess_with_currency("JPY", "5130.00", "Example Ramen Tokyo");
+        assert_money(&e, "5130.00", "JPY");
         // JPY is a known currency, so an approved row books.
-        assert!(matches!(validate(e), Verdict::Booked(_)));
+        assert_books_clean(e);
     }
 
     /// The model maps "Moneda" = "Won" (rendered `KRW$8,700.00`) to ISO "KRW".
     #[test]
     fn won_row_postprocesses_with_krw_currency() {
-        let mut v = approved_json();
-        v["currency"] = json!("KRW");
-        v["amount"] = json!("8700.00");
-        v["merchant"] = json!("Example Bibimbap Seoul");
-        let e = one(BancoPopularAdapter.postprocess(&v).unwrap());
-        assert_eq!(e.currency().as_str(), "KRW");
-        assert_eq!(e.amount().value(), Decimal::from_str("8700.00").unwrap());
-        assert!(matches!(validate(e), Verdict::Booked(_)));
+        let e = postprocess_with_currency("KRW", "8700.00", "Example Bibimbap Seoul");
+        assert_money(&e, "8700.00", "KRW");
+        assert_books_clean(e);
     }
 
-    // --- property tests --------------------------------------------------
+    // --- consumo date format properties ------------------------------------
 
     use proptest::prelude::*;
 

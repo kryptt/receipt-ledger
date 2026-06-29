@@ -27,10 +27,11 @@ use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 
 use super::{
-    AuthCode, Last4, Mcc, ParsedStatement, Reference, Section, SectionCurrency, StatementTxn,
-    TextRow,
+    join_cells, AuthCode, Last4, Mcc, ParsedStatement, Reference, Section, SectionCurrency,
+    StatementTxn, TextRow,
 };
 use crate::adapters::parse::strip_thousands_commas;
+use crate::eval::scorer::collapse_whitespace;
 use crate::schema::{Amount, Direction, Money};
 
 /// What a single row is, decided without reference to its neighbours. The
@@ -255,15 +256,9 @@ fn parse_txn(
     let amount = Amount::parse(&cleaned)
         .map_err(|e| anyhow!("statement amount {raw_amount:?} rejected: {e}"))?;
 
-    // Merchant = the cells between the reference and the amount.
-    let merchant = row.cells[3..amount_idx]
-        .iter()
-        .map(|c| c.text.trim())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Merchant = the cells between the reference and the amount, whitespace
+    // collapsed (cell joins can introduce runs that the original PDF did not).
+    let merchant = collapse_whitespace(&join_cells(&row.cells[3..amount_idx]));
     if merchant.is_empty() {
         return Err(anyhow!("transaction row has no merchant description"));
     }
@@ -343,12 +338,12 @@ fn decimal_cell_count(row: &TextRow) -> usize {
         .count()
 }
 
+// -- statement-parse unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::statement::Cell;
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
+    use crate::test_support::dec;
 
     /// Build a row from (x, text) pairs at a given y.
     fn row(y: f32, cells: &[(f32, &str)]) -> TextRow {
@@ -423,16 +418,16 @@ mod tests {
                     (520.0, "999.77"),
                 ],
             ),
-            // Second section header (USD).
-            row(700.0, &[(25.0, "VISA PRESTIGE USD")]),
+            // Second section header (USD card).
+            row(695.0, &[(25.0, "VISA PRESTIGE USD")]),
             row(
-                680.0,
+                675.0,
                 &[
-                    (25.0, "****-****-****-7524"),
-                    (195.0, "8,300.00"),
-                    (375.0, "22/05/2026"),
-                    (458.0, "16/06/2026"),
-                    (540.0, "2,491.46"),
+                    (30.0, "****-****-****-7524"),
+                    (200.0, "8,300.00"),
+                    (380.0, "22/05/2026"),
+                    (463.0, "16/06/2026"),
+                    (545.0, "2,491.46"),
                 ],
             ),
             row(
@@ -461,7 +456,7 @@ mod tests {
         );
         assert_eq!(
             s.sections[0].balance_anterior,
-            Some(Decimal::from_str("60999.77").unwrap()),
+            Some(dec("60999.77")),
             "BALANCE ANTERIOR = last decimal of the card row"
         );
         assert_eq!(s.sections[1].currency, SectionCurrency::Usd);
@@ -469,11 +464,8 @@ mod tests {
 
     #[test]
     fn captures_balance_total() {
-        let s = parse_statement(&sample()).unwrap();
-        assert_eq!(
-            s.sections[0].balance_total,
-            Some(Decimal::from_str("999.77").unwrap())
-        );
+        let stmt = parse_statement(&sample()).unwrap();
+        assert_eq!(stmt.sections[0].balance_total, Some(dec("999.77")));
     }
 
     #[test]
@@ -491,7 +483,7 @@ mod tests {
         assert_eq!(payment.money.currency.as_str(), "DOP");
         assert_eq!(
             payment.money.amount.value(),
-            Decimal::from_str("60999.81").unwrap()
+            dec("60999.81")
         );
 
         let charge = &s.txns[1];
@@ -500,7 +492,7 @@ mod tests {
         assert_eq!(charge.reference.as_str(), "24492166114100057344389");
         assert_eq!(
             charge.money.amount.value(),
-            Decimal::from_str("1000.00").unwrap()
+            dec("1000.00")
         );
 
         let usd = &s.txns[2];
@@ -526,23 +518,20 @@ mod tests {
     fn amount_is_last_decimal_not_blindly_last_cell() {
         // A trailing non-amount artifact cell after the real amount must not be
         // booked as the amount; the real amount (a signed decimal) wins.
-        let r = row(
-            600.0,
-            &[
-                (29.0, "25/04"),
-                (76.0, "24/04"),
-                (113.0, "0601324353"),
-                (252.0, "SOME MERCHANT"),
-                (540.0, "42.15"),
-                (600.0, "*"), // trailing artifact
-            ],
-        );
+        let r = row(600.0, &[
+            (30.0, "25/04"),
+            (78.0, "24/04"),
+            (115.0, "0601324353"),
+            (255.0, "SOME MERCHANT"),
+            (542.0, "42.15"),
+            (602.0, "*"), // trailing artifact
+        ]);
         let cut = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
         let reference = Reference::parse("0601324353").unwrap();
         let txn = parse_txn(&r, reference, SectionCurrency::Usd, cut).unwrap();
         assert_eq!(
             txn.money.amount.value(),
-            Decimal::from_str("42.15").unwrap()
+            dec("42.15")
         );
         assert_eq!(txn.merchant, "SOME MERCHANT");
     }
@@ -555,15 +544,12 @@ mod tests {
             infer_year("28/04", cut).unwrap(),
             NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
         );
-        assert_eq!(
-            infer_year("22/05", cut).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 22).unwrap()
-        );
-        // Month after cut month → previous year (Dec→Jan wrap).
-        assert_eq!(
-            infer_year("31/12", cut).unwrap(),
-            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()
-        );
+        // Same-month date stays in cut year.
+        let may22 = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
+        assert_eq!(infer_year("22/05", cut).unwrap(), may22);
+        // Month after cut month → previous year (Dec→Jan wrap; 12 > 05).
+        let dec31 = NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        assert_eq!(infer_year("31/12", cut).unwrap(), dec31);
     }
 
     #[test]
@@ -596,12 +582,12 @@ mod tests {
             classify_row(&row(541.0, &[(113.0, "8398"), (150.0, "090531")])),
             RowKind::Continuation { .. }
         ));
-        assert!(matches!(
-            classify_row(&row(500.0, &[(20.0, "marketing copy here")])),
-            RowKind::Ignored
-        ));
+        // A single-cell row with no DD/MM pattern is noise, not a data row.
+        let noise = row(500.0, &[(20.0, "marketing copy here")]);
+        assert!(matches!(classify_row(&noise), RowKind::Ignored));
     }
 
+    // Verify the low-level DD/MM and decimal-cell recognition helpers.
     #[test]
     fn row_predicates() {
         assert!(is_ddmm("28/04"));

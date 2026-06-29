@@ -22,6 +22,7 @@
 use anyhow::{Result, anyhow};
 use chrono::NaiveDate;
 
+// SWIFT pacs.008 confirmation: deterministic XML-tag extraction, no LLM.
 use super::parse::strip_thousands_commas;
 use super::{DestHint, Outcome, SourceHint, TransferRecord};
 use crate::schema::{Amount, Currency, Money};
@@ -80,7 +81,7 @@ pub fn try_parse_swift(body: &str) -> Option<Result<TransferRecord>> {
 /// and recognises a real wire by its XML rather than a translatable subject.
 fn is_swift_confirmation(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    let has_doc_marker = SWIFT_DOC_MARKERS.iter().any(|m| lower.contains(m));
+    let has_doc_marker = SWIFT_DOC_MARKERS.iter().any(|marker| lower.contains(marker));
     let has_settlement = lower.contains(SWIFT_SETTLEMENT_MARKER);
     has_doc_marker && has_settlement
 }
@@ -131,29 +132,22 @@ fn looks_like_timestamp(s: &str) -> bool {
     let Some((date, time)) = s.split_once('-') else {
         return false;
     };
-    let date_ok = {
-        let mut parts = date.split('/');
-        let (Some(d), Some(m), Some(y), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return false;
-        };
-        [d, m, y]
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    is_digit_triple(date, '/') && is_digit_triple(time, ':')
+}
+
+/// Whether `s` is exactly three non-empty, all-digit fields separated by `sep`.
+/// Used for both `DD/MM/YY` (sep `/`) and `HH:MM:SS` (sep `:`) in the
+/// page-break timestamp shape.
+fn is_digit_triple(s: &str, sep: char) -> bool {
+    let mut parts = s.split(sep);
+    let (Some(a), Some(b), Some(c), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
     };
-    let time_ok = {
-        let mut parts = time.split(':');
-        let (Some(h), Some(mi), Some(se), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return false;
-        };
-        [h, mi, se]
-            .iter()
-            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
-    };
-    date_ok && time_ok
+    [a, b, c]
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Whether a line is an underscore rule: a non-empty run of `_` once trimmed.
@@ -347,18 +341,25 @@ fn parse_uetr(body: &str) -> Result<String> {
 
 // --- tiny tag-scanning helpers (tolerant of interrupted XML) ----------------
 
+/// The text between the first occurrence of `open` and the subsequent `close` in
+/// `haystack`. The shared primitive behind [`tag_value`], [`attr_value`], and
+/// [`innermost_id`]: find an opening marker, skip past it, find a closing
+/// marker, return the slice between. Returns `None` when either marker is
+/// absent.
+fn text_between(haystack: &str, open: &str, close: &str) -> Option<String> {
+    let start = haystack.find(open)? + open.len();
+    let rest = &haystack[start..];
+    let end = rest.find(close)?;
+    Some(rest[..end].to_string())
+}
+
 /// The text content of the first `<tag>…</tag>` (no attributes), scanning the
 /// whole body. Tolerates anything (page-break lines, underscore rules) appearing
 /// *between* the open and close tags — it returns everything in between, which
 /// for a leaf value element is just the value. Returns `None` if the tag is
-/// absent. Trims surrounding whitespace is left to the caller.
+/// absent. Trimming surrounding whitespace is left to the caller.
 fn tag_value(body: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = body.find(&open)? + open.len();
-    let rest = &body[start..];
-    let end = rest.find(&close)?;
-    Some(rest[..end].to_string())
+    text_between(body, &format!("<{tag}>"), &format!("</{tag}>"))
 }
 
 /// The `(attributes, inner text)` of the first `<tag ...>…</tag>` element,
@@ -395,24 +396,18 @@ fn element(body: &str, tag: &str) -> Option<(String, String)> {
 
 /// The value of an attribute `name="value"` within an open-tag attribute string.
 fn attr_value(attrs: &str, name: &str) -> Option<String> {
-    let key = format!("{name}=\"");
-    let start = attrs.find(&key)? + key.len();
-    let rest = &attrs[start..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    text_between(attrs, &format!("{name}=\""), "\"")
 }
 
 /// The innermost `<Id>` value inside a fragment like
 /// `<Id><Othr><Id>DO96BPDO…</Id></Othr></Id>` — the deepest (last) `<Id>…</Id>`,
 /// which is the actual account identifier rather than the wrapping scheme node.
 fn innermost_id(fragment: &str) -> Option<String> {
-    let open = "<Id>";
-    let close = "</Id>";
     // The last `<Id>` open tag begins the innermost value (the close tags nest
     // outward, so the final open is the deepest).
-    let last_open = fragment.rfind(open)? + open.len();
+    let last_open = fragment.rfind("<Id>")? + "<Id>".len();
     let rest = &fragment[last_open..];
-    let end = rest.find(close)?;
+    let end = rest.find("</Id>")?;
     Some(rest[..end].trim().to_string())
 }
 
@@ -424,47 +419,97 @@ pub fn try_parse_swift_outcome(body: &str) -> Option<Result<Outcome>> {
     try_parse_swift(body).map(|r| r.map(Outcome::Transfer))
 }
 
+// -- SWIFT pacs.008 wire confirmation parser tests --
 #[cfg(test)]
 mod tests {
+    use crate::test_support::dec;
     use super::*;
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
 
-    /// Real sample 1 (after the Gmail-forward unwrap): a pacs.008 confirmation
-    /// with page-break lines interrupting the XML.
-    fn sample_1() -> &'static str {
-        "Confirmacion Mensaje Swift Operado\n\
+    // --- shared XML fragments for building SWIFT test bodies -----------------
+
+    /// The pacs.008 preamble every SWIFT test body needs (document marker +
+    /// message-type line).
+    const PACS_PREAMBLE: &str = "Confirmacion Mensaje Swift Operado\n\
+       MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n";
+
+    /// Same preamble with page-break/underscore-rule interruptions -- exercises
+    /// the [`strip_page_breaks`] path.
+    const PACS_PREAMBLE_NOISY: &str = "Confirmacion Mensaje Swift Operado\n\
          _______________________________________________________________\n\
          29/05/26-05:12:56        ICMACKINTERTMX-0277-000001            1\n\
          \n\
-       MX Input     : pacs.008.001.08 CBPRPlus-pacs.008.001.08_FIToFICustomerCreditTransfer\n\
-             <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
-             <IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
-             <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-         29/05/26-05:12:56        ICMACKINTERTMX-0277-000001            2\n\
-         _______________________________________________________________\n\
-             <InstdAmt Ccy=\"USD\">2100.00</InstdAmt>\n\
-             <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-             <DbtrAgt><FinInstnId><BICFI>BPDODOSX</BICFI></FinInstnId></DbtrAgt>\n\
-             <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
-             <Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n\
-             <CdtrAcct><Id><Othr><Id>123720130</Id></Othr></Id></CdtrAcct>\n"
+       MX Input     : pacs.008.001.08 CBPRPlus-pacs.008.001.08_FIToFICustomerCreditTransfer\n";
+
+    /// Standard debtor account: IBAN last-4 = `4189`.
+    const DBTR_ACCT_4189: &str =
+        "<DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n";
+
+    /// Standard debtor agent BIC.
+    const DBTR_AGT: &str =
+        "<DbtrAgt><FinInstnId><BICFI>BPDODOSX</BICFI></FinInstnId></DbtrAgt>\n";
+
+    /// Chase creditor agent (BIC `CHASUS33XXX` -> normalised `CHASUS33`).
+    const CDTR_AGT_CHASE: &str =
+        "<CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n";
+
+    /// ABN AMRO creditor agent (BIC `ABNANL2AXXX` -> normalised `ABNANL2A`).
+    const CDTR_AGT_ABN: &str =
+        "<CdtrAgt><FinInstnId><BICFI>ABNANL2AXXX</BICFI></FinInstnId></CdtrAgt>\n";
+
+    /// UETR used by most tests (sample 1, page-break tests, single-field tests).
+    const UETR_1: &str = "<UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n";
+
+    /// UETR used by sample 2.
+    const UETR_2: &str = "<UETR>e5b9060e-1473-44b9-ba24-37db7e7cbc9c</UETR>\n";
+
+    /// Standard settlement: USD 2100.00 on 2026-05-29.
+    const SETTLEMENT_2100_USD: &str =
+        "<IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
+         <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n";
+
+    // --- test body builders -------------------------------------------------
+
+    /// Build a minimal valid SWIFT body from fragments (preamble + per-test XML).
+    fn swift_body(extra_lines: &[&str]) -> String {
+        let mut body = String::from(PACS_PREAMBLE);
+        for line in extra_lines {
+            body.push_str(line);
+        }
+        body
     }
 
-    /// Real sample 2: a different amount, UETR and creditor BIC, same debtor.
-    fn sample_2() -> &'static str {
-        "Confirmacion Mensaje Swift Operado\n\
-       MX Input     : pacs.008.001.08 CBPRPlus-pacs.008.001.08_FIToFICustomerCreditTransfer\n\
-             <UETR>e5b9060e-1473-44b9-ba24-37db7e7cbc9c</UETR>\n\
-             <IntrBkSttlmAmt Ccy=\"USD\">4000.00</IntrBkSttlmAmt>\n\
-             <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-             <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-             <DbtrAgt><FinInstnId><BICFI>BPDODOSX</BICFI></FinInstnId></DbtrAgt>\n\
-             <CdtrAgt><FinInstnId><BICFI>ABNANL2AXXX</BICFI></FinInstnId></CdtrAgt>\n\
-             <Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n"
+    /// Real sample 1 (after the Gmail-forward unwrap): noisy preamble, page-break
+    /// lines interrupting the XML, both InstdAmt + IntrBkSttlmAmt.
+    fn sample_1() -> String {
+        let mut body = String::from(PACS_PREAMBLE_NOISY);
+        body.push_str(UETR_1);
+        body.push_str("<IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n");
+        body.push_str("<IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n");
+        body.push_str("29/05/26-05:12:56        ICMACKINTERTMX-0277-000001            2\n");
+        body.push_str("_______________________________________________________________\n");
+        body.push_str("<InstdAmt Ccy=\"USD\">2100.00</InstdAmt>\n");
+        body.push_str(DBTR_ACCT_4189);
+        body.push_str(DBTR_AGT);
+        body.push_str(CDTR_AGT_CHASE);
+        body.push_str("<Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n");
+        body.push_str("<CdtrAcct><Id><Othr><Id>123720130</Id></Othr></Id></CdtrAcct>\n");
+        body
     }
 
-    /// A normal Banco Popular consumo notification body — NOT a SWIFT message.
+    /// Real sample 2: different amount, UETR and creditor BIC, same debtor.
+    fn sample_2() -> String {
+        swift_body(&[
+            UETR_2,
+            "<IntrBkSttlmAmt Ccy=\"USD\">4000.00</IntrBkSttlmAmt>\n",
+            "<IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n",
+            DBTR_ACCT_4189,
+            DBTR_AGT,
+            CDTR_AGT_ABN,
+            "<Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n",
+        ])
+    }
+
+    /// A normal Banco Popular consumo body -- NOT a SWIFT message.
     fn consumo_body() -> &'static str {
         "Notificación de Consumo\n\
          Monto | Moneda | Fecha | Comercio | Estatus\n\
@@ -472,14 +517,25 @@ mod tests {
          Tarjeta terminada en 1234"
     }
 
+    // --- assertion helpers --------------------------------------------------
+
     fn ok(body: &str) -> TransferRecord {
         try_parse_swift(body)
             .expect("a SWIFT confirmation yields Some")
             .expect("the sample parses")
     }
 
-    /// The debtor last-4 carried by a SWIFT [`SourceHint`], or a panic if the
-    /// source is not a SWIFT debtor.
+    /// Assert the transfer's amount equals the expected decimal string.
+    fn assert_amount(t: &TransferRecord, expected: &str) {
+        assert_eq!(t.money.amount.value(), dec(expected));
+    }
+
+    /// Assert the transfer's currency matches the expected ISO code.
+    fn assert_currency(t: &TransferRecord, expected: &str) {
+        assert_eq!(t.money.currency.as_str(), expected);
+    }
+
+    /// The debtor last-4 from a SWIFT [`SourceHint`], or a panic.
     fn swift_debtor_last4(t: &TransferRecord) -> &str {
         match &t.source {
             SourceHint::SwiftDebtorLast4(l4) => l4,
@@ -487,16 +543,34 @@ mod tests {
         }
     }
 
+    /// Assert the standard money + debtor fields that most samples share:
+    /// amount, currency, settlement date 2026-05-29, debtor last-4 `4189`.
+    fn assert_standard_wire(t: &TransferRecord, amount: &str, currency: &str) {
+        assert_amount(t, amount);
+        assert_currency(t, currency);
+        assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
+        assert_eq!(swift_debtor_last4(t), "4189");
+    }
+
+    /// Parse `body` as SWIFT and assert that parsing fails with an error
+    /// message containing every `needles` substring. Panics if the body is not
+    /// recognised as SWIFT or if parsing unexpectedly succeeds.
+    fn assert_swift_err(body: &str, needles: &[&str]) {
+        let msg = try_parse_swift(body)
+            .expect("markers present -> Some")
+            .expect_err("expected Err (-> Review)")
+            .to_string();
+        for needle in needles {
+            assert!(msg.contains(needle), "expected {needle:?} in: {msg}");
+        }
+    }
+
+    // --- tests --------------------------------------------------------------
+
     #[test]
     fn parses_sample_1() {
-        let t = ok(sample_1());
-        assert_eq!(
-            t.money.amount.value(),
-            Decimal::from_str("2100.00").unwrap()
-        );
-        assert_eq!(t.money.currency.as_str(), "USD");
-        assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
-        assert_eq!(swift_debtor_last4(&t), "4189");
+        let t = ok(&sample_1());
+        assert_standard_wire(&t, "2100.00", "USD");
         assert_eq!(t.dest, DestHint::CreditorBic("CHASUS33".to_string()));
         assert_eq!(t.external_id, "swift:5dd60267-659f-446e-92c4-c1540b8f8253");
         assert_eq!(t.description, "SWIFT wire to RODOLFO HANSEN");
@@ -504,14 +578,8 @@ mod tests {
 
     #[test]
     fn parses_sample_2() {
-        let t = ok(sample_2());
-        assert_eq!(
-            t.money.amount.value(),
-            Decimal::from_str("4000.00").unwrap()
-        );
-        assert_eq!(t.money.currency.as_str(), "USD");
-        assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
-        assert_eq!(swift_debtor_last4(&t), "4189");
+        let t = ok(&sample_2());
+        assert_standard_wire(&t, "4000.00", "USD");
         assert_eq!(t.dest, DestHint::CreditorBic("ABNANL2A".to_string()));
         assert_eq!(t.external_id, "swift:e5b9060e-1473-44b9-ba24-37db7e7cbc9c");
     }
@@ -520,11 +588,8 @@ mod tests {
     fn page_break_interruptions_do_not_break_parsing() {
         // Sample 1 specifically interleaves page-break lines and underscore rules
         // between the SWIFT fields; it must still parse every field by tag.
-        let t = ok(sample_1());
-        assert_eq!(
-            t.money.amount.value(),
-            Decimal::from_str("2100.00").unwrap()
-        );
+        let t = ok(&sample_1());
+        assert_amount(&t, "2100.00");
         assert_eq!(swift_debtor_last4(&t), "4189");
     }
 
@@ -532,25 +597,19 @@ mod tests {
     fn page_break_inside_a_field_value_rejoins() {
         // Fix 6: an interruption lands BETWEEN the `<IntrBkSttlmAmt Ccy="USD">`
         // open tag and its amount text. After page-break stripping the value
-        // rejoins and the field parses (it would not survive line-position
-        // extraction).
-        let body = "Confirmacion Mensaje Swift Operado\n\
-           MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
-                 <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
-                 <IntrBkSttlmAmt Ccy=\"USD\">\n\
-             29/05/26-05:12:56        ICMACKINTERTMX-0277-000001            2\n\
-             _______________________________________________________________\n\
-             2100.00</IntrBkSttlmAmt>\n\
-                 <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-                 <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-                 <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
-                 <Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n";
-        let t = ok(body);
-        assert_eq!(
-            t.money.amount.value(),
-            Decimal::from_str("2100.00").unwrap()
-        );
-        assert_eq!(t.money.currency.as_str(), "USD");
+        // rejoins and the field parses.
+        let body = swift_body(&[
+            UETR_1,
+            "<IntrBkSttlmAmt Ccy=\"USD\">\n",
+            "29/05/26-05:12:56        ICMACKINTERTMX-0277-000001            2\n",
+            "_______________________________________________________________\n",
+            "2100.00</IntrBkSttlmAmt>\n",
+            "<IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n",
+            DBTR_ACCT_4189,
+            CDTR_AGT_CHASE,
+            "<Cdtr><Nm>RODOLFO HANSEN</Nm></Cdtr>\n",
+        ]);
+        assert_amount(&ok(&body), "2100.00");
     }
 
     #[test]
@@ -562,7 +621,7 @@ mod tests {
     fn consumo_mentioning_mensaje_swift_is_not_swift() {
         // Fix 2: a consumo body that merely contains the prose phrase "mensaje
         // swift" must NOT be classified as a SWIFT confirmation (no pacs.008
-        // structure → None → falls through to the LLM path).
+        // structure -> None -> falls through to the LLM path).
         let body = "Notificación de Consumo\n\
              Su mensaje swift fue procesado? No: esto es un consumo normal.\n\
              EUR$1.50 | Euro | 27/05/2026 | Example Cafe | Aprobada\n\
@@ -577,9 +636,9 @@ mod tests {
     fn real_wire_is_classified_swift() {
         // Fix 2: a real wire (pacs.008 document marker + settlement element) IS
         // classified as SWIFT and parses.
-        assert!(try_parse_swift(sample_1()).is_some());
-        let t = ok(sample_1());
-        assert_eq!(t.money.currency.as_str(), "USD");
+        let body = sample_1();
+        assert!(try_parse_swift(&body).is_some());
+        assert_currency(&ok(&body), "USD");
     }
 
     #[test]
@@ -591,7 +650,7 @@ mod tests {
         assert_eq!(normalize_bic("CHASUS33"), "CHASUS33");
         assert_eq!(normalize_bic("BPDODOSX"), "BPDODOSX");
         assert_eq!(normalize_bic("chasus33"), "CHASUS33");
-        // A real (non-XXX) 11-char branch is NOT stripped — over-stripping it
+        // A real (non-XXX) 11-char branch is NOT stripped -- over-stripping it
         // would collapse distinct branches onto one institution key.
         assert_eq!(normalize_bic("CHASUS33ABC"), "CHASUS33ABC");
         assert_eq!(normalize_bic("chasus33abc"), "CHASUS33ABC");
@@ -603,29 +662,28 @@ mod tests {
     fn creditor_name_scoped_to_cdtr_not_debtor() {
         // Fix 3: a body with BOTH a debtor name (which appears first) and a
         // creditor name must describe the wire by the CREDITOR (beneficiary).
-        let body = "Confirmacion Mensaje Swift Operado\n\
-           MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
-                 <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
-                 <IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
-                 <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-                 <Dbtr><Nm>SENDER</Nm></Dbtr>\n\
-                 <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-                 <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
-                 <Cdtr><Nm>RECIPIENT</Nm></Cdtr>\n";
-        let t = ok(body);
-        assert_eq!(t.description, "SWIFT wire to RECIPIENT");
+        let body = swift_body(&[
+            UETR_1,
+            SETTLEMENT_2100_USD,
+            "<Dbtr><Nm>SENDER</Nm></Dbtr>\n",
+            DBTR_ACCT_4189,
+            CDTR_AGT_CHASE,
+            "<Cdtr><Nm>RECIPIENT</Nm></Cdtr>\n",
+        ]);
+        assert_eq!(ok(&body).description, "SWIFT wire to RECIPIENT");
     }
 
     #[test]
     fn debtor_last4_takes_last_four_alphanumerics_of_iban() {
-        assert_eq!(parse_debtor_last4(sample_1()).unwrap(), "4189");
+        assert_eq!(parse_debtor_last4(&sample_1()).unwrap(), "4189");
     }
 
     #[test]
     fn settlement_amount_preferred_over_instructed_amount() {
         // Sample 1 carries both IntrBkSttlmAmt and InstdAmt; we read the former.
-        let (amount, currency) = parse_settlement_amount(sample_1()).unwrap();
-        assert_eq!(amount.value(), Decimal::from_str("2100.00").unwrap());
+        let body = sample_1();
+        let (amount, currency) = parse_settlement_amount(&body).unwrap();
+        assert_eq!(amount.value(), dec("2100.00"));
         assert_eq!(currency.as_str(), "USD");
     }
 
@@ -633,20 +691,17 @@ mod tests {
     fn swift_marker_but_missing_field_is_error() {
         // Carries the structural markers (pacs.008 doc + settlement element, so it
         // IS classified as SWIFT) but the settlement amount is unparseable and the
-        // date/debtor/BIC/UETR are absent → Some(Err(..)) (→ Review), never a
+        // date/debtor/BIC/UETR are absent -> Some(Err(..)) (-> Review), never a
         // silent skip.
         let body = "MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
              <IntrBkSttlmAmt Ccy=\"USD\">not-a-number</IntrBkSttlmAmt>\nincomplete";
-        let r = try_parse_swift(body).expect("markers present → Some");
-        assert!(
-            r.is_err(),
-            "missing/malformed required fields must be an Err"
-        );
+        assert_swift_err(body, &["settlement amount"]);
     }
 
     #[test]
     fn outcome_wrapper_yields_transfer() {
-        let outcome = try_parse_swift_outcome(sample_1())
+        let body = sample_1();
+        let outcome = try_parse_swift_outcome(&body)
             .expect("Some for a SWIFT body")
             .expect("parses");
         match outcome {
@@ -658,54 +713,44 @@ mod tests {
     #[test]
     fn multi_transaction_wire_routes_to_review() {
         // Fix 1: a pacs.008 declaring NbOfTxs=2 (and carrying two CdtTrfTxInf
-        // blocks) must NOT silently book only the first — it is Some(Err) → Review.
-        let body = "Confirmacion Mensaje Swift Operado\n\
-           MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
-                 <GrpHdr><NbOfTxs>2</NbOfTxs></GrpHdr>\n\
-                 <CdtTrfTxInf>\n\
-                 <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
-                 <IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
-                 <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-                 <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-                 <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
-                 <Cdtr><Nm>RECIPIENT ONE</Nm></Cdtr>\n\
-                 </CdtTrfTxInf>\n\
-                 <CdtTrfTxInf>\n\
-                 <UETR>e5b9060e-1473-44b9-ba24-37db7e7cbc9c</UETR>\n\
-                 <IntrBkSttlmAmt Ccy=\"USD\">4000.00</IntrBkSttlmAmt>\n\
-                 <Cdtr><Nm>RECIPIENT TWO</Nm></Cdtr>\n\
-                 </CdtTrfTxInf>\n";
-        let r = try_parse_swift(body).expect("a SWIFT body → Some");
-        let err = r.expect_err("a multi-transaction wire must be an Err (→ Review)");
-        let msg = err.to_string();
-        assert!(msg.contains("multi-transaction"), "{msg}");
-        assert!(msg.contains("2 txns"), "{msg}");
+        // blocks) must NOT silently book only the first -- it is Some(Err) -> Review.
+        let body = swift_body(&[
+            "<GrpHdr><NbOfTxs>2</NbOfTxs></GrpHdr>\n",
+            "<CdtTrfTxInf>\n",
+            UETR_1,
+            SETTLEMENT_2100_USD,
+            DBTR_ACCT_4189,
+            CDTR_AGT_CHASE,
+            "<Cdtr><Nm>RECIPIENT ONE</Nm></Cdtr>\n",
+            "</CdtTrfTxInf>\n",
+            "<CdtTrfTxInf>\n",
+            UETR_2,
+            "<IntrBkSttlmAmt Ccy=\"USD\">4000.00</IntrBkSttlmAmt>\n",
+            "<Cdtr><Nm>RECIPIENT TWO</Nm></Cdtr>\n",
+            "</CdtTrfTxInf>\n",
+        ]);
+        assert_swift_err(&body, &["multi-transaction", "2 txns"]);
     }
 
     #[test]
     fn cross_currency_wire_routes_to_review() {
         // Fix 4: an FX wire instructing DOP but settling USD must NOT be booked as
-        // a same-currency transfer — it is Some(Err) → Review.
-        let body = "Confirmacion Mensaje Swift Operado\n\
-           MX Input : pacs.008.001.08 FIToFICustomerCreditTransfer\n\
-                 <UETR>5dd60267-659f-446e-92c4-c1540b8f8253</UETR>\n\
-                 <IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
-                 <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n\
-                 <InstdAmt Ccy=\"DOP\">125000.00</InstdAmt>\n\
-                 <DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n\
-                 <CdtrAgt><FinInstnId><BICFI>CHASUS33XXX</BICFI></FinInstnId></CdtrAgt>\n\
-                 <Cdtr><Nm>RECIPIENT</Nm></Cdtr>\n";
-        let r = try_parse_swift(body).expect("a SWIFT body → Some");
-        let err = r.expect_err("a cross-currency wire must be an Err (→ Review)");
-        let msg = err.to_string();
-        assert!(msg.contains("cross-currency"), "{msg}");
-        assert!(msg.contains("DOP") && msg.contains("USD"), "{msg}");
+        // a same-currency transfer -- it is Some(Err) -> Review.
+        let body = swift_body(&[
+            UETR_1,
+            SETTLEMENT_2100_USD,
+            "<InstdAmt Ccy=\"DOP\">125000.00</InstdAmt>\n",
+            DBTR_ACCT_4189,
+            CDTR_AGT_CHASE,
+            "<Cdtr><Nm>RECIPIENT</Nm></Cdtr>\n",
+        ]);
+        assert_swift_err(&body, &["cross-currency", "DOP", "USD"]);
     }
 
     #[test]
     fn same_currency_instructed_amount_is_fine() {
         // The normal case: InstdAmt and IntrBkSttlmAmt share a currency (sample 1
-        // carries both as USD) → no cross-currency error.
-        assert!(guard_single_currency(sample_1(), "USD").is_ok());
+        // carries both as USD) -> no cross-currency error.
+        assert!(guard_single_currency(&sample_1(), "USD").is_ok());
     }
 }

@@ -199,3 +199,119 @@ pub fn select(original_sender: &str) -> Option<&'static dyn Adapter> {
         .copied()
         .find(|a| a.matches(original_sender))
 }
+
+/// Test-only helpers shared between unit and integration tests.
+///
+/// Not `#[cfg(test)]` because integration tests in `tests/` are separate
+/// crates and cannot see cfg(test) items from the library crate.  The crate
+/// is `publish = false` and its public surface is not a SemVer contract, so
+/// an unconditional (but `#[doc(hidden)]`) module is the pragmatic choice.
+#[doc(hidden)]
+pub mod test_support {
+    use super::{Outcome, TransferRecord};
+    use crate::schema::Extracted;
+
+    /// Unwrap a `Transaction` outcome into its records, panicking with a clear
+    /// message when the outcome is a different variant. Shared by
+    /// [`single_transaction`] and [`assert_transaction_count`].
+    fn unwrap_transactions(outcome: Outcome) -> Vec<Extracted> {
+        match outcome {
+            Outcome::Transaction(v) => v,
+            Outcome::Transfer(_) => panic!("expected transaction, got transfer"),
+            Outcome::NotATransaction { reason } => {
+                panic!("expected transaction, got skip: {reason}")
+            }
+        }
+    }
+
+    /// Extract the single record from a `Transaction` outcome, panicking
+    /// if the outcome is not a single-element transaction.
+    pub fn single_transaction(outcome: Outcome) -> Extracted {
+        let mut v = unwrap_transactions(outcome);
+        assert_eq!(v.len(), 1);
+        v.pop().unwrap()
+    }
+
+    /// Extract the transfer from a `Transfer` outcome, panicking if the
+    /// outcome is not a transfer.
+    pub fn single_transfer(outcome: Outcome) -> TransferRecord {
+        match outcome {
+            Outcome::Transfer(t) => t,
+            Outcome::Transaction(_) => panic!("expected transfer, got transaction"),
+            Outcome::NotATransaction { reason } => {
+                panic!("expected transfer, got skip: {reason}")
+            }
+        }
+    }
+
+    /// Assert that the outcome is a `Transaction` with exactly `expected`
+    /// records. Returns the records for further assertions.
+    pub fn assert_transaction_count(outcome: Outcome, expected: usize) -> Vec<Extracted> {
+        let v = unwrap_transactions(outcome);
+        assert_eq!(v.len(), expected);
+        v
+    }
+
+    /// Assert that the outcome is a `NotATransaction` (a clean skip). Returns
+    /// the skip reason for optional further inspection.
+    pub fn assert_not_a_transaction(outcome: Outcome) -> String {
+        match outcome {
+            Outcome::NotATransaction { reason } => reason,
+            Outcome::Transaction(v) => {
+                panic!("expected not-a-transaction, got {} transaction(s)", v.len())
+            }
+            Outcome::Transfer(_) => panic!("expected not-a-transaction, got transfer"),
+        }
+    }
+
+    /// Validate an extracted record and assert it books cleanly (no Review).
+    /// Delegates to [`crate::test_support::assert_booked`] after calling
+    /// [`crate::validate::validate`].
+    pub fn assert_books_clean(e: Extracted) -> crate::validate::Validated {
+        crate::test_support::assert_booked(crate::validate::validate(e))
+    }
+
+    /// Validate an extracted record and assert it routes to Review (not Booked).
+    /// Returns the review reason for further assertions.
+    pub fn assert_reviews(e: Extracted) -> String {
+        match crate::validate::validate(e) {
+            crate::validate::Verdict::Review { reason } => reason,
+            crate::validate::Verdict::Booked(_) => {
+                panic!("expected Review, got Booked")
+            }
+        }
+    }
+
+    /// Assert amount + currency on an [`Extracted`] in one call. Eliminates the
+    /// repeated `assert_eq!(e.amount().value(), dec(...)); assert_eq!(e.currency().as_str(), ...)`
+    /// pair across adapter tests.
+    pub fn assert_money(e: &Extracted, expected_amount: &str, expected_currency: &str) {
+        assert_eq!(e.amount().value(), crate::test_support::dec(expected_amount));
+        assert_eq!(e.currency().as_str(), expected_currency);
+    }
+
+    /// Postprocess JSON through an adapter and extract the single transaction
+    /// record. Panics if postprocess fails or the outcome is not a single
+    /// transaction. Shared by integration and unit tests.
+    pub fn postprocess_one(
+        adapter: &dyn super::Adapter,
+        json: &serde_json::Value,
+    ) -> Extracted {
+        single_transaction(adapter.postprocess(json).expect("postprocess succeeds"))
+    }
+
+    /// Postprocess JSON with body refinement and extract the single transaction
+    /// record. Panics if postprocess_with_body fails or the outcome is not a
+    /// single transaction. Used by cross-currency and promo integration tests.
+    pub fn postprocess_with_body_one(
+        adapter: &dyn super::Adapter,
+        model_json: &serde_json::Value,
+        body: &str,
+    ) -> Extracted {
+        single_transaction(
+            adapter
+                .postprocess_with_body(model_json, body)
+                .expect("postprocess_with_body succeeds"),
+        )
+    }
+}

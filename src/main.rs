@@ -92,13 +92,7 @@ fn init_tracing() -> Option<receipt_ledger::telemetry::Telemetry> {
     receipt_ledger::telemetry::init(json, filter)
 }
 
-/// Install the ring crypto provider for rustls. We use reqwest's
-/// `rustls-no-provider` feature to keep the default off, so we must install one
-/// process-wide before any TLS happens.
-fn install_crypto_provider() {
-    // An `Err` means a provider is already installed, which is fine.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
+use receipt_ledger::install_crypto_provider;
 
 #[cfg(test)]
 mod tests {

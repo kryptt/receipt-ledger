@@ -189,20 +189,18 @@ mod tests {
         assert!(!u.body.contains("Forwarded message"));
     }
 
+    fn assert_extracts(input: &str, expected: &str) {
+        assert_eq!(extract_email(input).as_deref(), Some(expected));
+    }
+
     #[test]
     fn extracts_bracketed_address() {
-        assert_eq!(
-            extract_email("PayPal <service@paypal.com>").as_deref(),
-            Some("service@paypal.com")
-        );
+        assert_extracts("PayPal <service@paypal.com>", "service@paypal.com");
     }
 
     #[test]
     fn extracts_bare_address() {
-        assert_eq!(
-            extract_email("service@paypal.com").as_deref(),
-            Some("service@paypal.com")
-        );
+        assert_extracts("service@paypal.com", "service@paypal.com");
     }
 
     #[test]

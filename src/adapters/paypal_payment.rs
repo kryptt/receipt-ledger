@@ -20,9 +20,10 @@ use anyhow::{Result, anyhow};
 use chrono::NaiveDate;
 use serde_json::Value;
 
-use super::parse::strip_thousands_commas;
-use super::{Adapter, DestHint, Outcome, SourceHint, TransferRecord};
+// PayPal Credit payment-receipt: deterministic parse, no LLM.
 use crate::schema::{Amount, Currency, Money};
+use super::{Adapter, DestHint, Outcome, SourceHint, TransferRecord};
+use super::parse::strip_thousands_commas;
 
 /// Sender substring that identifies a PayPal Credit payment receipt. Note this
 /// is `customercare@`, NOT the purchase adapter's `service@`.
@@ -57,12 +58,14 @@ impl Adapter for PaypalPaymentAdapter {
         "paypal_payment"
     }
 
-    fn matches(&self, original_sender: &str) -> bool {
-        original_sender.contains(PAYMENT_SENDER)
+    fn matches(&self, sender: &str) -> bool {
+        // PayPal Credit payment receipts: customercare@ (not service@).
+        sender.contains(PAYMENT_SENDER)
     }
 
-    fn is_transaction(&self, body: &str) -> bool {
-        is_payment_receipt(body)
+    fn is_transaction(&self, email_body: &str) -> bool {
+        // Deterministic: receipt structure + user-paid marker (not just a quote).
+        is_payment_receipt(email_body)
     }
 
     /// Parse the fixed-format receipt directly, bypassing the LLM. Returns
@@ -105,7 +108,7 @@ impl Adapter for PaypalPaymentAdapter {
 /// is NotATransaction and never books a spurious transfer. Case-insensitive.
 fn is_payment_receipt(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.contains(USER_PAID_MARKER) && STRUCTURAL_MARKERS.iter().any(|m| lower.contains(m))
+    lower.contains(USER_PAID_MARKER) && STRUCTURAL_MARKERS.iter().any(|s| lower.contains(s))
 }
 
 /// Parse the receipt body into a [`TransferRecord`]. Pure — no I/O — so the
@@ -118,8 +121,10 @@ fn parse_payment(body: &str) -> Result<TransferRecord> {
     let transaction_id = parse_transaction_id(body)?;
     let funding_last4 = parse_funding_last4(body)?;
 
+    // Build the PayPal Credit transfer record from the parsed receipt fields.
+    let transfer_money = Money::new(amount, currency);
     Ok(TransferRecord {
-        money: Money::new(amount, currency),
+        money: transfer_money,
         date,
         description: PAYMENT_DESCRIPTION.to_string(),
         external_id: format!("pp-payment:{transaction_id}"),
@@ -182,19 +187,34 @@ fn parse_payment_date(body: &str) -> Result<NaiveDate> {
     ))
 }
 
+/// Find the line whose trimmed content matches `label` (case-insensitive) and
+/// return a sub-iterator starting at the first line AFTER it. The shared
+/// primitive behind `value_after_label` and `parse_funding_last4`.
+fn skip_to_label<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    label: &str,
+) -> bool {
+    lines.any(|line| line.trim().eq_ignore_ascii_case(label))
+}
+
+/// The trimmed text on the line immediately following a line whose trimmed
+/// content matches `label` (case-insensitive). The common structure behind
+/// `date_after_label` and `parse_transaction_id`. Returns `None` when the
+/// label is absent or the following line is blank.
+fn value_after_label<'a>(body: &'a str, label: &str) -> Option<&'a str> {
+    let mut lines = body.lines();
+    if !skip_to_label(&mut lines, label) {
+        return None;
+    }
+    let value = lines.next()?.trim();
+    if !value.is_empty() { Some(value) } else { None }
+}
+
 /// The value on the line following a line that is exactly `Date` (the
 /// Transaction Details label), parsed as `%B %d, %Y`.
 fn date_after_label(body: &str) -> Option<NaiveDate> {
-    let mut lines = body.lines();
-    while let Some(line) = lines.next() {
-        if line.trim().eq_ignore_ascii_case("date") {
-            let value = lines.next()?.trim();
-            if let Ok(d) = NaiveDate::parse_from_str(value, "%B %d, %Y") {
-                return Some(d);
-            }
-        }
-    }
-    None
+    let value = value_after_label(body, "date")?;
+    NaiveDate::parse_from_str(value, "%B %d, %Y").ok()
 }
 
 /// The date from the `You paid $… on May 29, 2026` headline — the three tokens
@@ -226,16 +246,9 @@ fn date_after_on_in_line(line: &str) -> Option<NaiveDate> {
 /// line that is exactly `Transaction ID`. Errors when the label is absent or
 /// the following value is blank.
 fn parse_transaction_id(body: &str) -> Result<String> {
-    let mut lines = body.lines();
-    while let Some(line) = lines.next() {
-        if line.trim().eq_ignore_ascii_case("transaction id") {
-            let value = lines.next().map(str::trim).unwrap_or_default();
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
-        }
-    }
-    Err(anyhow!("no `Transaction ID` value found"))
+    value_after_label(body, "transaction id")
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("no `Transaction ID` value found"))
 }
 
 /// Extract the funding last-4 from the value line under the exact `Paid with`
@@ -251,19 +264,17 @@ fn parse_transaction_id(body: &str) -> Result<String> {
 /// there is no `Paid with` block or its value carries no `x-NNNN`.
 fn parse_funding_last4(body: &str) -> Result<String> {
     let mut lines = body.lines();
-    while let Some(line) = lines.next() {
-        if line.trim().eq_ignore_ascii_case("paid with") {
-            // The funding instrument value sits on the following line(s); read
-            // forward until a line yields an `x-NNNN`, stopping at a blank line.
-            for value in lines.by_ref() {
-                if value.trim().is_empty() {
-                    break;
-                }
-                if let Some(last4) = four_digits_after_x(value) {
-                    return Ok(last4);
-                }
-            }
+    if !skip_to_label(&mut lines, "paid with") {
+        return Err(anyhow!("no `Paid with` funding `x-NNNN` last-4 found"));
+    }
+    // The funding instrument value sits on the following line(s); read forward
+    // until a line yields an `x-NNNN`, stopping at a blank line.
+    for value in lines {
+        if value.trim().is_empty() {
             break;
+        }
+        if let Some(last4) = four_digits_after_x(value) {
+            return Ok(last4);
         }
     }
     Err(anyhow!("no `Paid with` funding `x-NNNN` last-4 found"))
@@ -296,11 +307,12 @@ fn four_digits_after_x(line: &str) -> Option<String> {
     None
 }
 
+// -- adapters-paypal-payment unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal::Decimal;
-    use std::str::FromStr;
+    use crate::adapters::test_support::single_transfer as transfer;
+    use crate::test_support::dec;
 
     /// The exact forwarded-receipt body shape (after the Gmail forward is
     /// unwrapped: the inner body, original sender recovered separately).
@@ -325,17 +337,6 @@ mod tests {
          kryptt@gmail.com"
     }
 
-    /// The transfer from a `Transfer` outcome, or a panic.
-    fn transfer(outcome: Outcome) -> TransferRecord {
-        match outcome {
-            Outcome::Transfer(t) => t,
-            Outcome::Transaction(_) => panic!("expected transfer, got transaction"),
-            Outcome::NotATransaction { reason } => {
-                panic!("expected transfer, got skip: {reason}")
-            }
-        }
-    }
-
     #[test]
     fn matches_payment_sender() {
         assert!(PaypalPaymentAdapter.matches("customercare@paypal.com"));
@@ -351,10 +352,7 @@ mod tests {
             .expect("deterministic adapter always takes over")
             .expect("the sample receipt parses");
         let t = transfer(outcome);
-        assert_eq!(
-            t.money.amount.value(),
-            Decimal::from_str("1300.00").unwrap()
-        );
+        assert_eq!(t.money.amount.value(), dec("1300.00"));
         assert_eq!(t.money.currency.as_str(), "USD");
         assert_eq!(t.date, NaiveDate::from_ymd_opt(2026, 5, 29).unwrap());
         assert_eq!(t.external_id, "pp-payment:49R50555FK9130709");
@@ -394,15 +392,13 @@ mod tests {
 
     #[test]
     fn date_parses_english_month_day_year() {
+        let expected = NaiveDate::from_ymd_opt(2026, 5, 29).unwrap();
         assert_eq!(
             NaiveDate::parse_from_str("May 29, 2026", "%B %d, %Y").unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
+            expected,
         );
         // The adapter's two date paths both land on the same date.
-        assert_eq!(
-            parse_payment_date(sample_body()).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 5, 29).unwrap(),
-        );
+        assert_eq!(parse_payment_date(sample_body()).unwrap(), expected);
     }
 
     #[test]
@@ -490,9 +486,10 @@ mod tests {
 
     #[test]
     fn amount_strips_thousands_comma_and_reads_currency() {
-        let (amount, currency) = parse_amount_currency(sample_body()).unwrap();
-        assert_eq!(amount.value(), Decimal::from_str("1300.00").unwrap());
-        assert_eq!(currency.as_str(), "USD");
+        // PayPal Credit receipt: `$1,300.00 USD` line parsed with comma stripping.
+        let parsed = parse_amount_currency(sample_body()).unwrap();
+        assert_eq!(parsed.0.value(), dec("1300.00"));
+        assert_eq!(parsed.1.as_str(), "USD");
     }
 
     #[test]

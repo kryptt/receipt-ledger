@@ -17,6 +17,8 @@
 //! - [`Money`] pairs an [`Amount`] with the [`Currency`] it is denominated in,
 //!   so an amount can never be read in the wrong currency.
 
+use std::fmt;
+
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -59,13 +61,10 @@ pub enum CurrencyError {
     NotThreeLetters(String),
 }
 
-impl std::fmt::Display for CurrencyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CurrencyError::NotThreeLetters(s) => {
-                write!(f, "currency {s:?} is not a 3-letter ISO-4217 code")
-            }
-        }
+impl fmt::Display for CurrencyError {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let CurrencyError::NotThreeLetters(s) = self;
+        write!(out, "currency {s:?} is not a 3-letter ISO-4217 code")
     }
 }
 
@@ -106,19 +105,9 @@ impl Currency {
         );
         Currency(code.to_string())
     }
-
-    /// The uppercase ISO code, e.g. `"EUR"`.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
-impl std::fmt::Display for Currency {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+impl_newtype_display!(Currency);
 
 impl Serialize for Currency {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -128,8 +117,8 @@ impl Serialize for Currency {
 
 impl<'de> Deserialize<'de> for Currency {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(d)?;
-        Currency::parse(&raw).map_err(serde::de::Error::custom)
+        let raw_code = String::deserialize(d)?;
+        Currency::parse(&raw_code).map_err(serde::de::Error::custom)
     }
 }
 
@@ -145,8 +134,8 @@ pub enum AmountError {
     ScaleTooLarge { value: String, scale: u32 },
 }
 
-impl std::fmt::Display for AmountError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for AmountError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AmountError::NotPlainDecimal(s) => {
                 write!(f, "amount {s:?} is not a plain non-negative decimal")
@@ -294,7 +283,8 @@ impl<'de> Deserialize<'de> for Amount {
                 )));
             }
         };
-        Amount::parse(&raw).map_err(serde::de::Error::custom)
+        // Sanitize via the Amount gate (plain decimal, bounded scale).
+        Amount::parse(&raw).map_err(|e| serde::de::Error::custom(e))
     }
 }
 
@@ -341,6 +331,7 @@ impl Extracted {
     }
 }
 
+// -- schema unit tests --
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,7 +392,7 @@ mod tests {
         assert!(!is_plain_decimal("1 2"));
     }
 
-    // --- property tests --------------------------------------------------
+    // --- schema property tests: Amount + Currency roundtrips ---------------
 
     use proptest::prelude::*;
 

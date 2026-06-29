@@ -48,10 +48,10 @@ impl Validated {
 /// `&ValidatedTransfer`, so the gate cannot be skipped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedTransfer {
+    external_id: String,
     money: Money,
     date: NaiveDate,
     description: String,
-    external_id: String,
 }
 
 impl ValidatedTransfer {
@@ -92,7 +92,7 @@ pub fn validate_transfer(
     money: Money,
     date: NaiveDate,
     description: String,
-    external_id: String,
+    external_id: String, // transfer dedup key
 ) -> TransferVerdict {
     let reason = if !money.amount.is_positive() {
         Some(format!("transfer amount not positive: {}", money.amount))
@@ -108,10 +108,10 @@ pub fn validate_transfer(
     match reason {
         Some(reason) => TransferVerdict::Review { reason },
         None => TransferVerdict::Booked(ValidatedTransfer {
+            external_id,
             money,
             date,
             description,
-            external_id,
         }),
     }
 }
@@ -340,29 +340,19 @@ const ISO_4217: &[&str] = &[
     "KRW", "TWD", "THB", "MYR", "IDR", "PHP", "TRY", "ILS", "AED", "SAR",
 ];
 
+// -- validate unit tests (status classification + gate logic) --
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Amount, Currency, Direction, Money, Source};
+    use crate::schema::{Direction, Money};
+    use crate::test_support::money;
     use chrono::NaiveDate;
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
+    /// Base validate test fixture (approved, outgoing, positive).
     fn base() -> Extracted {
-        Extracted {
-            source: Source::Paypal,
-            external_id: Some("8XY12345AB678901C".to_string()),
-            money: Money::new(
-                Amount::parse("149.99").unwrap(),
-                Currency::parse("EUR").unwrap(),
-            ),
-            direction: Direction::Out,
-            date: NaiveDate::from_ymd_opt(2026, 5, 11).unwrap(),
-            merchant: "Example Merchant B.V.".to_string(),
-            account_hint: None,
-            status: "approved".to_string(),
-            raw_ref: "TESTORDER0123456".to_string(),
-        }
+        crate::test_support::paypal_record()
     }
 
     fn with_status(s: &str) -> Extracted {
@@ -394,68 +384,46 @@ mod tests {
 
     // --- C1 / L4: closed status classification ---------------------------
 
-    #[test]
-    fn approve_tokens_classify_approved() {
-        for s in [
-            "approved",
-            "Approved",
-            "completed",
-            "complete",
-            "success",
-            "successful",
-            "paid",
-            "sent",
-            "posted",
-            "settled",
-            "Aprobada",
-            "aprobado",
-            "completada",
-        ] {
+    /// Assert every raw status in `cases` classifies to `expected`.
+    fn assert_all_classify(cases: &[&str], expected: Status) {
+        for s in cases {
             assert_eq!(
                 Status::classify(s),
-                Status::Approved,
-                "{s:?} should approve"
+                expected,
+                "{s:?} should classify as {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn approve_tokens_classify_approved() {
+        // Every token in the const classifies as Approved.
+        assert_all_classify(APPROVE_TOKENS, Status::Approved);
+        // Case-insensitivity: a capitalized variant also classifies.
+        assert_all_classify(&["Approved", "Aprobada"], Status::Approved);
     }
 
     #[test]
     fn reject_tokens_classify_declined() {
-        for s in [
-            "declined",
-            "Declinada",
-            "failed",
-            "reversed",
-            "refunded",
-            "reembolsado",
-            "contracargo",
-            "disputa",
-            "devuelto",
-            "chargeback",
-            "unpaid",
-            "cancelled",
-            "void",
-        ] {
-            assert_eq!(
-                Status::classify(s),
-                Status::Declined,
-                "{s:?} should decline"
-            );
-        }
+        // Every token in the const classifies as Declined.
+        assert_all_classify(REJECT_TOKENS, Status::Declined);
+        // Case-insensitivity: a capitalized variant also classifies.
+        assert_all_classify(&["Declinada"], Status::Declined);
     }
 
     #[test]
     fn ambiguous_states_classify_other() {
-        for s in [
-            "pending",
-            "processing",
-            "on hold",
-            "expired",
-            "weird-new-status",
-            "",
-        ] {
-            assert_eq!(Status::classify(s), Status::Other, "{s:?} should be Other");
-        }
+        assert_all_classify(
+            &[
+                "pending",
+                "processing",
+                "on hold",
+                "expired",
+                "weird-new-status",
+                "",
+            ],
+            Status::Other,
+        );
     }
 
     /// The must-Review battery from the audit: each MUST NOT book.
@@ -496,7 +464,7 @@ mod tests {
     #[test]
     fn non_positive_amount_routes_to_review() {
         let mut r = base();
-        r.money = Money::new(Amount::parse("0").unwrap(), Currency::parse("EUR").unwrap());
+        r.money = money("0", "EUR");
         assert!(is_review(r));
     }
 
@@ -520,10 +488,7 @@ mod tests {
     fn unknown_currency_routes_to_review() {
         let mut r = base();
         // XYZ parses as a Currency (3 letters) but is not in our booked set.
-        r.money = Money::new(
-            Amount::parse("1.00").unwrap(),
-            Currency::parse("XYZ").unwrap(),
-        );
+        r.money = money("1.00", "XYZ");
         assert!(is_review(r));
     }
 
@@ -536,12 +501,6 @@ mod tests {
 
     // --- transfer gate (statement payments) ------------------------------
 
-    fn money(amount: &str, currency: &str) -> Money {
-        Money::new(
-            Amount::parse(amount).unwrap(),
-            Currency::parse(currency).unwrap(),
-        )
-    }
     fn day() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 4, 28).unwrap()
     }

@@ -114,23 +114,26 @@ async fn main() -> Result<()> {
 /// model may have extracted it perfectly; the gate just refuses to book), so we
 /// still project the extracted fields — the eval judges *extraction*, while
 /// `status`/`direction` capture whatever made it un-bookable.
+/// Shorthand for the non-transaction early return used by `run_one`.
+fn skip() -> Result<Produced> {
+    Ok(Produced::not_a_transaction())
+}
+
 async fn run_one(llm: &LlmClient<'_>, ex: &Example) -> Result<Produced> {
     // 1. Unwrap the forward and recover the original sender.
-    let unwrapped = match unwrap::unwrap_message(Some(&ex.expected.from), &ex.body) {
-        Some(u) => u,
-        None => return Ok(Produced::not_a_transaction()),
+    let Some(unwrapped) = unwrap::unwrap_message(Some(&ex.expected.from), &ex.body) else {
+        return skip();
     };
 
     // 2. Adapter selection.
-    let adapter = match adapters::select(&unwrapped.original_sender) {
-        Some(a) => a,
-        None => return Ok(Produced::not_a_transaction()),
+    let Some(adapter) = adapters::select(&unwrapped.original_sender) else {
+        return skip();
     };
 
     // 3. Deterministic non-transaction prefilter (no LLM call), matching the
     //    pipeline: a clean non-transaction projects to NotATransaction.
     if !adapter.is_transaction(&unwrapped.body) {
-        return Ok(Produced::not_a_transaction());
+        return skip();
     }
 
     // 4. Real LLM extraction with the SAME request params as the pipeline.
@@ -149,11 +152,11 @@ async fn run_one(llm: &LlmClient<'_>, ex: &Example) -> Result<Produced> {
         // scores, and is never produced via this LLM path anyway (it is
         // deterministically extracted in the pipeline); project it like a
         // non-transaction for this purchase-extraction harness.
-        Outcome::Transfer(_) => return Ok(Produced::not_a_transaction()),
-        Outcome::NotATransaction { .. } => return Ok(Produced::not_a_transaction()),
+        Outcome::Transfer(_) => return skip(),
+        Outcome::NotATransaction { .. } => return skip(),
     };
     let Some(record) = records.into_iter().next() else {
-        return Ok(Produced::not_a_transaction());
+        return skip();
     };
 
     // 6. Run the sync validation gate for parity with the pipeline. Either
@@ -171,7 +174,7 @@ async fn run_one(llm: &LlmClient<'_>, ex: &Example) -> Result<Produced> {
 /// A one-line per-example summary: `kind=ok amount=ok currency=WRONG ...`.
 fn summarize(scores: &receipt_ledger::eval::FieldScores) -> String {
     use receipt_ledger::eval::FieldScore;
-    scores
+    let fields: Vec<String> = scores
         .iter()
         .into_iter()
         .map(|(name, fs)| {
@@ -182,8 +185,8 @@ fn summarize(scores: &receipt_ledger::eval::FieldScores) -> String {
             };
             format!("{name}={mark}")
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+    fields.join(" ")
 }
 
 /// One labeled dataset example: the email body + its ground-truth label.
@@ -256,14 +259,12 @@ impl Options {
             }
         }
 
-        let models = models
-            .or_else(|| std::env::var("RECEIPT_EVAL_MODELS").ok())
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_MODELS.to_string())
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let models = receipt_ledger::config::parse_csv(
+            &models
+                .or_else(|| std::env::var("RECEIPT_EVAL_MODELS").ok())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_MODELS.to_string()),
+        );
 
         let ollama_url = std::env::var("RECEIPT_OLLAMA_URL")
             .ok()
@@ -287,9 +288,4 @@ impl Options {
     }
 }
 
-/// Install the ring crypto provider for rustls (same as the main binary): the
-/// `rustls-no-provider` feature keeps the default off, so a provider must be
-/// installed process-wide before any TLS.
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
+use receipt_ledger::install_crypto_provider;

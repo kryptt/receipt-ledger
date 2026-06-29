@@ -1,0 +1,16 @@
+{
+  "minTokens": 15,
+  "minLines": 3,
+  "threshold": 0,
+  "gitignore": true,
+  "reporters": ["console"],
+  "exitCode": 1,
+  "ignore": [
+    "tests/fixtures/**",
+    "eval/dataset/**",
+    "docs/observability/dashboard.json",
+    ".github/workflows/**",
+    "target/**",
+    "target.bak/**"
+  ]
+}

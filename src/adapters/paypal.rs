@@ -15,11 +15,14 @@
 
 use std::borrow::Cow;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use serde_json::Value;
 
-use super::parse::{collect_objects, currency_field, parse_amount, parse_date_with, string_field};
+// PayPal purchase adapter: LLM-based extraction with cross-currency refinement.
+use super::parse::{
+    extract_common_fields, parse_amount, parse_date_with, postprocess_transactions, string_field,
+};
 use super::{Adapter, Outcome};
 use crate::schema::{Amount, Direction, Extracted, Money, Source};
 
@@ -61,6 +64,7 @@ impl Adapter for PaypalAdapter {
     }
 
     fn matches(&self, original_sender: &str) -> bool {
+        // PayPal purchase receipts come from service@paypal.com.
         original_sender.contains(PAYPAL_SENDER)
     }
 
@@ -73,6 +77,7 @@ impl Adapter for PaypalAdapter {
         if is_installment_payment(&lower) {
             return false;
         }
+        // P2 passed: check for receipt markers (Transaction ID, You paid).
         RECEIPT_MARKERS.iter().any(|m| lower.contains(m))
     }
 
@@ -192,12 +197,7 @@ PayPal email:
         if let Some(reason) = not_a_transaction_reason(json) {
             return Ok(Outcome::NotATransaction { reason });
         }
-        let objects = collect_objects(json);
-        if objects.is_empty() {
-            return Err(anyhow!("LLM JSON contained no transaction object"));
-        }
-        let records = objects.iter().map(parse_one).collect::<Result<Vec<_>>>()?;
-        Ok(Outcome::Transaction(records))
+        postprocess_transactions(json, parse_one)
     }
 
     /// P1: after the model's extraction, deterministically override the booked
@@ -243,32 +243,30 @@ fn not_a_transaction_reason(json: &Value) -> Option<String> {
 
 /// Parse one JSON object into a typed [`Extracted`].
 fn parse_one(obj: &Value) -> Result<Extracted> {
-    let map = obj
-        .as_object()
-        .ok_or_else(|| anyhow!("expected JSON object, got {obj}"))?;
+    let c = extract_common_fields(
+        obj,
+        |map| parse_amount(map.get("amount")).context("parsing `amount`"),
+        |map| parse_date(map.get("date")).context("parsing `date`"),
+    )?;
 
-    let amount = parse_amount(map.get("amount")).context("parsing `amount`")?;
-    let currency = currency_field(map, "currency")?;
-    let direction = parse_direction(map.get("direction"));
-    let date = parse_date(map.get("date")).context("parsing `date`")?;
-    let merchant = string_field(map, "merchant").ok_or_else(|| anyhow!("missing `merchant`"))?;
-    let status = string_field(map, "status").unwrap_or_default();
-
-    let external_id = string_field(map, "external_id");
-    let raw_ref = string_field(map, "raw_ref")
-        .or_else(|| external_id.clone())
-        .unwrap_or_default();
-    let account_hint = string_field(map, "account_hint");
+    let direction = parse_direction(c.map.get("direction"));
+    let external_id = string_field(c.map, "external_id");
+    // Fall back to external_id when raw_ref is absent (PayPal-specific policy).
+    let raw_ref = if c.raw_ref.is_empty() {
+        external_id.clone().unwrap_or_default()
+    } else {
+        c.raw_ref
+    };
 
     Ok(Extracted {
         source: Source::Paypal,
         external_id,
-        money: Money::new(amount, currency),
+        money: Money::new(c.amount, c.currency),
         direction,
-        date,
-        merchant,
-        account_hint,
-        status,
+        date: c.date,
+        merchant: c.merchant,
+        account_hint: c.account_hint,
+        status: c.status,
         raw_ref,
     })
 }
@@ -428,16 +426,13 @@ fn first_decimal(s: &str) -> Option<String> {
     if started { Some(out) } else { None }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::validate::{Verdict, validate};
-    use rust_decimal::Decimal;
-    use serde_json::json;
-    use std::str::FromStr;
+/// PayPal JSON fixtures shared between unit and integration tests.
+#[doc(hidden)]
+pub mod fixtures {
+    use serde_json::{json, Value};
 
-    /// The JSON a correctly-behaving model produces for the fixture receipt.
-    fn fixture_json() -> Value {
+    /// The JSON a correctly-behaving model produces for the PayPal fixture receipt.
+    pub fn fixture_json() -> Value {
         json!({
             "kind": "transaction",
             "external_id": "8XY12345AB678901C",
@@ -452,19 +447,34 @@ mod tests {
         })
     }
 
-    /// The single record from a `Transaction` outcome, or a panic.
-    fn one(outcome: Outcome) -> Extracted {
-        match outcome {
-            Outcome::Transaction(mut v) => {
-                assert_eq!(v.len(), 1);
-                v.pop().unwrap()
-            }
-            Outcome::Transfer(_) => panic!("expected transaction, got transfer"),
-            Outcome::NotATransaction { reason } => {
-                panic!("expected transaction, got skip: {reason}")
-            }
-        }
+    /// Model JSON for a cross-currency receipt where the EUR merchant total
+    /// should be overridden to USD by the deterministic body refinement.
+    pub fn cross_currency_model_json(raw_ref: &str) -> Value {
+        json!({
+            "kind": "transaction",
+            "external_id": "7AA11122BB333444C",
+            "amount": "44.80",
+            "currency": "EUR",
+            "direction": "out",
+            "date": "2026-05-12",
+            "merchant": "Northwind Outfitters",
+            "account_hint": "Visa ending x-9981",
+            "status": "approved",
+            "raw_ref": raw_ref
+        })
     }
+}
+
+// -- adapters-paypal unit tests --
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::fixtures::{cross_currency_model_json, fixture_json};
+    use crate::adapters::test_support::{
+        assert_books_clean, assert_money, assert_not_a_transaction, assert_reviews,
+        assert_transaction_count, single_transaction as one,
+    };
+    use serde_json::json;
 
     #[test]
     fn matches_paypal_sender() {
@@ -476,7 +486,7 @@ mod tests {
     #[test]
     fn is_transaction_detects_receipt_markers() {
         assert!(PaypalAdapter.is_transaction("... Transaction ID: 8XY ..."));
-        assert!(PaypalAdapter.is_transaction("You paid €1.00 to Shop"));
+        assert!(PaypalAdapter.is_transaction("You paid EUR 1.00 to Shop"));
         // Non-receipt mail: shipping, plan reminders, surveys.
         assert!(!PaypalAdapter.is_transaction("Your order is on its way!"));
         assert!(!PaypalAdapter.is_transaction("Your Pay in 4 plan: next payment due soon"));
@@ -486,10 +496,7 @@ mod tests {
     #[test]
     fn kind_other_is_clean_skip_not_review() {
         let v = json!({"kind": "other"});
-        assert!(matches!(
-            PaypalAdapter.postprocess(&v).unwrap(),
-            Outcome::NotATransaction { .. }
-        ));
+        assert_not_a_transaction(PaypalAdapter.postprocess(&v).unwrap());
     }
 
     #[test]
@@ -497,21 +504,16 @@ mod tests {
         let e = one(PaypalAdapter.postprocess(&fixture_json()).unwrap());
 
         assert_eq!(e.external_id.as_deref(), Some("8XY12345AB678901C"));
-        assert_eq!(e.amount().value(), Decimal::from_str("149.99").unwrap());
-        assert_eq!(e.currency().as_str(), "EUR");
+        assert_money(&e, "149.99", "EUR");
         assert_eq!(e.direction, Direction::Out);
         assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 11).unwrap());
         assert!(e.merchant.contains("Example Merchant"));
 
-        match validate(e) {
-            Verdict::Booked(b) => {
-                assert_eq!(
-                    b.as_extracted().external_id.as_deref(),
-                    Some("8XY12345AB678901C")
-                )
-            }
-            Verdict::Review { reason } => panic!("fixture should book, got review: {reason}"),
-        }
+        let b = assert_books_clean(e);
+        assert_eq!(
+            b.as_extracted().external_id.as_deref(),
+            Some("8XY12345AB678901C")
+        );
     }
 
     #[test]
@@ -528,8 +530,7 @@ mod tests {
             "raw_ref": "X"
         });
         let e = one(PaypalAdapter.postprocess(&v).unwrap());
-        assert_eq!(e.amount().value(), Decimal::from_str("12.50").unwrap());
-        assert_eq!(e.currency().as_str(), "USD");
+        assert_money(&e, "12.50", "USD");
         assert_eq!(e.date, NaiveDate::from_ymd_opt(2026, 5, 11).unwrap());
     }
 
@@ -538,7 +539,7 @@ mod tests {
         let mut v = fixture_json();
         v["status"] = json!("Declined");
         let e = one(PaypalAdapter.postprocess(&v).unwrap());
-        assert!(matches!(validate(e), Verdict::Review { .. }));
+        assert_reviews(e);
     }
 
     #[test]
@@ -551,11 +552,7 @@ mod tests {
     #[test]
     fn accepts_transactions_wrapper() {
         let v = json!({ "transactions": [fixture_json()] });
-        match PaypalAdapter.postprocess(&v).unwrap() {
-            Outcome::Transaction(v) => assert_eq!(v.len(), 1),
-            Outcome::Transfer(_) => panic!("unexpected transfer"),
-            Outcome::NotATransaction { reason } => panic!("unexpected skip: {reason}"),
-        }
+        assert_transaction_count(PaypalAdapter.postprocess(&v).unwrap(), 1);
     }
 
     // --- P2: installment detection / is_transaction prefilter --------------
@@ -576,7 +573,7 @@ mod tests {
     #[test]
     fn installment_marker_vetoes_even_with_receipt_markers() {
         // Even if an installment mail also carried a Transaction ID line, the
-        // installment veto wins — it is paying down an already-booked plan.
+        // installment veto wins -- it is paying down an already-booked plan.
         let body = "You made a $62.00 USD payment for your Pay in 4 plan.\n\
             Transaction ID: 9ZZ00011AA222333B";
         assert!(!PaypalAdapter.is_transaction(body));
@@ -585,7 +582,7 @@ mod tests {
     #[test]
     fn real_payin4_purchase_is_still_a_transaction() {
         // A genuine Pay-in-4 PURCHASE ("You paid $X to <merchant>") is a
-        // transaction — only the installment-payment phrasing is vetoed.
+        // transaction -- only the installment-payment phrasing is vetoed.
         let body = "You paid $212.00 USD to Northwind Outfitters\n\
             Paid with Pay in 4\nTransaction ID: 6RT90034LM778820B";
         assert!(PaypalAdapter.is_transaction(body));
@@ -603,18 +600,28 @@ mod tests {
 
     // --- P1: cross-currency USD total --------------------------------------
 
+    /// A cross-currency receipt body carrying the authoritative USD total
+    /// line. Shared across P1, trim, and postprocess_with_body tests.
+    fn cross_currency_body() -> String {
+        "You paid EUR 44.80 EUR to Northwind Outfitters\n\
+            Total EUR 44.80 EUR\n\
+            Total amount of this Transaction: $54.50 USD\n\
+            Payment method: Visa ending x-9981\n\
+            Transaction ID: 7AA11122BB333444C"
+            .to_string()
+    }
+
     #[test]
     fn usd_transaction_total_extracts_the_usd_figure() {
-        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
-            Total €44.80 EUR\n\
-            Total amount of this Transaction: $54.50 USD\n\
-            Payment method: Visa ending x-9981";
-        assert_eq!(usd_transaction_total(body), Amount::parse("54.50").ok());
+        assert_eq!(
+            usd_transaction_total(&cross_currency_body()),
+            Amount::parse("54.50").ok()
+        );
     }
 
     #[test]
     fn usd_transaction_total_absent_when_no_label() {
-        let body = "You paid €44.80 EUR to Shop\nTotal €44.80 EUR";
+        let body = "You paid EUR 44.80 EUR to Shop\nTotal EUR 44.80 EUR";
         assert_eq!(usd_transaction_total(body), None);
     }
 
@@ -627,70 +634,50 @@ mod tests {
 
     #[test]
     fn postprocess_with_body_overrides_to_usd_on_cross_currency() {
-        // The model extracted the EUR merchant total; the body's authoritative
-        // USD line must win at the deterministic refinement step.
-        let model = json!({
-            "kind": "transaction",
-            "external_id": "7AA11122BB333444C",
-            "amount": "44.80",
-            "currency": "EUR",
-            "direction": "out",
-            "date": "2026-05-12",
-            "merchant": "Northwind Outfitters",
-            "account_hint": "Visa ending x-9981",
-            "status": "approved",
-            "raw_ref": "NW-XCUR-01"
-        });
-        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
-            Total €44.80 EUR\n\
-            Total amount of this Transaction: $54.50 USD\n\
-            Payment method: Visa ending x-9981\n\
-            Transaction ID: 7AA11122BB333444C";
-        let e = one(PaypalAdapter.postprocess_with_body(&model, body).unwrap());
-        assert_eq!(e.amount().value(), Decimal::from_str("54.50").unwrap());
-        assert_eq!(e.currency().as_str(), "USD");
+        // P1 unit test: the EUR merchant total gets replaced by the USD figure.
+        let xcur_model = cross_currency_model_json("NW-XCUR-01");
+        let xcur_body = cross_currency_body();
+        let refined = one(PaypalAdapter.postprocess_with_body(&xcur_model, &xcur_body).unwrap());
+        assert_money(&refined, "54.50", "USD");
         // Everything else is preserved from the model's extraction.
-        assert_eq!(e.merchant, "Northwind Outfitters");
-        assert_eq!(e.external_id.as_deref(), Some("7AA11122BB333444C"));
+        assert_eq!(refined.merchant, "Northwind Outfitters");
+        assert_eq!(refined.external_id.as_deref(), Some("7AA11122BB333444C"));
     }
 
     #[test]
     fn postprocess_with_body_keeps_merchant_total_when_no_usd_line() {
-        // No "Total amount of this Transaction" line → fall back to the model's
+        // No "Total amount of this Transaction" line -- fall back to the model's
         // merchant-currency total (downstream FX handles conversion).
-        let model = fixture_json(); // EUR 149.99
-        let body = "You paid €149.99 EUR to Example Merchant B.V.\nTotal €149.99 EUR";
-        let e = one(PaypalAdapter.postprocess_with_body(&model, body).unwrap());
-        assert_eq!(e.amount().value(), Decimal::from_str("149.99").unwrap());
-        assert_eq!(e.currency().as_str(), "EUR");
+        let model_eur = fixture_json(); // EUR 149.99
+        let body = "You paid EUR 149.99 EUR to Example Merchant B.V.\nTotal EUR 149.99 EUR";
+        let kept = one(PaypalAdapter.postprocess_with_body(&model_eur, body).unwrap());
+        assert_money(&kept, "149.99", "EUR");
     }
 
     #[test]
     fn postprocess_with_body_passes_through_non_transaction() {
-        let v = json!({"kind": "other"});
-        assert!(matches!(
+        // Even with a USD-total line present, a non-transaction stays skipped.
+        let other = json!({"kind": "other"});
+        assert_not_a_transaction(
             PaypalAdapter
-                .postprocess_with_body(&v, "Total amount of this Transaction: $1.00 USD")
+                .postprocess_with_body(&other, "Total amount of this Transaction: $1.00 USD")
                 .unwrap(),
-            Outcome::NotATransaction { .. }
-        ));
+        );
     }
 
     // --- LLM-input trimming (8K-ctx guard) ---------------------------------
 
     #[test]
     fn trim_is_idempotent_on_clean_fixture_body() {
-        // The scrubbed dataset fixtures never contain <URL>, [image:…], or
+        // The scrubbed dataset fixtures never contain <URL>, [image:...], or
         // a "Help & Contact" footer. The trim must pass them through with no
         // allocation (Borrowed) and no content change.
-        let body = "You paid €44.80 EUR to Northwind Outfitters\n\
-            Total €44.80 EUR\n\
-            Total amount of this Transaction: $54.50 USD\n\
-            Payment method: Visa ending x-9981\n\
-            Transaction ID: 7AA11122BB333444C\n\
-            Your payment was sent from buyer@example.com";
-        match trim_paypal_noise(body) {
-            Cow::Borrowed(s) => assert_eq!(s, body),
+        let body = format!(
+            "{}\nYour payment was sent from buyer@example.com",
+            cross_currency_body()
+        );
+        match trim_paypal_noise(&body) {
+            Cow::Borrowed(s) => assert_eq!(s, body.as_str()),
             Cow::Owned(_) => panic!("clean body must be returned borrowed"),
         }
     }
@@ -718,7 +705,7 @@ mod tests {
         let body = "You paid $1.00 USD to Shop\nTransaction ID: ABC123\n\
             ------------------------------\n\
             Help & Contact | Security | Apps\n\
-            PayPal is committed to preventing fraudulent emails…";
+            PayPal is committed to preventing fraudulent emails...";
         let trimmed = trim_paypal_noise(body);
         let t = trimmed.as_ref();
         assert!(t.contains("Transaction ID: ABC123"));
@@ -730,10 +717,10 @@ mod tests {
     fn trim_preserves_p1_cross_currency_signal() {
         // The USD-line check runs on the UNTRIMMED body in the pipeline, so
         // this is belt-and-suspenders, but the trim must still leave it.
-        let body = "You paid €44.80 EUR to Shop\n\
+        let body = "You paid EUR 44.80 EUR to Shop\n\
             <https://www.paypal.com/track/foo>\n\
             [image: PayPal]\n\
-            Total €44.80 EUR\n\
+            Total EUR 44.80 EUR\n\
             Total amount of this Transaction: $54.50 USD\n\
             Payment method: Visa";
         let t = trim_paypal_noise(body);
@@ -743,7 +730,7 @@ mod tests {
 
     #[test]
     fn trim_handles_unterminated_marker_safely() {
-        // An unterminated <http://… (no closing '>') is defensive-dropped.
+        // An unterminated <http://... (no closing '>') is defensive-dropped.
         // The meaningful prefix survives; we just lose the open-ended tail.
         let body = "You paid $1.00 USD to Shop\nTransaction ID: ABC\n\
             <https://truncated.example.com/no/close";
@@ -754,7 +741,7 @@ mod tests {
 
     #[test]
     fn trim_real_world_paypal_forward_shrinks_dramatically() {
-        // A 5× repetition of the noisy-block pattern observed in the failing
+        // A 5x repetition of the noisy-block pattern observed in the failing
         // production emails (DigitalOcean / Drakenrijk). The trimmed body
         // must end up well under the original size while keeping every field
         // the prompt cares about.
@@ -784,7 +771,7 @@ mod tests {
         assert!(!t.contains("[image:"));
     }
 
-    // --- P3: promo-Mastercard ignored → funding from the real method --------
+    // --- P3: promo-Mastercard ignored -- funding from the real method -------
 
     #[test]
     fn promo_mastercard_does_not_become_the_funding_hint() {
@@ -792,22 +779,22 @@ mod tests {
         // and ignores the cashback-Mastercard promo. A "Balance"-class hint
         // (a linked card) routes to PayPal Balance, never credit.
         use crate::firefly::paypal_is_credit_funded;
-        let visa = one(PaypalAdapter
+        let visa_funded = one(PaypalAdapter
             .postprocess(&json!({
                 "kind": "transaction",
-                "external_id": "C1",
-                "amount": "12.10",
+                "external_id": "PROMO-TEST-1",
+                "amount": "9.95",
                 "currency": "USD",
                 "direction": "out",
                 "date": "2026-05-12",
                 "merchant": "Card Shop",
                 "account_hint": "VISA ending x-7781",
                 "status": "approved",
-                "raw_ref": "C1"
+                "raw_ref": "PROMO-TEST-1"
             }))
             .unwrap());
         assert!(
-            !paypal_is_credit_funded(&visa),
+            !paypal_is_credit_funded(&visa_funded),
             "a linked VISA card funds the PayPal balance, not credit"
         );
     }
