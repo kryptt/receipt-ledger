@@ -287,18 +287,118 @@ impl<'a> FireflyClient<'a> {
         self.post_group(&group, external_id, "transaction").await
     }
 
+    /// The Firefly search modifier that matches `external_id` **exactly**.
+    ///
+    /// NOT `external_id:` — that one is a substring match, so
+    /// `external_id:"937380S"` happily matches `2U9499059X937380S`. Using it as a
+    /// duplicate test would let a *prefix/suffix collision* suppress a real
+    /// booking, which is strictly worse than the duplicate we are preventing.
+    /// Verified against Firefly 6.6.3: `external_id_is:` returns 0 hits for both
+    /// a truncated and a suffix query, `external_id:` returns the full match for
+    /// both.
+    const EXTERNAL_ID_EXACT: &'static str = "external_id_is";
+
+    /// Find an already-booked transaction group with this exact `external_id`.
+    ///
+    /// Firefly core does NOT deduplicate on `external_id` — the maintainer's
+    /// position is that "the API does not, and will not check for duplicates"
+    /// (firefly-iii#2185). Its only guard is `error_if_duplicate_hash`, which
+    /// compares a sha256 over the *entire submitted payload*
+    /// (`TransactionJournalFactory::hashArray`), so two mails describing one
+    /// transaction that extract to different amounts or funding accounts hash
+    /// differently and both get booked. The official data-importer solves this
+    /// client-side by searching `external_id` before submitting
+    /// (`ApiSubmitter`, the "cell" detection method); this is the same approach.
+    ///
+    /// Results are re-checked field-by-field for exact equality rather than
+    /// trusted from the query alone, so no quoting or matching quirk in the
+    /// search backend can turn into a false positive that silently drops a
+    /// charge.
+    async fn find_by_external_id(&self, external_id: &str) -> Result<Option<String>> {
+        // Built via `Url` rather than `RequestBuilder::query` — reqwest is
+        // pulled in with default-features = false (see Cargo.toml) so the query
+        // helper is not compiled in. `query_pairs_mut` percent-encodes, which
+        // matters: the value is quoted and can contain characters that would
+        // otherwise terminate the parameter.
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/api/v1/search/transactions",
+            self.base_url.trim_end_matches('/')
+        ))
+        .with_context(|| format!("building Firefly search URL from {}", self.base_url))?;
+        url.query_pairs_mut()
+            .append_pair(
+                "query",
+                &format!("{}:\"{external_id}\"", Self::EXTERNAL_ID_EXACT),
+            )
+            .append_pair("limit", "50");
+
+        let resp = self
+            .http
+            .get(url)
+            .bearer_auth(&self.token)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .with_context(|| format!("searching Firefly for external_id {external_id}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            // Deliberately fatal: the caller turns this into a Review rather
+            // than booking blind. A duplicate needs manual DB cleanup and, once
+            // deleted, Firefly's `withTrashed()` hash check blocks re-import
+            // forever — a Review is the recoverable failure, so prefer it.
+            anyhow::bail!("Firefly search returned {status} for external_id {external_id}: {body}");
+        }
+        let found = resp
+            .json::<SearchResponse>()
+            .await
+            .with_context(|| format!("decoding Firefly search for external_id {external_id}"))?;
+
+        Ok(found
+            .data
+            .into_iter()
+            .find(|group| {
+                group
+                    .attributes
+                    .transactions
+                    .iter()
+                    .any(|split| split.external_id.as_deref() == Some(external_id))
+            })
+            .map(|group| group.id))
+    }
+
     /// POST a transaction group and classify the response — the one place that
     /// decides Created vs Duplicate vs hard failure, shared by [`submit`] and
-    /// [`submit_transfer`]. A 422 whose body is Firefly's duplicate-hash shape is
-    /// success-as-duplicate (idempotent re-run); any other 422 (or non-2xx) is a
-    /// real failure that bails (→ the pipeline routes the message to Review),
-    /// never silently treated as Processed.
+    /// [`submit_transfer`].
+    ///
+    /// Two guards, in order:
+    /// 1. An exact `external_id` lookup ([`find_by_external_id`](Self::find_by_external_id)),
+    ///    because Firefly will not do this for us.
+    /// 2. `error_if_duplicate_hash` on the POST itself — still useful as a
+    ///    backstop, but it only fires on byte-identical payloads and has a
+    ///    sub-second check-then-insert race (every duplicate-hash collision
+    ///    observed in this instance was created inside the same second).
+    ///
+    /// A 422 whose body is Firefly's duplicate-hash shape is success-as-duplicate
+    /// (idempotent re-run); any other 422 (or non-2xx) is a real failure that
+    /// bails (→ the pipeline routes the message to Review), never silently
+    /// treated as Processed.
     async fn post_group(
         &self,
         group: &TransactionGroup<'_>,
         external_id: &str,
         kind: &str,
     ) -> Result<SubmitOutcome> {
+        if let Some(existing) = self.find_by_external_id(external_id).await? {
+            info!(
+                %external_id,
+                %kind,
+                journal_group = %existing,
+                "already booked (external_id match) — not double-booking"
+            );
+            return Ok(SubmitOutcome::Duplicate);
+        }
         let url = format!(
             "{}/api/v1/transactions",
             self.base_url.trim_end_matches('/')
@@ -894,6 +994,30 @@ struct Pagination {
 
 // --- rule-group / rules (merchant alias map) -------------------------------
 
+/// `GET /api/v1/search/transactions` — only the fields the external_id dedup
+/// check needs. Everything else in the payload is ignored by serde.
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    data: Vec<SearchGroup>,
+}
+#[derive(Deserialize)]
+struct SearchGroup {
+    id: String,
+    attributes: SearchGroupAttrs,
+}
+#[derive(Deserialize)]
+struct SearchGroupAttrs {
+    #[serde(default)]
+    transactions: Vec<SearchSplit>,
+}
+#[derive(Deserialize)]
+struct SearchSplit {
+    /// `null` on splits that carry no external id — never equal to a real key.
+    #[serde(default)]
+    external_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct RuleGroupList {
     #[serde(default)]
@@ -1452,6 +1576,165 @@ mod tests {
                 ("ABNANL2A".to_string(), acct("8")),
             ]),
         )
+    }
+
+    /// A one-shot loopback HTTP stub. Serves `bodies` in order, one per
+    /// connection, and returns every request it saw (request line + body) so a
+    /// test can assert what was NOT sent. No new dependencies — same approach as
+    /// the telemetry export test.
+    fn stub_server(bodies: Vec<(u16, String)>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback firefly stub");
+        let port = listener
+            .local_addr()
+            .expect("the bound listener has a local address")
+            .port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in bodies {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 8192];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let resp = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes());
+                let _ = sock.flush();
+            }
+            seen
+        });
+        (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// A `GET /search/transactions` payload whose single split carries `ext`.
+    fn search_hit(ext: &str) -> String {
+        format!(
+            r#"{{"data":[{{"id":"1771","attributes":{{"transactions":[{{"external_id":"{ext}"}}]}}}}]}}"#
+        )
+    }
+
+    /// Minimal well-formed split. `post_group` never inspects its contents —
+    /// these tests are about the dedup decision, not the payload shape (that is
+    /// covered by the `builds_*` tests).
+    fn stub_split<'a>(external_id: &'a str) -> Split<'a> {
+        Split {
+            kind: "withdrawal",
+            date: "2026-06-29".to_string(),
+            amount: "10.00".to_string(),
+            currency_code: "USD",
+            description: "stub",
+            external_id,
+            tags: vec![],
+            source_id: "103",
+            destination: Destination::Name("Merchant"),
+            foreign_amount: None,
+            foreign_currency_code: None,
+            category_name: None,
+        }
+    }
+
+    fn stub_client<'a>(http: &'a Client, fx: &'a FxClient<'a>, base: &str) -> FireflyClient<'a> {
+        FireflyClient::new(
+            http,
+            base,
+            "tok",
+            fx,
+            acct("103"),
+            Some(acct("105")),
+            Some(acct("106")),
+            Some(acct("107")),
+            Some(acct("201")),
+            Some(acct("202")),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    /// The whole point: an existing transaction with this exact external_id
+    /// means Duplicate, and NO POST is attempted. Firefly will not do this for
+    /// us (firefly-iii#2185), so if this regresses we silently double-book.
+    #[tokio::test]
+    async fn exact_external_id_hit_is_a_duplicate_and_posts_nothing() {
+        let (base, handle) = stub_server(vec![(200, search_hit("2U9499059X937380S"))]);
+        let http = Client::new();
+        let fxc = fx(&http);
+        let c = stub_client(&http, &fxc, &base);
+
+        let group = TransactionGroup::single(stub_split("2U9499059X937380S"));
+        let outcome = c
+            .post_group(&group, "2U9499059X937380S", "transaction")
+            .await
+            .expect("a duplicate is a normal outcome, not an error");
+
+        assert!(matches!(outcome, SubmitOutcome::Duplicate));
+        let seen = handle.join().expect("stub thread joins");
+        assert_eq!(seen.len(), 1, "only the search should have been sent");
+        assert!(
+            seen[0].starts_with("GET /api/v1/search/transactions"),
+            "expected only a search, got: {}",
+            seen[0].lines().next().unwrap_or_default()
+        );
+    }
+
+    /// Firefly's `external_id:` modifier is a SUBSTRING match, so a search can
+    /// return a transaction whose id merely contains ours. Treating that as a
+    /// duplicate would silently drop a real charge — worse than the duplicate
+    /// being prevented. We re-check equality on the response, so a near-miss
+    /// must fall through to the POST.
+    #[tokio::test]
+    async fn substring_external_id_is_not_treated_as_a_duplicate() {
+        let (base, handle) = stub_server(vec![
+            // The stored id merely CONTAINS the one we are about to book.
+            (200, search_hit("PREFIX-2U9499059X937380S-SUFFIX")),
+            (200, r#"{"data":{"id":"9"}}"#.to_string()),
+        ]);
+        let http = Client::new();
+        let fxc = fx(&http);
+        let c = stub_client(&http, &fxc, &base);
+
+        let group = TransactionGroup::single(stub_split("2U9499059X937380S"));
+        let outcome = c
+            .post_group(&group, "2U9499059X937380S", "transaction")
+            .await
+            .expect("a non-matching search must not fail the booking");
+
+        assert!(matches!(outcome, SubmitOutcome::Created));
+        let seen = handle.join().expect("stub thread joins");
+        assert_eq!(seen.len(), 2, "search then POST");
+        assert!(seen[1].starts_with("POST /api/v1/transactions"));
+    }
+
+    /// A search that errors is fatal, NOT "assume it's new and book it". The
+    /// caller turns this into a Review; a wrong duplicate needs manual DB
+    /// cleanup and, once deleted, Firefly's `withTrashed()` hash check blocks
+    /// re-import permanently. Review is the recoverable failure.
+    #[tokio::test]
+    async fn search_failure_does_not_fall_through_to_booking() {
+        let (base, handle) = stub_server(vec![(500, r#"{"message":"boom"}"#.to_string())]);
+        let http = Client::new();
+        let fxc = fx(&http);
+        let c = stub_client(&http, &fxc, &base);
+
+        let group = TransactionGroup::single(stub_split("2U9499059X937380S"));
+        let err = c
+            .post_group(&group, "any-id", "transaction")
+            .await
+            .expect_err("a failed duplicate check must not book blind");
+
+        assert!(
+            format!("{err:#}").contains("search returned 500"),
+            "error should name the failed search, got: {err:#}"
+        );
+        let seen = handle.join().expect("stub thread joins");
+        assert_eq!(seen.len(), 1, "must not POST after a failed search");
     }
 
     #[test]

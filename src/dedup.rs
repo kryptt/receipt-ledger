@@ -4,7 +4,20 @@
 //! re-forwarded email) does not double-book. PayPal gives us a real
 //! `Transaction ID`, which is the strongest possible key. Sources without an
 //! id (e.g. Banco Popular, v2) fall back to a composite hash over the salient
-//! fields. Firefly's own external-id duplicate detection is the final backstop.
+//! fields.
+//!
+//! **Firefly has no external-id duplicate detection.** This doc used to call it
+//! "the final backstop"; no such feature exists. Firefly core offers only
+//! `error_if_duplicate_hash`, a sha256 over the *entire submitted payload*
+//! (`TransactionJournalFactory::hashArray`), and the maintainer's position is
+//! that "the API does not, and will not check for duplicates"
+//! (firefly-iii#2185). Two mails describing one transaction that extract to
+//! different amounts or funding accounts therefore hash differently and BOTH get
+//! booked — which is how one PayPal charge landed three times.
+//!
+//! The key produced here only works because
+//! [`crate::firefly::FireflyClient`] now looks it up explicitly before every
+//! POST. Keep the two in step: a key nothing searches is decoration.
 
 use sha2::{Digest, Sha256};
 

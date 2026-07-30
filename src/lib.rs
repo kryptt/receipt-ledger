@@ -642,6 +642,14 @@ async fn process_message(
     let mut booked_any = false;
     let mut dup_any = false;
     let mut review_reason: Option<String> = None;
+    // Dedup key of every record already submitted for THIS message. A single
+    // mail can extract the same transaction twice (a summary block plus a detail
+    // block), and the two POSTs then go out back-to-back — inside the window
+    // where Firefly's own check-then-insert on `import_hash_v2` does not yet see
+    // the first row, so it accepts both. Observed: one "Receipt for your PayPal
+    // payment" booked twice 59ms apart with identical hashes. Firefly's guard
+    // cannot close this; ours has to.
+    let mut submitted: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for record in records {
         // 5. Validation gates (deterministic, sync). Only `validate` can mint a
@@ -696,6 +704,17 @@ async fn process_message(
 
                 // 6. Dedup key. 7. Submit to Firefly (skipped in dry-run).
                 let external_id = dedup::external_id(validated.as_extracted());
+                // Same key twice within one message → the second is this mail
+                // restating the first, not a second charge. Count it as the
+                // duplicate it is instead of racing Firefly with it.
+                if !submitted.insert(external_id.clone()) {
+                    info!(
+                        %external_id,
+                        "record repeats an external_id already submitted for this message — skipping"
+                    );
+                    dup_any = true;
+                    continue;
+                }
                 if dry_run {
                     info!(%external_id, "DRY RUN: would book withdrawal");
                     booked_any = true;
