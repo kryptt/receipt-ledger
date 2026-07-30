@@ -16,14 +16,14 @@
 use chrono::NaiveDate;
 use serde_json::json;
 
+use receipt_ledger::adapters;
 use receipt_ledger::adapters::banco_popular::fixtures::approved_json;
 use receipt_ledger::adapters::test_support::{assert_money, postprocess_one};
-use receipt_ledger::adapters;
 use receipt_ledger::dedup;
-use receipt_ledger::validate::validate;
+use receipt_ledger::schema::{Direction, Source};
 use receipt_ledger::test_support::{assert_booked, assert_review};
 use receipt_ledger::unwrap::unwrap_message;
-use receipt_ledger::schema::{Direction, Source};
+use receipt_ledger::validate::validate;
 
 const AUTOFORWARD: &str = include_str!("fixtures/banco_popular_autoforward.txt");
 const MANUAL_FWD: &str = include_str!("fixtures/banco_popular_manual_fwd.txt");
@@ -39,8 +39,10 @@ fn autoforwarded_consumo_books_with_expected_fields() {
         "notificaciones@popularenlinea.com"
     );
     // The body is the original message verbatim.
-    assert!(unwrapped.body.contains("Notificacion de Consumo")
-        || unwrapped.body.contains("Notificación de Consumo"));
+    assert!(
+        unwrapped.body.contains("Notificacion de Consumo")
+            || unwrapped.body.contains("Notificación de Consumo")
+    );
     assert!(unwrapped.body.contains("Example Cafe Amsterdam"));
 
     // 2. Sender detection selects the Banco Popular adapter.

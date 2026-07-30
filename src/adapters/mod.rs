@@ -208,6 +208,11 @@ pub fn select(original_sender: &str) -> Option<&'static dyn Adapter> {
 /// an unconditional (but `#[doc(hidden)]`) module is the pragmatic choice.
 #[doc(hidden)]
 pub mod test_support {
+    // Being un-gated (see above) puts this module in the `not(test)` build, where
+    // lib.rs denies unwrap/expect. These are fixture accessors whose whole job is
+    // to panic loudly on an unexpected outcome, so allow them here.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::{Outcome, TransferRecord};
     use crate::schema::Extracted;
 
@@ -286,17 +291,17 @@ pub mod test_support {
     /// repeated `assert_eq!(e.amount().value(), dec(...)); assert_eq!(e.currency().as_str(), ...)`
     /// pair across adapter tests.
     pub fn assert_money(e: &Extracted, expected_amount: &str, expected_currency: &str) {
-        assert_eq!(e.amount().value(), crate::test_support::dec(expected_amount));
+        assert_eq!(
+            e.amount().value(),
+            crate::test_support::dec(expected_amount)
+        );
         assert_eq!(e.currency().as_str(), expected_currency);
     }
 
     /// Postprocess JSON through an adapter and extract the single transaction
     /// record. Panics if postprocess fails or the outcome is not a single
     /// transaction. Shared by integration and unit tests.
-    pub fn postprocess_one(
-        adapter: &dyn super::Adapter,
-        json: &serde_json::Value,
-    ) -> Extracted {
+    pub fn postprocess_one(adapter: &dyn super::Adapter, json: &serde_json::Value) -> Extracted {
         single_transaction(adapter.postprocess(json).expect("postprocess succeeds"))
     }
 

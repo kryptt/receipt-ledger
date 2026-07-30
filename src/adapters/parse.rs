@@ -7,8 +7,8 @@
 //! adapter still owns its own `parse_one` (its field set differs); only the
 //! field-level primitives live here.
 
-use chrono::NaiveDate;
 use anyhow::{Result, anyhow};
+use chrono::NaiveDate;
 use serde_json::Value;
 
 use super::Outcome;

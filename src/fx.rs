@@ -686,7 +686,9 @@ mod tests {
         let http = Client::new();
         let fx = FxClient::new(&http, "http://fx.invalid");
         let date = NaiveDate::from_ymd_opt(2026, 5, 27).unwrap();
-        let r = test_runtime().block_on(fx.rate("USD", "usd", date)).unwrap();
+        let r = test_runtime()
+            .block_on(fx.rate("USD", "usd", date))
+            .unwrap();
         assert_eq!(r, Decimal::ONE);
     }
 
@@ -799,7 +801,9 @@ mod tests {
         let fx = FxClient::with_seeded_rate(&http, "JPY", "USD", may_27, dec("0.0064"));
         // Case-insensitive lookup and seeded value round-trip.
         assert_eq!(
-            test_runtime().block_on(fx.rate("jpy", "USD", may_27)).unwrap(),
+            test_runtime()
+                .block_on(fx.rate("jpy", "USD", may_27))
+                .unwrap(),
             dec("0.0064"),
         );
     }

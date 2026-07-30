@@ -21,9 +21,9 @@ use chrono::NaiveDate;
 use serde_json::Value;
 
 // PayPal Credit payment-receipt: deterministic parse, no LLM.
-use crate::schema::{Amount, Currency, Money};
-use super::{Adapter, DestHint, Outcome, SourceHint, TransferRecord};
 use super::parse::strip_thousands_commas;
+use super::{Adapter, DestHint, Outcome, SourceHint, TransferRecord};
+use crate::schema::{Amount, Currency, Money};
 
 /// Sender substring that identifies a PayPal Credit payment receipt. Note this
 /// is `customercare@`, NOT the purchase adapter's `service@`.
@@ -190,10 +190,7 @@ fn parse_payment_date(body: &str) -> Result<NaiveDate> {
 /// Find the line whose trimmed content matches `label` (case-insensitive) and
 /// return a sub-iterator starting at the first line AFTER it. The shared
 /// primitive behind `value_after_label` and `parse_funding_last4`.
-fn skip_to_label<'a>(
-    lines: &mut impl Iterator<Item = &'a str>,
-    label: &str,
-) -> bool {
+fn skip_to_label<'a>(lines: &mut impl Iterator<Item = &'a str>, label: &str) -> bool {
     lines.any(|line| line.trim().eq_ignore_ascii_case(label))
 }
 

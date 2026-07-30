@@ -27,8 +27,8 @@ use chrono::{Datelike, NaiveDate};
 use rust_decimal::Decimal;
 
 use super::{
-    join_cells, AuthCode, Last4, Mcc, ParsedStatement, Reference, Section, SectionCurrency,
-    StatementTxn, TextRow,
+    AuthCode, Last4, Mcc, ParsedStatement, Reference, Section, SectionCurrency, StatementTxn,
+    TextRow, join_cells,
 };
 use crate::adapters::parse::strip_thousands_commas;
 use crate::eval::scorer::collapse_whitespace;
@@ -481,19 +481,13 @@ mod tests {
         );
         assert_eq!(payment.merchant, "Pago Via App");
         assert_eq!(payment.money.currency.as_str(), "DOP");
-        assert_eq!(
-            payment.money.amount.value(),
-            dec("60999.81")
-        );
+        assert_eq!(payment.money.amount.value(), dec("60999.81"));
 
         let charge = &s.txns[1];
         assert_eq!(charge.direction, Direction::Out);
         assert_eq!(charge.merchant, "DONACION JOMPEAME JOMPEAME.COM");
         assert_eq!(charge.reference.as_str(), "24492166114100057344389");
-        assert_eq!(
-            charge.money.amount.value(),
-            dec("1000.00")
-        );
+        assert_eq!(charge.money.amount.value(), dec("1000.00"));
 
         let usd = &s.txns[2];
         assert_eq!(usd.section, SectionCurrency::Usd);
@@ -518,21 +512,21 @@ mod tests {
     fn amount_is_last_decimal_not_blindly_last_cell() {
         // A trailing non-amount artifact cell after the real amount must not be
         // booked as the amount; the real amount (a signed decimal) wins.
-        let r = row(600.0, &[
-            (30.0, "25/04"),
-            (78.0, "24/04"),
-            (115.0, "0601324353"),
-            (255.0, "SOME MERCHANT"),
-            (542.0, "42.15"),
-            (602.0, "*"), // trailing artifact
-        ]);
+        let r = row(
+            600.0,
+            &[
+                (30.0, "25/04"),
+                (78.0, "24/04"),
+                (115.0, "0601324353"),
+                (255.0, "SOME MERCHANT"),
+                (542.0, "42.15"),
+                (602.0, "*"), // trailing artifact
+            ],
+        );
         let cut = NaiveDate::from_ymd_opt(2026, 5, 22).unwrap();
         let reference = Reference::parse("0601324353").unwrap();
         let txn = parse_txn(&r, reference, SectionCurrency::Usd, cut).unwrap();
-        assert_eq!(
-            txn.money.amount.value(),
-            dec("42.15")
-        );
+        assert_eq!(txn.money.amount.value(), dec("42.15"));
         assert_eq!(txn.merchant, "SOME MERCHANT");
     }
 

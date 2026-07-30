@@ -63,12 +63,14 @@ fn hex(bytes: &[u8]) -> String {
 // -- dedup unit tests (external_id + composite hash) --
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::schema::Source;
     use crate::test_support::money;
-    use super::*;
 
     /// Base dedup fixture: PayPal record with transaction id (has external_id).
-    fn record() -> Extracted { crate::test_support::paypal_record() }
+    fn record() -> Extracted {
+        crate::test_support::paypal_record()
+    }
 
     fn idless() -> Extracted {
         let mut r = record();
@@ -132,7 +134,9 @@ mod tests {
     /// Build an id-less record from salient fields, for hashing-invariant props.
     fn idless_with(
         source: Source, // dedup hash source discriminant
-        amount: &str, currency: &str, merchant: &str,
+        amount: &str,
+        currency: &str,
+        merchant: &str,
         last4: &str,
         status: &str,
     ) -> Extracted {

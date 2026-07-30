@@ -10,13 +10,13 @@
 
 use serde_json::json;
 
+use receipt_ledger::adapters;
 use receipt_ledger::adapters::paypal::fixtures::{
     cross_currency_model_json, fixture_json as fixture_model_json,
 };
 use receipt_ledger::adapters::test_support::{
     assert_money, postprocess_one, postprocess_with_body_one,
 };
-use receipt_ledger::adapters;
 use receipt_ledger::schema::{Direction, Source};
 use receipt_ledger::test_support::{assert_booked, assert_review};
 use receipt_ledger::unwrap::unwrap_forward;
@@ -70,7 +70,10 @@ fn declined_paypal_goes_to_review() {
 
     // Same receipt, but the model reports a declined payment.
     let mut model_json = fixture_model_json();
-    model_json.as_object_mut().unwrap().insert("status".into(), json!("declined"));
+    model_json
+        .as_object_mut()
+        .unwrap()
+        .insert("status".into(), json!("declined"));
 
     let record = postprocess_one(adapter, &model_json);
     assert_review(validate(record));

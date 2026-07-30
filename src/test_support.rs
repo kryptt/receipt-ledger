@@ -2,13 +2,22 @@
 //!
 //! Centralises small utilities that otherwise get copy-pasted across test files
 //! (e.g. the `dec` decimal parser, single-threaded tokio runtime, record
-//! factories). Only compiled under `#[cfg(test)]`.
+//! factories).
+//!
+//! NOT `#[cfg(test)]`-gated: `tests/banco_popular_pipeline.rs` and
+//! `tests/paypal_pipeline.rs` are integration tests, which link the crate built
+//! *without* `cfg(test)`, so this module has to exist in that build for them to
+//! use it. That in turn means `lib.rs`'s
+//! `#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]`
+//! applies here, hence the module-level allow below. The panics are correct:
+//! these are fixture builders, and a bad fixture literal should fail the test
+//! loudly rather than be handled.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::str::FromStr;
 use rust_decimal::Decimal;
+use std::str::FromStr;
 
-/// Shorthand decimal parser for test literals. Panics on invalid input (test
-/// code only — the `#![deny(clippy::unwrap_used)]` attribute exempts `#[cfg(test)]`).
+/// Shorthand decimal parser for test literals. Panics on invalid input.
 pub fn dec(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap() // test-only parse
 }

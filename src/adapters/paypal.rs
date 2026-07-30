@@ -429,7 +429,7 @@ fn first_decimal(s: &str) -> Option<String> {
 /// PayPal JSON fixtures shared between unit and integration tests.
 #[doc(hidden)]
 pub mod fixtures {
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     /// The JSON a correctly-behaving model produces for the PayPal fixture receipt.
     pub fn fixture_json() -> Value {
@@ -468,8 +468,8 @@ pub mod fixtures {
 // -- adapters-paypal unit tests --
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::fixtures::{cross_currency_model_json, fixture_json};
+    use super::*;
     use crate::adapters::test_support::{
         assert_books_clean, assert_money, assert_not_a_transaction, assert_reviews,
         assert_transaction_count, single_transaction as one,
@@ -637,7 +637,9 @@ mod tests {
         // P1 unit test: the EUR merchant total gets replaced by the USD figure.
         let xcur_model = cross_currency_model_json("NW-XCUR-01");
         let xcur_body = cross_currency_body();
-        let refined = one(PaypalAdapter.postprocess_with_body(&xcur_model, &xcur_body).unwrap());
+        let refined = one(PaypalAdapter
+            .postprocess_with_body(&xcur_model, &xcur_body)
+            .unwrap());
         assert_money(&refined, "54.50", "USD");
         // Everything else is preserved from the model's extraction.
         assert_eq!(refined.merchant, "Northwind Outfitters");
@@ -650,7 +652,9 @@ mod tests {
         // merchant-currency total (downstream FX handles conversion).
         let model_eur = fixture_json(); // EUR 149.99
         let body = "You paid EUR 149.99 EUR to Example Merchant B.V.\nTotal EUR 149.99 EUR";
-        let kept = one(PaypalAdapter.postprocess_with_body(&model_eur, body).unwrap());
+        let kept = one(PaypalAdapter
+            .postprocess_with_body(&model_eur, body)
+            .unwrap());
         assert_money(&kept, "149.99", "EUR");
     }
 

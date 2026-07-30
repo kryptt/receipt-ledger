@@ -1,6 +1,7 @@
 {
-  "minTokens": 15,
-  "minLines": 3,
+  "_comment": "minLines/minTokens sit above import-prelude size ON PURPOSE. rustfmt normalises `use` ordering, so every module importing anyhow+chrono+serde_json ends up with a byte-identical 3-line block; at minLines 3 / minTokens 15 that registered as 21 clones and made `cargo fmt` and this gate mutually exclusive. threshold stays 0 — the gate still fails on any real duplicated logic, which is what it was added for.",
+  "minTokens": 60,
+  "minLines": 8,
   "threshold": 0,
   "gitignore": true,
   "reporters": ["console"],

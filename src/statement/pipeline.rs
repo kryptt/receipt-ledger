@@ -518,7 +518,10 @@ async fn book_charge(
     ctx: &PipelineCtx<'_>,
     report: &mut StatementReport,
 ) {
-    let tag = RowTag { reference: charge.reference.as_str(), label: "BookNew" };
+    let tag = RowTag {
+        reference: charge.reference.as_str(),
+        label: "BookNew",
+    };
     let extracted = charge.to_extracted(&section.primary_last4);
     let validated = match validate(extracted) {
         Verdict::Booked(v) => v,
@@ -530,7 +533,12 @@ async fn book_charge(
     };
     let ext = validated.as_extracted();
     if !check_and_apply_ceiling(
-        ctx, ext.currency().as_str(), ext.amount().value(), ext.date, &tag, report,
+        ctx,
+        ext.currency().as_str(),
+        ext.amount().value(),
+        ext.date,
+        &tag,
+        report,
     )
     .await
     {
@@ -559,18 +567,21 @@ async fn book_charge(
 
 /// Book a statement payment as a transfer (paying account → card), tallying the
 /// outcome. Per-row failures are counted as review, never abort the statement.
-async fn book_payment(
-    payment: &StatementTxn,
-    report: &mut StatementReport,
-    ctx: &PipelineCtx<'_>,
-) {
-    let tag = RowTag { reference: payment.reference.as_str(), label: "payment" };
+async fn book_payment(payment: &StatementTxn, report: &mut StatementReport, ctx: &PipelineCtx<'_>) {
+    let tag = RowTag {
+        reference: payment.reference.as_str(),
+        label: "payment",
+    };
     let external_id = format!("bpstmt:{}", tag.reference);
     // Plausibility ceiling applies to transfers too (a crafted huge payment must
     // not silently move money out of the savings account).
     if !check_and_apply_ceiling(
-        ctx, payment.money.currency.as_str(),
-        payment.money.amount.value(), payment.auth_date, &tag, report,
+        ctx,
+        payment.money.currency.as_str(),
+        payment.money.amount.value(),
+        payment.auth_date,
+        &tag,
+        report,
     )
     .await
     {
@@ -590,7 +601,10 @@ async fn book_payment(
         }
     };
     if ctx.cfg.dry_run {
-        info!(reference = tag.reference, "DRY RUN: would book payment transfer");
+        info!(
+            reference = tag.reference,
+            "DRY RUN: would book payment transfer"
+        );
         report.payments_booked += 1;
         return;
     }
@@ -652,10 +666,13 @@ mod tests {
         assert_classify(&m, Ingest::Statement);
     }
 
+    /// A classification case: subject, sender, and the attachment to build.
+    type Case = (&'static str, &'static str, fn() -> Attachment);
+
     /// Messages that lack a statement signal should classify as Notification.
     #[test]
     fn non_statement_messages_are_notification() {
-        let cases: &[(&str, &str, fn() -> Attachment)] = &[
+        let cases: &[Case] = &[
             // PDF present but no cuenta subject and no matching sender
             ("here is a receipt", "someone@example.com", pdf_att),
             // cuenta subject present but no PDF attachment
@@ -700,8 +717,8 @@ mod tests {
                 currency: SectionCurrency::Usd,
                 primary_last4: Last4::parse("7524").unwrap(),
                 cut_date: chrono::NaiveDate::from_ymd_opt(2026, 5, 22).unwrap(),
-                balance_anterior: anterior.map(|s| dec(s)),
-                balance_total: total.map(|s| dec(s)),
+                balance_anterior: anterior.map(dec),
+                balance_total: total.map(dec),
             }
         }
 

@@ -284,7 +284,7 @@ impl<'de> Deserialize<'de> for Amount {
             }
         };
         // Sanitize via the Amount gate (plain decimal, bounded scale).
-        Amount::parse(&raw).map_err(|e| serde::de::Error::custom(e))
+        Amount::parse(&raw).map_err(serde::de::Error::custom)
     }
 }
 

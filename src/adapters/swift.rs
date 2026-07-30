@@ -81,7 +81,9 @@ pub fn try_parse_swift(body: &str) -> Option<Result<TransferRecord>> {
 /// and recognises a real wire by its XML rather than a translatable subject.
 fn is_swift_confirmation(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    let has_doc_marker = SWIFT_DOC_MARKERS.iter().any(|marker| lower.contains(marker));
+    let has_doc_marker = SWIFT_DOC_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker));
     let has_settlement = lower.contains(SWIFT_SETTLEMENT_MARKER);
     has_doc_marker && has_settlement
 }
@@ -422,8 +424,8 @@ pub fn try_parse_swift_outcome(body: &str) -> Option<Result<Outcome>> {
 // -- SWIFT pacs.008 wire confirmation parser tests --
 #[cfg(test)]
 mod tests {
-    use crate::test_support::dec;
     use super::*;
+    use crate::test_support::dec;
 
     // --- shared XML fragments for building SWIFT test bodies -----------------
 
@@ -445,8 +447,7 @@ mod tests {
         "<DbtrAcct><Id><Othr><Id>DO96BPDO00000000000802394189</Id></Othr></Id></DbtrAcct>\n";
 
     /// Standard debtor agent BIC.
-    const DBTR_AGT: &str =
-        "<DbtrAgt><FinInstnId><BICFI>BPDODOSX</BICFI></FinInstnId></DbtrAgt>\n";
+    const DBTR_AGT: &str = "<DbtrAgt><FinInstnId><BICFI>BPDODOSX</BICFI></FinInstnId></DbtrAgt>\n";
 
     /// Chase creditor agent (BIC `CHASUS33XXX` -> normalised `CHASUS33`).
     const CDTR_AGT_CHASE: &str =
@@ -463,8 +464,7 @@ mod tests {
     const UETR_2: &str = "<UETR>e5b9060e-1473-44b9-ba24-37db7e7cbc9c</UETR>\n";
 
     /// Standard settlement: USD 2100.00 on 2026-05-29.
-    const SETTLEMENT_2100_USD: &str =
-        "<IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
+    const SETTLEMENT_2100_USD: &str = "<IntrBkSttlmAmt Ccy=\"USD\">2100.00</IntrBkSttlmAmt>\n\
          <IntrBkSttlmDt>2026-05-29</IntrBkSttlmDt>\n";
 
     // --- test body builders -------------------------------------------------

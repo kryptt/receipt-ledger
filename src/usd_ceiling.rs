@@ -53,8 +53,8 @@ pub fn check(amount: Decimal, rate: Decimal, ceiling: Option<Decimal>) -> Ceilin
 // -- ceiling-verdict unit tests --
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{dec, test_runtime};
     use super::*;
+    use crate::test_support::{dec, test_runtime};
 
     /// Assert that a verdict is [`CeilingVerdict::Within`].
     fn assert_within(v: &CeilingVerdict) {
@@ -68,9 +68,7 @@ mod tests {
     /// `usd_equivalent` for further assertions.
     fn assert_over(v: &CeilingVerdict) -> Decimal {
         match v {
-            CeilingVerdict::Over {
-                usd_equivalent, ..
-            } => *usd_equivalent,
+            CeilingVerdict::Over { usd_equivalent, .. } => *usd_equivalent,
             CeilingVerdict::Within { .. } => panic!("expected Over, got {v:?}"),
         }
     }

@@ -364,8 +364,8 @@ pub(crate) fn parse_amount(s: &str) -> anyhow::Result<Decimal> {
 // -- field-level scoring + projection unit tests --
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{dec, money};
     use super::*;
+    use crate::test_support::{dec, money};
 
     /// A fully-correct transaction projection.
     fn tx() -> Produced {
@@ -604,9 +604,13 @@ mod tests {
     fn from_record_then_score_against_matching_label_is_all_correct() {
         let rec = paypal_record(Some("Pay in 4"), "USD");
         let produced = Produced::from_record(&rec);
-        let expected =
-            Produced::from_expected(&expected_tx("10.00", "USD", "Shop", RoutedAccount::PaypalCredit))
-                .unwrap();
+        let expected = Produced::from_expected(&expected_tx(
+            "10.00",
+            "USD",
+            "Shop",
+            RoutedAccount::PaypalCredit,
+        ))
+        .unwrap();
         assert_all_correct(&score(&expected, &produced));
     }
 

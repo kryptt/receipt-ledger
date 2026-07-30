@@ -519,11 +519,15 @@ fn parse_mcc_category_map(raw: &str) -> Result<HashMap<String, String>> {
 /// Parse an optional [`Decimal`] env var. Absent → `None`; present but
 /// unparseable → hard error.
 fn decimal_optional(key: &str) -> Result<Option<Decimal>> {
-    optional_parsed(key, || None, |v| {
-        Decimal::from_str(v)
-            .map(Some)
-            .with_context(|| format!("{v:?} is not a decimal"))
-    })
+    optional_parsed(
+        key,
+        || None,
+        |v| {
+            Decimal::from_str(v)
+                .map(Some)
+                .with_context(|| format!("{v:?} is not a decimal"))
+        },
+    )
 }
 
 /// Parse an optional `u64` env var, falling back to `default` when unset/blank.
@@ -585,9 +589,15 @@ mod tests {
 
     /// Assert that a `key:accountid` parser rejects the three standard
     /// malformed shapes: no colon, non-numeric value, empty key.
-    fn assert_rejects_malformed(parse: impl Fn(&str) -> Result<HashMap<String, AccountId>>, bare_key: &str) {
+    fn assert_rejects_malformed(
+        parse: impl Fn(&str) -> Result<HashMap<String, AccountId>>,
+        bare_key: &str,
+    ) {
         assert!(parse(bare_key).is_err(), "no colon separator");
-        assert!(parse(&format!("{bare_key}:abc")).is_err(), "non-numeric account id");
+        assert!(
+            parse(&format!("{bare_key}:abc")).is_err(),
+            "non-numeric account id"
+        );
         assert!(parse(":1").is_err(), "empty key");
     }
 

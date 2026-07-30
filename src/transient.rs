@@ -64,8 +64,12 @@ macro_rules! define_provider_error {
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
-                    $name::Transient(m) => write!(f, concat!("transient ", $prefix, " failure: {}"), m),
-                    $name::Permanent(m) => write!(f, concat!("permanent ", $prefix, " failure: {}"), m),
+                    $name::Transient(m) => {
+                        write!(f, concat!("transient ", $prefix, " failure: {}"), m)
+                    }
+                    $name::Permanent(m) => {
+                        write!(f, concat!("permanent ", $prefix, " failure: {}"), m)
+                    }
                 }
             }
         }
@@ -135,6 +139,6 @@ macro_rules! assert_transient_chain {
 }
 
 #[cfg(test)]
-pub(crate) use define_classify_assertions;
-#[cfg(test)]
 pub(crate) use assert_transient_chain;
+#[cfg(test)]
+pub(crate) use define_classify_assertions;

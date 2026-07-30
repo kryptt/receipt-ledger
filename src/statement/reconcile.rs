@@ -408,7 +408,9 @@ fn resolve_cluster(
 /// loser is only booked-new when nothing else could be its duplicate.
 fn has_other_candidate(charge: &StatementTxn, exclude: usize, ctx: &MatchCtx<'_>) -> bool {
     ctx.journals.iter().enumerate().any(|(i, j)| {
-        i != exclude && same_currency(charge, j) && ctx.plausible(&charge.merchant, charge.auth_date, j)
+        i != exclude
+            && same_currency(charge, j)
+            && ctx.plausible(&charge.merchant, charge.auth_date, j)
     })
 }
 
@@ -589,11 +591,7 @@ mod tests {
 
     /// Double-book probe against a single journal (the repeated pattern in the
     /// probe test).
-    fn probe_one(
-        merchant: &str,
-        date: NaiveDate,
-        j: &ExistingJournal,
-    ) -> Option<ExistingJournal> {
+    fn probe_one(merchant: &str, date: NaiveDate, j: &ExistingJournal) -> Option<ExistingJournal> {
         let p = ReconcileParams::default();
         statement_already_booked(merchant, date, std::slice::from_ref(j), &p, &[]).cloned()
     }
@@ -698,7 +696,10 @@ mod tests {
     #[track_caller]
     fn assert_confirmed_clean(r: &Reconciliation) {
         assert_confirmed(r, 0);
-        assert!(r.unmatched_journals.is_empty(), "expected no unmatched journals");
+        assert!(
+            r.unmatched_journals.is_empty(),
+            "expected no unmatched journals"
+        );
     }
 
     /// Assert `charges[idx]` is `BookNew`.
@@ -838,7 +839,12 @@ mod tests {
             ..journal("J9", "7-Eleven B315 Kastrup", "7.28", 17)
         };
         expect_confirmed_clean(
-            &[charge("74987506133002256024229", "7-Eleven B315 Kastrup", "7.28", 17)],
+            &[charge(
+                "74987506133002256024229",
+                "7-Eleven B315 Kastrup",
+                "7.28",
+                17,
+            )],
             &[stmt_journal],
         );
     }
@@ -858,10 +864,7 @@ mod tests {
             amount: money("50.93", "DOP"),
             ..journal("J1", "JR EAST", "50.93", 21)
         };
-        expect_book_new(
-            &[charge("0601324353", "JR EAST", "50.93", 21)],
-            &[dop],
-        );
+        expect_book_new(&[charge("0601324353", "JR EAST", "50.93", 21)], &[dop]);
     }
 
     /// H1 regression: two charges both match one journal; whichever is processed
@@ -908,7 +911,10 @@ mod tests {
         let c2 = charge("0601000002", "NAGANO DENTETSU", "6.66", 23);
         let c3 = charge("0601000003", "BRAND NEW CAFE", "3.00", 19);
 
-        let sa = sorted_kinds(&run_default(&[c1.clone(), c2.clone(), c3.clone()], &journals));
+        let sa = sorted_kinds(&run_default(
+            &[c1.clone(), c2.clone(), c3.clone()],
+            &journals,
+        ));
         let sb = sorted_kinds(&run_default(&[c3, c1, c2], &journals));
         assert_eq!(sa, sb);
     }
@@ -950,7 +956,12 @@ mod tests {
     #[test]
     fn contained_merchant_confirms_without_alias() {
         expect_confirmed_clean(
-            &[charge("0601324353", "DONACION JOMPEAME JOMPEAME.COM", "1000.00", 24)],
+            &[charge(
+                "0601324353",
+                "DONACION JOMPEAME JOMPEAME.COM",
+                "1000.00",
+                24,
+            )],
             &[journal("J1", "JOMPEAME", "1000.00", 24)],
         );
     }
@@ -971,7 +982,10 @@ mod tests {
         assert_mismatch(&r, 0);
         assert_book_new(&r, 1);
         assert_book_new(&r, 2);
-        assert!(r.unmatched_journals.is_empty(), "journal consumed by the amount match");
+        assert!(
+            r.unmatched_journals.is_empty(),
+            "journal consumed by the amount match"
+        );
     }
 
     /// Cluster where two charges are equidistant from the journal -- no clear

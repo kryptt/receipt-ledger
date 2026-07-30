@@ -85,18 +85,23 @@ impl Mailbox {
             .await
             .context("connecting to JMAP session")?;
 
-        let inbox_id =
-            first_mailbox(&client, mailbox::query::Filter::role(Role::Inbox), "role")
-                .await?
-                .ok_or_else(|| anyhow!("no INBOX mailbox found"))?;
-        let processed_id =
-            first_mailbox(&client, mailbox::query::Filter::name(&cfg.processed_mailbox), "name")
-                .await?
-                .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.processed_mailbox))?;
-        let review_id =
-            first_mailbox(&client, mailbox::query::Filter::name(&cfg.review_mailbox), "name")
-                .await?
-                .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.review_mailbox))?;
+        let inbox_id = first_mailbox(&client, mailbox::query::Filter::role(Role::Inbox), "role")
+            .await?
+            .ok_or_else(|| anyhow!("no INBOX mailbox found"))?;
+        let processed_id = first_mailbox(
+            &client,
+            mailbox::query::Filter::name(&cfg.processed_mailbox),
+            "name",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.processed_mailbox))?;
+        let review_id = first_mailbox(
+            &client,
+            mailbox::query::Filter::name(&cfg.review_mailbox),
+            "name",
+        )
+        .await?
+        .ok_or_else(|| anyhow!("mailbox {:?} not found", cfg.review_mailbox))?;
 
         info!(%inbox_id, %processed_id, %review_id, "resolved mailboxes");
         Ok(Self {

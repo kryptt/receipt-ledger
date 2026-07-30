@@ -28,8 +28,8 @@
 //! user's own foreign account); a normal consumo returns `None` there and falls
 //! through UNCHANGED to the LLM `prompt`/`postprocess` path below.
 
-use chrono::NaiveDate;
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use serde_json::Value;
 
 // Banco Popular adapter imports — consumo parsing + SWIFT disambiguation.
@@ -224,11 +224,11 @@ pub mod fixtures {
 mod tests {
     use super::fixtures::approved_json;
     use super::*;
-    use serde_json::json;
     use crate::adapters::test_support::{
-        assert_books_clean, assert_money, assert_reviews,
-        assert_transaction_count, single_transaction as one,
+        assert_books_clean, assert_money, assert_reviews, assert_transaction_count,
+        single_transaction as one,
     };
+    use serde_json::json;
 
     #[test]
     fn matches_banco_sender() {
