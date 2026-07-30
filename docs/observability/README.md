@@ -63,6 +63,27 @@ abort emits no run-complete summary; an exit-0 stuck run is not a Job failure).
 > co-primary alert still ANDs in KSM `last_successful_time`, so it holds even if
 > retention is later shortened.
 
+## Field access in LogQL: the `fields_` prefix
+
+> **The bare field names above are the `tracing` field names, not the LogQL label
+> names.** `tracing`'s JSON fmt layer nests every structured field under a top-level
+> `fields` object, so a `run complete` line is
+> `{"timestamp":…,"level":"INFO","fields":{"message":"run complete","deferred":0,…}}`.
+> Loki's `| json` flattens nested JSON with `_` separators, so the queryable labels
+> are **`fields_deferred`, `fields_disposition`, `fields_source`,
+> `fields_balance_checked`, `fields_balance_delta`, `fields_message`** — never the
+> bare names. (Same flattening rule as `spans_0_trace_id` in the Traces section.)
+>
+> A rule written against the bare names matches **0 series and silently never
+> fires**. Verified 2026-07-30 against a live Loki: `| json | deferred != ""`
+> returned nothing; `| json | fields_message="run complete" | unwrap fields_deferred`
+> returned the run tallies. The examples below use the flattened names.
+>
+> Note also that `fields.message` — the `tracing` event message — is the reliable way
+> to select an event class. Several events share field names (both `run complete` and
+> `statement reconciliation complete` carry `deferred` and `review`), so
+> `| fields_deferred != ""` is *not* a run-complete selector.
+
 ## Example LogQL recording rules
 
 Adapt the Loki stream selector (`{namespace="home", app="receipt-ledger"}`) to your setup.
@@ -75,11 +96,10 @@ groups:
       # Per-source × disposition rate (review-rate, volumes).
       - record: receiptledger:outcomes:rate5m
         expr: |
-          sum by (source, disposition) (
+          sum by (fields_source, fields_disposition) (
             count_over_time(
               {namespace="home", app="receipt-ledger"}
-                | json | line_format "{{.disposition}}"
-                | disposition != "" [5m]
+                | json | fields_message="message outcome" [5m]
             )
           )
       # No-progress: deferred messages on the last run-complete line.
@@ -87,18 +107,26 @@ groups:
         expr: |
           last_over_time(
             {namespace="home", app="receipt-ledger"}
-              | json | __error__="" | deferred != ""
-              | unwrap deferred [3h]
+              | json | __error__="" | fields_message="run complete"
+              | unwrap fields_deferred [3h]
           )
       # Correctness: statement closing-balance delta (when checked).
       - record: receiptledger:balance_delta:last
         expr: |
           last_over_time(
             {namespace="home", app="receipt-ledger"}
-              | json | balance_checked="true"
-              | unwrap balance_delta [12h]
+              | json | __error__="" | fields_balance_checked="true"
+              | unwrap fields_balance_delta [12h]
           )
 ```
+
+**Recording rules are optional — and this cluster does not use them.** A Loki ruler
+only materialises `record:` output into Prometheus if it has `remote_write`
+configured; without it, recording rules produce nothing and any dashboard panel
+asking Prometheus for `receiptledger:*` renders "No data". Alerting rules are
+unaffected (the ruler evaluates them in-process and fires straight to Alertmanager).
+Rather than stand up a metrics-write path for one dashboard, the panels below query
+these same LogQL expressions **directly against the Loki datasource**.
 
 ## Example alert rules
 
@@ -211,25 +239,33 @@ exits with its normal code; telemetry can never delay the run or flip the exit c
 ## Dashboard
 
 A ready-to-import Grafana dashboard lives at [`dashboard.json`](./dashboard.json)
-(schemaVersion 39, templated `datasource`). Its panels mirror the recording/alert
-rules above:
+(schemaVersion 39). It has **two** datasource variables: `datasource` (Prometheus,
+for the kube-state-metrics panels) and `loki` (for the application-signal panels,
+queried as LogQL directly — no recording rules required).
 
-- **Dispositions by source over time** — `receiptledger:outcomes:rate5m` stacked by
-  `source` / `disposition`.
-- **Review rate (5m)** — `sum(receiptledger:outcomes:rate5m{disposition="review"})`,
-  red past the `ReceiptLedgerReviewPileup` threshold (> 5).
-- **Deferred on last run (no-progress)** — `receiptledger:deferred:last`.
-- **Time since last successful run** — age of
-  `kube_cronjob_status_last_successful_time{cronjob="receipt-ledger"}`, red past the
-  3h no-progress window (the two together are the `ReceiptLedgerNoProgress` co-primary).
-- **Failed jobs** — `kube_job_status_failed{job_name=~"receipt-ledger.*"}`
-  (`ReceiptLedgerRunFailing`).
-- **Statement closing-balance delta** — `abs(receiptledger:balance_delta:last)`, red
-  past `0.01` (`ReceiptLedgerBalanceMismatch`).
+| Panel | Datasource | Query |
+|---|---|---|
+| Dispositions by source over time | Loki | `sum by (fields_source, fields_disposition) (count_over_time({…} \| json \| fields_message="message outcome" [5m]))` |
+| Review count (1h, all sources) | Loki | `sum(count_over_time({…} \| json \| fields_disposition="review" [1h]))`, red past the `ReceiptLedgerReviewPileup` threshold |
+| Deferred on last run (no-progress) | Loki | `max(last_over_time({…} \| json \| __error__="" \| fields_message="run complete" \| unwrap fields_deferred [3h]))` |
+| Time since last successful run | Prometheus | age of `kube_cronjob_status_last_successful_time{cronjob="receipt-ledger"}`, red past the 3h no-progress window (with the panel above, the `ReceiptLedgerNoProgress` co-primary) |
+| Failed jobs | Prometheus | `kube_job_status_failed{job_name=~"receipt-ledger.*"}` (`ReceiptLedgerRunFailing`) |
+| Statement closing-balance delta | Loki | `max(last_over_time({…} \| json \| __error__="" \| fields_balance_checked="true" \| unwrap fields_balance_delta [14d]))`, red past `0.01` (`ReceiptLedgerBalanceMismatch`) |
 
-Point its `datasource` variable at the Prometheus/Mimir instance holding the recorded
-metrics + kube-state-metrics. As with the rules, importing it is the cluster-side step;
-the app's job is only to emit the fields.
+Two caveats on the Loki panels:
+
+- **No `abs()`.** LogQL has no absolute-value function for metric queries, so the
+  balance-delta panel plots the **signed** delta and is one-sided against the `0.01`
+  threshold — matching the alert, which is also written `> 0.01`. A large *negative*
+  delta shows on the graph but colours green.
+- **Lookback windows, not buckets.** `last_over_time([3h])` / `([14d])` carry the last
+  observed value forward so a sparse signal renders a continuous line rather than a
+  single dot. Statements arrive roughly monthly; the 14d window matches Loki's
+  retention here, so the panel goes empty only once a statement ages out entirely.
+
+Point `datasource` at the Prometheus holding kube-state-metrics and `loki` at the Loki
+holding these logs. Importing it is the cluster-side step; the app's job is only to
+emit the fields.
 
 ## Follow-up
 
