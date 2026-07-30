@@ -1,6 +1,6 @@
 [package]
 name = "receipt-ledger"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 license = "MIT"
 description = "Transaction-notification-email → Firefly III ingestor (one-shot CronJob)"
@@ -62,9 +62,19 @@ strsim = "0.11"
 # (opentelemetry*, prost, const-hex). The musl/Dockerfile builder is unaffected
 # (no new C toolchain). Versions are a mutually-compatible set:
 # opentelemetry/otlp/sdk 0.32, tracing-opentelemetry 0.33.
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client"] }
+#
+# `internal-logs` is REQUIRED, not optional polish. Without it the SDK's
+# `otel_error!`/`otel_warn!` macros compile to `let _ = ...` no-ops (see
+# `opentelemetry/src/global/internal_logging.rs`), so a rejected export — a 404,
+# a refused connection, a partial-success rejection — is discarded in total
+# silence. That violates the crate's no-silently-swallowed-errors rule and hid a
+# live 404 against Tempo for the whole life of 0.16.0. With it on, those surface
+# as `tracing` events on the `opentelemetry*` targets through the normal fmt
+# layer (they are events, not spans, so there is no feedback loop through the
+# OpenTelemetry span layer).
+opentelemetry = { version = "0.32", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-json", "reqwest-blocking-client", "internal-logs"] }
 tracing-opentelemetry = { version = "0.33", default-features = false }
 
 [dev-dependencies]

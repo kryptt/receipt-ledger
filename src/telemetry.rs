@@ -191,7 +191,35 @@ fn install_fmt_only(json: bool, env_filter: tracing_subscriber::EnvFilter) {
     init_with_fmt!(registry, json);
 }
 
+/// The OTLP/HTTP signal path for traces, per the OTLP spec's endpoint rules.
+///
+/// The SDK appends this itself **only** when it reads [`OTEL_ENDPOINT_ENV`] from
+/// the environment on its own. An endpoint handed to `with_endpoint` is treated
+/// as programmatic configuration and used **verbatim** — see `resolve_http_endpoint`
+/// in `opentelemetry-otlp`, whose first branch returns `provided_endpoint` unmodified.
+/// [`init`] reads the variable itself (it is the on/off gate) and therefore owes
+/// the append; without it every export POSTs to the collector's root path, which
+/// Tempo answers with 404.
+const TRACES_PATH: &str = "/v1/traces";
+
+/// Append [`TRACES_PATH`] to a base OTLP endpoint, idempotently.
+///
+/// `http://tempo.monitor:4318` (and its trailing-slash form) → `.../v1/traces`;
+/// an endpoint that already names the signal path is returned unchanged, so an
+/// operator may set either form of [`OTEL_ENDPOINT_ENV`] and get one working URL.
+fn traces_endpoint(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with(TRACES_PATH) {
+        base.to_string()
+    } else {
+        format!("{base}{TRACES_PATH}")
+    }
+}
+
 /// Build the batch tracer provider with an OTLP/HTTP-JSON span exporter.
+///
+/// `endpoint` is the **base** collector URL (the [`OTEL_ENDPOINT_ENV`] value);
+/// [`traces_endpoint`] resolves it to the signal URL actually POSTed to.
 ///
 /// The exporter uses the default BLOCKING reqwest client (`reqwest-blocking-client`)
 /// because the default `BatchSpanProcessor` exports from a dedicated thread that
@@ -203,7 +231,7 @@ fn build_provider(endpoint: &str) -> anyhow::Result<SdkTracerProvider> {
     let exporter = SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpJson)
-        .with_endpoint(endpoint)
+        .with_endpoint(traces_endpoint(endpoint))
         .with_timeout(FLUSH_TIMEOUT)
         .build()?;
     let resource = Resource::builder()
@@ -372,7 +400,12 @@ mod tests {
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
         // Capture: persist new span's fields into its extensions.
-        fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             let grab = grab_fields(attrs);
             let span_ref = ctx.span(id).unwrap();
             // Persist the (possibly later-recorded) fields in the span extension
@@ -381,7 +414,12 @@ mod tests {
         }
 
         // Capture: merge dynamically-recorded values into the existing span field set.
-        fn on_record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             let span = ctx.span(id).unwrap();
             let grab = grab_fields(values);
             let mut ext = span.extensions_mut();
@@ -398,7 +436,11 @@ mod tests {
 
         // Capture: snapshot the enclosing span's name, trace_id, and field names
         // for each event that fires within an instrumented scope.
-        fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
             if let Some(span) = ctx.event_span(event) {
                 // The JSON fmt layer renders ALL enclosing spans' fields on each
                 // event (its `spans[]` array), so a `trace_id` recorded on the
@@ -445,10 +487,14 @@ mod tests {
         fn record_to(&self, visitor: &mut FieldGrab);
     }
     impl RecordFields for tracing::span::Attributes<'_> {
-        fn record_to(&self, grab: &mut FieldGrab) { self.record(grab); }
+        fn record_to(&self, grab: &mut FieldGrab) {
+            self.record(grab);
+        }
     }
     impl RecordFields for tracing::span::Record<'_> {
-        fn record_to(&self, visitor: &mut FieldGrab) { self.record(visitor); }
+        fn record_to(&self, visitor: &mut FieldGrab) {
+            self.record(visitor);
+        }
     }
 
     /// Build a provider + OTel layer over a given in-memory exporter. Returns
@@ -600,6 +646,88 @@ mod tests {
             captured, allowed,
             "extract span attributes must be exactly {{stage}}; had {fields:?}"
         );
+    }
+
+    #[test]
+    fn traces_endpoint_appends_the_signal_path_idempotently() {
+        // The bare base endpoint, as OTEL_EXPORTER_OTLP_ENDPOINT carries it.
+        assert_eq!(
+            traces_endpoint("http://tempo.monitor:4318"),
+            "http://tempo.monitor:4318/v1/traces"
+        );
+        // Trailing slash must not produce a doubled separator.
+        assert_eq!(
+            traces_endpoint("http://tempo.monitor:4318/"),
+            "http://tempo.monitor:4318/v1/traces"
+        );
+        // Already a signal URL → unchanged (no `/v1/traces/v1/traces`).
+        assert_eq!(
+            traces_endpoint("http://tempo.monitor:4318/v1/traces"),
+            "http://tempo.monitor:4318/v1/traces"
+        );
+        // A collector behind a path prefix keeps the prefix.
+        assert_eq!(
+            traces_endpoint("http://gw:4318/otlp"),
+            "http://gw:4318/otlp/v1/traces"
+        );
+    }
+
+    /// The regression test that actually matters: assert the **wire request**,
+    /// not the string helper.
+    ///
+    /// `opentelemetry-otlp`'s `resolve_http_endpoint` uses a programmatic
+    /// `with_endpoint` value VERBATIM — it appends `/v1/traces` only for an
+    /// endpoint it reads from the environment itself. Passing the raw
+    /// `OTEL_EXPORTER_OTLP_ENDPOINT` value straight through therefore POSTed to
+    /// the collector's root path, which Tempo answers 404 (verified against the
+    /// live cluster Tempo: `POST /` → 404, `POST /v1/traces` → 200) — and with
+    /// `internal-logs` off that 404 was silent, so every run's trace vanished.
+    ///
+    /// A one-shot loopback listener stands in for the collector and captures the
+    /// request line. Pins the path AND the POST method against any future
+    /// endpoint-resolution change in the SDK.
+    #[test]
+    fn export_posts_to_the_v1_traces_path() {
+        use std::io::{Read as _, Write as _};
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback test collector");
+        let port = listener
+            .local_addr()
+            .expect("the bound listener has a local address")
+            .port();
+
+        // Accept exactly one export and hand back the request line.
+        let collector = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("the exporter connects");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).expect("the exporter sends a request");
+            // Answer 200 so the export completes rather than tripping its timeout.
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+            let _ = sock.flush();
+            String::from_utf8_lossy(&buf[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+
+        // The BASE endpoint, exactly as the CronJob env supplies it.
+        let provider = build_provider(&format!("http://127.0.0.1:{port}"))
+            .expect("provider builds against the loopback collector");
+        {
+            let tracer = provider.tracer("test");
+            tracer.in_span("exported", |_| {});
+        }
+        provider.force_flush().expect("the batch exports");
+
+        let request_line = collector.join().expect("the collector thread finishes");
+        assert_eq!(
+            request_line, "POST /v1/traces HTTP/1.1",
+            "the exporter must POST the OTLP traces signal path, not the collector root"
+        );
+
+        let _ = provider.shutdown();
     }
 
     #[test]
