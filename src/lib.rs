@@ -126,7 +126,21 @@ pub async fn run(http: Client) -> Result<Summary> {
     // content. The `.context(...)` error messages and control flow are unchanged.
     let prior_state = jmap::load_state(&cfg.state_path);
     let (mailbox, messages, new_state) = async {
-        let mailbox = Mailbox::connect(&cfg).await.context("JMAP connect")?;
+        // Connect is read-only, so retrying it cannot double-submit. Stalwart's
+        // session endpoint 500s while its LDAP backend restarts (seen during node
+        // reboots): ride that out instead of failing the whole hourly run.
+        let mut attempt = 1;
+        let mailbox = loop {
+            match Mailbox::connect(&cfg).await {
+                Ok(m) => break m,
+                Err(e) if attempt < 4 => {
+                    warn!(attempt, error = ?e, "JMAP connect failed, retrying in 20s");
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e).context("JMAP connect"),
+            }
+        };
         let (messages, new_state) = mailbox
             .fetch_new(prior_state)
             .await
